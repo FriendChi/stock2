@@ -16,7 +16,8 @@ def fetch_or_load_fund_data(code_dict, data_dir="data"):
     if csv_path.exists():
         print("Today's data already exists, skip download:")
         print(csv_path)
-        data = pd.read_csv(csv_path)
+        # 读取时固定为字符串，避免被自动推断成整数后丢失前导0
+        data = pd.read_csv(csv_path, dtype={"code": str})
     else:
         print("Start downloading fund data...")
         data_list = []
@@ -36,5 +37,7 @@ def fetch_or_load_fund_data(code_dict, data_dir="data"):
 
     # 无论下载或读取分支，都统一数据类型和排序规则
     data["date"] = pd.to_datetime(data["date"]).dt.date
+    # 统一基金代码格式，保证与字符串基金池过滤一致
+    data["code"] = data["code"].astype(str).str.zfill(6)
     data = data.sort_values(["date", "code"]).reset_index(drop=True)
     return data
