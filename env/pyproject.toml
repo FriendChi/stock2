@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "stock2"
+version = "0.1.0"
+description = ""
+authors = ["chi <chi@example.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+akshare = "*"
+vectorbt = "*"
+pandas = "*"
+numpy = "*"
+matplotlib = "*"
+plotly = "*"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
