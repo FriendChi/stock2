@@ -5,8 +5,7 @@ import matplotlib.pyplot as plt
 
 from compute_return import add_return_column
 from config import code_dict
-from feature_engineering import build_aligned_price_df
-from feature_engineering import build_feature_dict
+from feature_engineering import DataLayer
 from fetch_fund_data import fetch_or_load_fund_data
 from backtest import run_backtest
 
@@ -34,25 +33,26 @@ def main():
         "009052",
         "008702",
     ]
-    price_df_aligned = build_aligned_price_df(data=data, fund_list=fund_list)
+    price_df_aligned = DataLayer.build_aligned_price_df(data=data, fund_list=fund_list)
 
-    # 按时间顺序切分训练和验证区间，默认前80%训练，后20%验证
-    split_idx = int(len(price_df_aligned) * 0.8)
-    if split_idx <= 0 or split_idx >= len(price_df_aligned):
-        raise ValueError(
-            "样本量不足，无法按前80%训练、后20%验证切分。"
-            f" 当前样本数={len(price_df_aligned)}"
-        )
-
-    # 固定验证模式：仅使用后20%样本
-    price_df_selected = price_df_aligned.iloc[split_idx:].copy()
+    # 验证段向前借用上下文窗口，缓解特征在验证起点的冷启动缺失
+    split_result = DataLayer.split_train_valid(
+        price_df=price_df_aligned,
+        train_ratio=0.8,
+        valid_context_window=120,
+    )
+    split_idx = split_result["split_idx"]
+    price_df_selected = split_result["valid_df"]
+    price_df_selected_with_context = split_result["valid_df_with_context"]
     print("当前模式:", "valid")
     print("切分位置:", split_idx)
     print("当前样本区间:", price_df_selected.index.min(), price_df_selected.index.max())
     print("当前样本形状:", price_df_selected.shape)
+    print("验证上下文区间:", price_df_selected_with_context.index.min(), price_df_selected_with_context.index.max())
+    print("验证上下文形状:", price_df_selected_with_context.shape)
 
-    # 特征仅基于验证区间计算
-    feature_dict = build_feature_dict(price_df_selected)
+    # 特征在验证模式下使用带上下文样本计算，避免窗口类特征在起始段缺失
+    feature_dict = DataLayer.build_feature_dict(price_df_selected_with_context)
     print(feature_dict.keys())
     print(feature_dict["momentum_20"].head())
 
