@@ -2,8 +2,6 @@ import pandas as pd
 
 
 class DataLayer:
-
-
     @classmethod
     def build_aligned_price_df(cls, data, fund_list):
         # 先过滤基金池，再透视成多基金宽表并按日期排序
@@ -46,6 +44,10 @@ class DataLayer:
     @classmethod
     def build_feature_dict(cls, price_df):
         feature_dict = {}
+
+        # 原始净值与单期收益率特征
+        feature_dict["nav"] = price_df
+        feature_dict["return"] = price_df.pct_change(1)
 
         # 基础收益类特征
         ret_1 = price_df.pct_change(1)
