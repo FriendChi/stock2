@@ -12,6 +12,7 @@ pandas = "*"
 numpy = "*"
 matplotlib = "*"
 plotly = "*"
+xgboost = "*"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
