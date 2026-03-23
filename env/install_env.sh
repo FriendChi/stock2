@@ -23,6 +23,6 @@ export PATH="$HOME/.local/bin:$PATH"
 # 固定虚拟环境到项目目录下的 .venv，保持路径稳定
 poetry config virtualenvs.in-project true --local
 
-# 先生成/更新锁文件，再按锁文件安装依赖，保证可复现
+# 先生成/更新锁文件，再按锁文件安装依赖，避免安装root包失败
 poetry lock --no-interaction
-poetry install --no-interaction --no-ansi
+poetry install --no-root --no-interaction --no-ansi
