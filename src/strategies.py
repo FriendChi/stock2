@@ -62,6 +62,24 @@ class MomentumStrategy:
 
 class NeuralRankStrategy:
     @classmethod
+    def _build_group_sizes_from_dates(cls, date_list):
+        # 按样本出现顺序统计每个交易日分组大小，供排序模型group参数使用
+        if len(date_list) == 0:
+            return []
+        group_sizes = []
+        current_day = date_list[0]
+        current_count = 0
+        for day in date_list:
+            if day == current_day:
+                current_count += 1
+                continue
+            group_sizes.append(int(current_count))
+            current_day = day
+            current_count = 1
+        group_sizes.append(int(current_count))
+        return group_sizes
+
+    @classmethod
     def _build_samples(cls, returns_df, lookback):
         # 构建样本：用过去lookback日收益率预测下一日收益率
         x_list = []
@@ -246,6 +264,61 @@ class NeuralRankStrategy:
         return model
 
     @classmethod
+    def train_xgb_rank_model(
+        cls,
+        x_train,
+        y_rank_train,
+        train_dates,
+        seed=42,
+        xgb_params=None,
+    ):
+        # 懒加载xgboost，避免未安装时影响mlp后端正常使用
+        try:
+            from xgboost import XGBRanker
+        except ImportError as exc:
+            raise ImportError("未安装xgboost，请先安装后再使用xgb_ranker后端。") from exc
+
+        # 排名值越小越好，转换为相关性分数供学习排序目标使用
+        y_rank_flat = y_rank_train.reshape(-1).astype(float)
+        max_rank = np.max(y_rank_flat)
+        y_relevance = max_rank + 1.0 - y_rank_flat
+
+        # 以交易日为group进行排序训练，符合横截面排序场景
+        group_sizes = cls._build_group_sizes_from_dates(train_dates)
+        if len(group_sizes) == 0:
+            raise ValueError("训练分组为空，无法训练XGBRanker。")
+
+        # 默认参数保持保守，优先保证稳定可用
+        default_params = {
+            "objective": "rank:pairwise",
+            "n_estimators": 200,
+            "learning_rate": 0.05,
+            "max_depth": 4,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "reg_alpha": 0.0,
+            "reg_lambda": 1.0,
+            "random_state": int(seed),
+            "n_jobs": -1,
+        }
+        if isinstance(xgb_params, dict):
+            default_params.update(xgb_params)
+
+        model = XGBRanker(**default_params)
+        model.fit(x_train, y_relevance, group=group_sizes, verbose=False)
+        return model
+
+    @classmethod
+    def predict_rank_scores(cls, model, x, model_backend="mlp"):
+        # 统一不同后端的预测接口，输出可比较的排序分数
+        backend = str(model_backend).lower()
+        if backend == "mlp":
+            return cls.predict_scores(model=model, x=x)
+        if backend == "xgb_ranker":
+            return np.asarray(model.predict(x), dtype=float).reshape(-1)
+        raise ValueError(f"不支持的model_backend: {model_backend}")
+
+    @classmethod
     def _compute_rank_ic(cls, date_list, pred_score, y_rank_true):
         # 无样本时直接返回NaN，避免空分组导致异常
         if len(date_list) == 0:
@@ -286,11 +359,13 @@ class NeuralRankStrategy:
         train_df,
         valid_df,
         rank_n=7,
+        model_backend="mlp",
         hidden_dim=16,
         epochs=200,
         lr=0.01,
         l2=0.0,
         seed=42,
+        xgb_params=None,
     ):
         # 从数据层产物中提取训练样本，标签为未来n日收益排名
         x_train, y_rank_train, train_dates, _ = cls._build_rank_samples_from_labeled_table(
@@ -315,24 +390,37 @@ class NeuralRankStrategy:
         x_train_std = (x_train - x_mean) / x_std
         x_valid_std = (x_valid - x_mean) / x_std
 
-        # 使用排名标签监督训练模型，输出可用于排序的预测分数
-        model = cls.train_rank_model(
-            x_train=x_train_std,
-            y_rank_train=y_rank_train,
-            hidden_dim=hidden_dim,
-            epochs=epochs,
-            lr=lr,
-            l2=l2,
-            seed=seed,
-        )
-        train_pred = cls.predict_scores(model=model, x=x_train_std)
-        valid_pred = cls.predict_scores(model=model, x=x_valid_std)
+        # 根据配置切换训练后端，统一输出可用于排序的预测分数
+        model_backend = str(model_backend).lower()
+        if model_backend == "mlp":
+            model = cls.train_rank_model(
+                x_train=x_train_std,
+                y_rank_train=y_rank_train,
+                hidden_dim=hidden_dim,
+                epochs=epochs,
+                lr=lr,
+                l2=l2,
+                seed=seed,
+            )
+        elif model_backend == "xgb_ranker":
+            model = cls.train_xgb_rank_model(
+                x_train=x_train_std,
+                y_rank_train=y_rank_train,
+                train_dates=train_dates,
+                seed=seed,
+                xgb_params=xgb_params,
+            )
+        else:
+            raise ValueError(f"不支持的model_backend: {model_backend}")
+        train_pred = cls.predict_rank_scores(model=model, x=x_train_std, model_backend=model_backend)
+        valid_pred = cls.predict_rank_scores(model=model, x=x_valid_std, model_backend=model_backend)
 
         # 汇总训练元信息，便于脚本侧打印与后续模型落地
         metrics = {
             "train_samples": int(x_train.shape[0]),
             "valid_samples": int(x_valid.shape[0]),
             "feature_dim": int(x_train.shape[1]),
+            "model_backend": model_backend,
             "train_rank_ic": cls._compute_rank_ic(
                 date_list=train_dates,
                 pred_score=train_pred,
@@ -350,6 +438,7 @@ class NeuralRankStrategy:
             "x_mean": x_mean,
             "x_std": x_std,
             "rank_n": int(rank_n),
+            "model_backend": model_backend,
         }
         return artifact, metrics
 

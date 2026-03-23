@@ -46,6 +46,7 @@ def main():
 
     # 训练参数集中在脚本内，便于复现实验并保持入口稳定
     rank_n = 7
+    model_backend = "xgb_ranker"
     train_ratio = 0.8
     hidden_dim = 16
     epochs = 200
@@ -94,6 +95,7 @@ def main():
         train_df=train_df,
         valid_df=valid_df,
         rank_n=rank_n,
+        model_backend=model_backend,
         hidden_dim=hidden_dim,
         epochs=epochs,
         lr=lr,
@@ -103,16 +105,20 @@ def main():
 
     # 输出关键训练信息，便于确认训练是否成功与样本规模是否合理
     print("当前模式:", "train")
+    print("模型后端:", metrics["model_backend"])
     print("训练目标:", f"future_{rank_n}d_rank")
     print("labeled_df形状:", labeled_df.shape)
     print("train_df形状:", train_df.shape)
     print("valid_df形状:", valid_df.shape)
     print("训练样本数:", metrics["train_samples"])
     print("验证样本数:", metrics["valid_samples"])
+    print("特征维度:", metrics["feature_dim"])
     print("训练集RankIC:", metrics["train_rank_ic"])
     print("验证集RankIC:", metrics["valid_rank_ic"])
-    print("模型参数形状w1:", artifact["model"]["w1"].shape)
-    print("模型参数形状w2:", artifact["model"]["w2"].shape)
+    # 仅mlp后端有w1/w2参数矩阵，树模型后端不输出该信息
+    if metrics["model_backend"] == "mlp":
+        print("模型参数形状w1:", artifact["model"]["w1"].shape)
+        print("模型参数形状w2:", artifact["model"]["w2"].shape)
 
 
 
