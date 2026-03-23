@@ -359,13 +359,8 @@ class NeuralRankStrategy:
         train_df,
         valid_df,
         rank_n=7,
-        model_backend="mlp",
-        hidden_dim=16,
-        epochs=200,
-        lr=0.01,
-        l2=0.0,
         seed=42,
-        xgb_params=None,
+        model_config=None,
     ):
         # 从数据层产物中提取训练样本，标签为未来n日收益排名
         x_train, y_rank_train, train_dates, _ = cls._build_rank_samples_from_labeled_table(
@@ -390,16 +385,23 @@ class NeuralRankStrategy:
         x_train_std = (x_train - x_mean) / x_std
         x_valid_std = (x_valid - x_mean) / x_std
 
+        # 模型配置统一通过字典传入，避免函数签名随新增后端持续膨胀
+        model_config = model_config or {}
+        model_backend = str(model_config.get("backend", "mlp")).lower()
+        # 各后端超参数收敛到params字段，便于入口脚本集中管理
+        model_params = model_config.get("params", {})
+        if not isinstance(model_params, dict):
+            raise ValueError("model_config['params'] 必须为dict。")
+
         # 根据配置切换训练后端，统一输出可用于排序的预测分数
-        model_backend = str(model_backend).lower()
         if model_backend == "mlp":
             model = cls.train_rank_model(
                 x_train=x_train_std,
                 y_rank_train=y_rank_train,
-                hidden_dim=hidden_dim,
-                epochs=epochs,
-                lr=lr,
-                l2=l2,
+                hidden_dim=model_params["hidden_dim"],
+                epochs=model_params["epochs"],
+                lr=model_params["lr"],
+                l2=model_params["l2"],
                 seed=seed,
             )
         elif model_backend == "xgb_ranker":
@@ -408,7 +410,7 @@ class NeuralRankStrategy:
                 y_rank_train=y_rank_train,
                 train_dates=train_dates,
                 seed=seed,
-                xgb_params=xgb_params,
+                xgb_params=model_params,
             )
         else:
             raise ValueError(f"不支持的model_backend: {model_backend}")

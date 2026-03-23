@@ -48,11 +48,30 @@ def main():
     rank_n = 7
     model_backend = "xgb_ranker"
     train_ratio = 0.8
-    hidden_dim = 16
-    epochs = 200
-    lr = 0.01
-    l2 = 0.0
     seed = 42
+    # 模型后端与后端参数统一收敛到一个字典，便于入口层集中管理
+    model_config = {
+        "backend": model_backend,
+        "params": {
+            "mlp": {
+                "hidden_dim": 16,
+                "epochs": 200,
+                "lr": 0.01,
+                "l2": 0.0,
+            },
+            "xgb_ranker": {
+                "n_estimators": 120,
+                "learning_rate": 0.03,
+                "max_depth": 2,
+                "min_child_weight": 8,
+                "gamma": 0.2,
+                "subsample": 0.7,
+                "colsample_bytree": 0.7,
+                "reg_alpha": 0.5,
+                "reg_lambda": 3.0,
+            },
+        }[model_backend],
+    }
 
     # 先构建多特征与未来n日收益排名标签，再按时间切训练/验证
     labeled_df = DataLayer.build_labeled_table(
@@ -95,12 +114,8 @@ def main():
         train_df=train_df,
         valid_df=valid_df,
         rank_n=rank_n,
-        model_backend=model_backend,
-        hidden_dim=hidden_dim,
-        epochs=epochs,
-        lr=lr,
-        l2=l2,
         seed=seed,
+        model_config=model_config,
     )
 
     # 输出关键训练信息，便于确认训练是否成功与样本规模是否合理
