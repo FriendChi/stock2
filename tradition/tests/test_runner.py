@@ -55,6 +55,14 @@ def test_build_cli_override_collects_strategy_params():
     assert override["strategy_param_dict"]["ma_cross"] == {"fast": 3, "slow": 9}
 
 
+def test_build_cli_override_collects_batch_codes():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(["--batch-run", "--fund-codes", "7301,12832"])
+    override = runner.build_cli_override(args)
+    assert override["batch_run"] is True
+    assert override["fund_code_list"] == ["007301", "012832"]
+
+
 def test_merge_strategy_params_overrides_single_strategy():
     merged = runner.merge_strategy_params(
         default_param_dict={"buy_and_hold": {}, "ma_cross": {"fast": 5, "slow": 20}},
@@ -62,6 +70,46 @@ def test_merge_strategy_params_overrides_single_strategy():
     )
     assert merged["ma_cross"] == {"fast": 3, "slow": 20}
     assert merged["buy_and_hold"] == {}
+
+
+def test_build_summary_table_sorts_by_sharpe():
+    summary_df = runner.build_summary_table(
+        [
+            {
+                "fund_code": "A",
+                "strategy_name": "buy_and_hold",
+                "sample_start": pd.Timestamp("2024-01-01"),
+                "sample_end": pd.Timestamp("2024-01-02"),
+                "data_mode": "nav_price_series",
+                "trade_count": 1,
+                "output_path": "a.png",
+                "stats": {
+                    "cumulative_return": 0.1,
+                    "annual_return": 0.1,
+                    "annual_volatility": 0.2,
+                    "sharpe": 0.5,
+                    "max_drawdown": -0.1,
+                },
+            },
+            {
+                "fund_code": "B",
+                "strategy_name": "buy_and_hold",
+                "sample_start": pd.Timestamp("2024-01-01"),
+                "sample_end": pd.Timestamp("2024-01-02"),
+                "data_mode": "nav_price_series",
+                "trade_count": 1,
+                "output_path": "b.png",
+                "stats": {
+                    "cumulative_return": 0.2,
+                    "annual_return": 0.2,
+                    "annual_volatility": 0.2,
+                    "sharpe": 1.0,
+                    "max_drawdown": -0.2,
+                },
+            },
+        ]
+    )
+    assert summary_df.iloc[0]["fund_code"] == "B"
 
 
 def test_run_single_fund_strategy_returns_summary(monkeypatch, sample_fund_df, tmp_path):
@@ -121,3 +169,47 @@ def test_run_single_fund_strategy_returns_summary(monkeypatch, sample_fund_df, t
     assert result["strategy_name"] == "buy_and_hold"
     assert result["trade_count"] == 2
     assert result["data_mode"] == "nav_price_series"
+
+
+def test_run_multi_fund_strategy_returns_summary(monkeypatch, tmp_path):
+    fake_config = {
+        "code_dict": {"007301": "半导体", "012832": "新能源"},
+        "data_dir": tmp_path,
+        "output_dir": tmp_path,
+        "force_refresh": False,
+        "cache_prefix": "tradition_fund",
+        "default_strategy_name": "momentum",
+        "strategy_param_dict": {"momentum": {"window": 20}},
+        "init_cash": 10000.0,
+        "fees": 0.001,
+    }
+    monkeypatch.setattr(runner, "build_tradition_config", lambda config_override=None: dict(fake_config, **(config_override or {})))
+    monkeypatch.setattr(runner, "fetch_fund_data_with_cache", lambda **kwargs: pd.DataFrame({"date": [], "code": [], "fund": [], "nav": []}))
+    monkeypatch.setattr(runner, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(
+        runner,
+        "run_single_fund_strategy_from_data",
+        lambda normalized_data, config, fund_code, print_summary=False: {
+            "fund_code": fund_code,
+            "strategy_name": config["default_strategy_name"],
+            "strategy_params": config["strategy_param_dict"][config["default_strategy_name"]],
+            "stats": {
+                "cumulative_return": 0.1 if fund_code == "007301" else 0.2,
+                "annual_return": 0.1 if fund_code == "007301" else 0.2,
+                "annual_volatility": 0.2,
+                "sharpe": 0.5 if fund_code == "007301" else 1.0,
+                "max_drawdown": -0.1,
+            },
+            "equity_curve": pd.Series([1.0, 1.1]),
+            "output_path": tmp_path / f"{fund_code}.png",
+            "data_mode": "nav_price_series",
+            "sample_start": pd.Timestamp("2024-01-01"),
+            "sample_end": pd.Timestamp("2024-01-02"),
+            "trade_count": 2,
+        },
+    )
+
+    result = runner.run_multi_fund_strategy()
+
+    assert list(result["summary_df"]["fund_code"]) == ["012832", "007301"]
+    assert result["summary_path"].exists()
