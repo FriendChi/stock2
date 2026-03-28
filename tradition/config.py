@@ -27,6 +27,21 @@ DEFAULT_STRATEGY_PARAM_DICT = {
     "momentum": {
         "window": 20,
     },
+    "multi_factor_score": {
+        "momentum_window_short": 20,
+        "momentum_window_long": 60,
+        "volatility_window": 20,
+        "drawdown_window": 60,
+        "score_window": 60,
+        "factor_weight_dict": {
+            "momentum_20": 0.30,
+            "momentum_60": 0.30,
+            "volatility_20": 0.20,
+            "drawdown_60": 0.20,
+        },
+        "entry_threshold": 0.2,
+        "exit_threshold": 0.0,
+    },
 }
 
 

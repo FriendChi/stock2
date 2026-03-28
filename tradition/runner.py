@@ -56,7 +56,7 @@ def build_arg_parser():
     parser.add_argument(
         "--strategy-name",
         dest="strategy_name",
-        choices=["buy_and_hold", "ma_cross", "momentum"],
+        choices=["buy_and_hold", "ma_cross", "momentum", "multi_factor_score"],
         help="策略名称",
     )
     parser.add_argument("--batch-run", action="store_true", help="按基金池批量运行当前策略并输出汇总表")

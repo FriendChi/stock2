@@ -3,6 +3,7 @@ from copy import deepcopy
 import pandas as pd
 
 from tradition.config import DEFAULT_STRATEGY_PARAM_DICT
+from tradition.factor_engine import build_multi_factor_score
 
 
 def calculate_sma(series, window):
@@ -80,6 +81,15 @@ def generate_signals(price_series, strategy_name, strategy_params=None):
         momentum = calculate_momentum(price_series, window=window)
         entry_raw = (momentum > 0).fillna(False)
         exit_raw = (momentum <= 0).fillna(False)
+        entries, exits = _build_edge_signals(entry_raw=entry_raw, exit_raw=exit_raw)
+        return entries, exits, params
+
+    if strategy_name == "multi_factor_score":
+        factor_df, score_series = build_multi_factor_score(price_series=price_series, strategy_params=params)
+        entry_threshold = float(params["entry_threshold"])
+        exit_threshold = float(params["exit_threshold"])
+        entry_raw = (score_series > entry_threshold).fillna(False)
+        exit_raw = (score_series <= exit_threshold).fillna(False)
         entries, exits = _build_edge_signals(entry_raw=entry_raw, exit_raw=exit_raw)
         return entries, exits, params
 
