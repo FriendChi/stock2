@@ -1,22 +1,15 @@
-from tradition.data_adapter import adapt_to_backtesting_ohlc
+from tradition.data_adapter import adapt_to_price_series
 
 
-def test_adapt_to_backtesting_ohlc_uses_synthetic_nav(sample_fund_df):
-    adapted, price_source = adapt_to_backtesting_ohlc(sample_fund_df)
-    assert price_source == "synthetic_from_nav"
-    assert list(adapted.columns) == ["Open", "High", "Low", "Close", "Volume"]
+def test_adapt_to_price_series_returns_nav_series(sample_fund_df):
+    price_series, data_mode = adapt_to_price_series(sample_fund_df)
+    assert data_mode == "nav_price_series"
+    assert price_series.name == "price"
+    assert price_series.index.is_monotonic_increasing
 
 
-def test_adapt_to_backtesting_ohlc_prefers_real_price_fields(sample_fund_df):
-    real_price_df = sample_fund_df.rename(
-        columns={
-            "nav": "close",
-        }
-    ).copy()
-    real_price_df["open"] = real_price_df["close"] - 0.01
-    real_price_df["high"] = real_price_df["close"] + 0.02
-    real_price_df["low"] = real_price_df["close"] - 0.02
-    real_price_df["nav"] = real_price_df["close"]
-    adapted, price_source = adapt_to_backtesting_ohlc(real_price_df)
-    assert price_source == "real_price_fields"
-    assert adapted["Open"].iloc[0] == real_price_df["open"].iloc[0]
+def test_adapt_to_price_series_drops_duplicate_dates(sample_fund_df):
+    duplicated_df = sample_fund_df.copy()
+    duplicated_df.loc[len(duplicated_df)] = duplicated_df.iloc[-1]
+    price_series, _ = adapt_to_price_series(duplicated_df)
+    assert price_series.index.is_unique

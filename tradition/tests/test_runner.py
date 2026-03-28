@@ -3,19 +3,34 @@ import pandas as pd
 from tradition import runner
 
 
-class FakeBacktest:
-    def __init__(self, data, strategy_cls, cash, commission, exclusive_orders):
-        self.data = data
-        self.strategy_cls = strategy_cls
-        self.cash = cash
-        self.commission = commission
-        self.exclusive_orders = exclusive_orders
+class FakePortfolioTrades:
+    def count(self):
+        return 2
 
-    def run(self):
-        return {
-            "_equity_curve": pd.DataFrame({"Equity": [10000.0, 10100.0, 10200.0]}),
-            "# Trades": 2,
-        }
+
+class FakePortfolio:
+    def __init__(self, close, entries, exits, init_cash, fees, slippage, freq):
+        self.close = close
+        self.entries = entries
+        self.exits = exits
+        self.init_cash = init_cash
+        self.fees = fees
+        self.slippage = slippage
+        self.freq = freq
+        self.trades = FakePortfolioTrades()
+
+    def value(self):
+        return pd.Series([10000.0, 10100.0, 10200.0], index=pd.date_range("2024-01-01", periods=3, freq="D"))
+
+
+class FakePortfolioFactory:
+    @staticmethod
+    def from_signals(close, entries, exits, init_cash, fees, slippage, freq):
+        return FakePortfolio(close, entries, exits, init_cash, fees, slippage, freq)
+
+
+class FakeVectorbt:
+    Portfolio = FakePortfolioFactory
 
 
 def test_build_cli_override_collects_strategy_params():
@@ -71,23 +86,22 @@ def test_run_single_fund_strategy_returns_summary(monkeypatch, sample_fund_df, t
     monkeypatch.setattr(runner, "filter_single_fund", lambda data, fund_code: data)
     monkeypatch.setattr(
         runner,
-        "adapt_to_backtesting_ohlc",
+        "adapt_to_price_series",
         lambda fund_df: (
-            pd.DataFrame(
-                {
-                    "Open": [1.0, 1.1, 1.2],
-                    "High": [1.0, 1.1, 1.2],
-                    "Low": [1.0, 1.1, 1.2],
-                    "Close": [1.0, 1.1, 1.2],
-                    "Volume": [1.0, 1.0, 1.0],
-                },
-                index=pd.date_range("2024-01-01", periods=3, freq="D"),
-            ),
-            "synthetic_from_nav",
+            pd.Series([1.0, 1.1, 1.2], index=pd.date_range("2024-01-01", periods=3, freq="D"), name="price"),
+            "nav_price_series",
         ),
     )
-    monkeypatch.setattr(runner, "build_strategy_class", lambda strategy_name, strategy_params=None: (object, strategy_params or {}))
-    monkeypatch.setattr(runner, "load_backtest_class", lambda: FakeBacktest)
+    monkeypatch.setattr(
+        runner,
+        "generate_signals",
+        lambda price_series, strategy_name, strategy_params=None: (
+            pd.Series([True, False, False], index=price_series.index),
+            pd.Series([False, False, False], index=price_series.index),
+            strategy_params or {},
+        ),
+    )
+    monkeypatch.setattr(runner, "load_vectorbt_module", lambda: FakeVectorbt)
     monkeypatch.setattr(
         runner,
         "compute_return_metrics",
@@ -106,3 +120,4 @@ def test_run_single_fund_strategy_returns_summary(monkeypatch, sample_fund_df, t
     assert result["fund_code"] == "007301"
     assert result["strategy_name"] == "buy_and_hold"
     assert result["trade_count"] == 2
+    assert result["data_mode"] == "nav_price_series"

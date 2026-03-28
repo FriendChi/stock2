@@ -2,18 +2,18 @@ import argparse
 from datetime import datetime
 
 from tradition.config import build_tradition_config
-from tradition.data_adapter import adapt_to_backtesting_ohlc
+from tradition.data_adapter import adapt_to_price_series
 from tradition.data_fetcher import fetch_fund_data_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
-from tradition.strategies import build_strategy_class
+from tradition.strategies import generate_signals
 
 
-def load_backtest_class():
-    # 延迟导入第三方回测库，减少模块导入阶段对环境完整性的强依赖。
-    from backtesting import Backtest
+def load_vectorbt_module():
+    # 延迟导入 vectorbt，减少模块导入阶段对环境完整性的强依赖。
+    import vectorbt as vbt
 
-    return Backtest
+    return vbt
 
 
 def build_cli_override(args):
@@ -73,8 +73,16 @@ def merge_strategy_params(default_param_dict, override_param_dict=None):
     return merged
 
 
+def extract_trade_count(portfolio):
+    # 统一把 vectorbt 的交易统计转成标量，避免不同返回类型污染结果结构。
+    trade_count = portfolio.trades.count()
+    if hasattr(trade_count, "item"):
+        return int(trade_count.item())
+    return int(trade_count)
+
+
 def run_single_fund_strategy(config_override=None):
-    # 统一入口收敛配置、拉数、适配、回测和结果输出，便于后续新增策略时复用同一主链。
+    # 统一入口收敛配置、拉数、信号回测和结果输出，便于后续新增策略时复用同一主链。
     config = build_tradition_config(config_override=config_override)
     raw_data = fetch_fund_data_with_cache(
         code_dict=config["code_dict"],
@@ -85,23 +93,25 @@ def run_single_fund_strategy(config_override=None):
     normalized_data = normalize_fund_data(raw_data)
     fund_code = str(config["default_fund_code"]).zfill(6)
     fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
-    backtest_input_df, data_mode = adapt_to_backtesting_ohlc(fund_df=fund_df)
+    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
 
     strategy_name = str(config["default_strategy_name"]).lower()
-    strategy_cls, strategy_params = build_strategy_class(
+    entries, exits, strategy_params = generate_signals(
+        price_series=price_series,
         strategy_name=strategy_name,
         strategy_params=config["strategy_param_dict"].get(strategy_name),
     )
-    Backtest = load_backtest_class()
-    backtest = Backtest(
-        backtest_input_df,
-        strategy_cls,
-        cash=float(config["init_cash"]),
-        commission=float(config["fees"]),
-        exclusive_orders=True,
+    vbt = load_vectorbt_module()
+    portfolio = vbt.Portfolio.from_signals(
+        close=price_series,
+        entries=entries,
+        exits=exits,
+        init_cash=float(config["init_cash"]),
+        fees=float(config["fees"]),
+        slippage=0.0,
+        freq="1D",
     )
-    stats = backtest.run()
-    equity_curve = stats["_equity_curve"]["Equity"]
+    equity_curve = portfolio.value()
     metric_dict = compute_return_metrics(equity_curve=equity_curve)
 
     date_str = datetime.today().strftime("%Y-%m-%d")
@@ -120,9 +130,9 @@ def run_single_fund_strategy(config_override=None):
         "equity_curve": equity_curve,
         "output_path": output_path,
         "data_mode": data_mode,
-        "sample_start": backtest_input_df.index.min(),
-        "sample_end": backtest_input_df.index.max(),
-        "trade_count": stats.get("# Trades", 0),
+        "sample_start": price_series.index.min(),
+        "sample_end": price_series.index.max(),
+        "trade_count": extract_trade_count(portfolio=portfolio),
     }
     print_run_summary(result=result)
     return result
