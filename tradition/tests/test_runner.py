@@ -63,6 +63,14 @@ def test_build_cli_override_collects_batch_codes():
     assert override["fund_code_list"] == ["007301", "012832"]
 
 
+def test_build_cli_override_collects_compare_all_flag():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(["--compare-all", "--fund-code", "7301"])
+    override = runner.build_cli_override(args)
+    assert override["compare_all"] is True
+    assert override["default_fund_code"] == "007301"
+
+
 def test_merge_strategy_params_overrides_single_strategy():
     merged = runner.merge_strategy_params(
         default_param_dict={"buy_and_hold": {}, "ma_cross": {"fast": 5, "slow": 20}},
@@ -212,4 +220,64 @@ def test_run_multi_fund_strategy_returns_summary(monkeypatch, tmp_path):
     result = runner.run_multi_fund_strategy()
 
     assert list(result["summary_df"]["fund_code"]) == ["012832", "007301"]
+    assert result["summary_path"].exists()
+
+
+def test_run_compare_all_strategies_returns_summary(monkeypatch, tmp_path):
+    fake_config = {
+        "code_dict": {"007301": "半导体"},
+        "data_dir": tmp_path,
+        "output_dir": tmp_path,
+        "force_refresh": False,
+        "cache_prefix": "tradition_fund",
+        "default_fund_code": "007301",
+        "default_strategy_name": "buy_and_hold",
+        "strategy_param_dict": {
+            "buy_and_hold": {},
+            "ma_cross": {"fast": 5, "slow": 20},
+            "momentum": {"window": 20},
+            "multi_factor_score": {
+                "entry_threshold": 0.2,
+                "exit_threshold": 0.0,
+                "factor_weight_dict": {},
+                "momentum_window_short": 20,
+                "momentum_window_long": 60,
+                "volatility_window": 20,
+                "drawdown_window": 60,
+                "score_window": 60,
+            },
+        },
+        "init_cash": 10000.0,
+        "fees": 0.001,
+    }
+    monkeypatch.setattr(runner, "build_tradition_config", lambda config_override=None: dict(fake_config, **(config_override or {})))
+    monkeypatch.setattr(runner, "fetch_fund_data_with_cache", lambda **kwargs: pd.DataFrame({"date": [], "code": [], "fund": [], "nav": []}))
+    monkeypatch.setattr(runner, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(
+        runner,
+        "run_single_fund_strategy_from_data",
+        lambda normalized_data, config, fund_code, print_summary=False: {
+            "fund_code": fund_code,
+            "strategy_name": config["default_strategy_name"],
+            "strategy_params": config["strategy_param_dict"][config["default_strategy_name"]],
+            "stats": {
+                "cumulative_return": 0.1,
+                "annual_return": 0.1 if config["default_strategy_name"] != "momentum" else 0.2,
+                "annual_volatility": 0.2,
+                "sharpe": 0.5 if config["default_strategy_name"] != "momentum" else 1.0,
+                "max_drawdown": -0.1,
+            },
+            "equity_curve": pd.Series([1.0, 1.1]),
+            "output_path": tmp_path / f"{config['default_strategy_name']}.png",
+            "data_mode": "nav_price_series",
+            "sample_start": pd.Timestamp("2024-01-01"),
+            "sample_end": pd.Timestamp("2024-01-02"),
+            "trade_count": 2,
+        },
+    )
+
+    result = runner.run_compare_all_strategies()
+
+    assert result["fund_code"] == "007301"
+    assert list(result["summary_df"]["strategy_name"])[0] == "momentum"
     assert result["summary_path"].exists()

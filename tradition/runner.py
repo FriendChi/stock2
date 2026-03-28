@@ -11,6 +11,9 @@ from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.strategies import generate_signals
 
 
+ALL_STRATEGY_NAME_LIST = ["buy_and_hold", "ma_cross", "momentum", "multi_factor_score"]
+
+
 def load_vectorbt_module():
     # 延迟导入 vectorbt，减少模块导入阶段对环境完整性的强依赖。
     import vectorbt as vbt
@@ -35,6 +38,8 @@ def build_cli_override(args):
         override["fees"] = float(args.fees)
     if args.batch_run:
         override["batch_run"] = True
+    if args.compare_all:
+        override["compare_all"] = True
 
     strategy_param_override = {}
     if args.ma_fast is not None:
@@ -56,10 +61,11 @@ def build_arg_parser():
     parser.add_argument(
         "--strategy-name",
         dest="strategy_name",
-        choices=["buy_and_hold", "ma_cross", "momentum", "multi_factor_score"],
+        choices=ALL_STRATEGY_NAME_LIST,
         help="策略名称",
     )
     parser.add_argument("--batch-run", action="store_true", help="按基金池批量运行当前策略并输出汇总表")
+    parser.add_argument("--compare-all", action="store_true", help="对单只基金运行全部策略并输出对比表")
     parser.add_argument("--force-refresh", action="store_true", help="忽略当天缓存并重新拉取 AkShare 数据")
     parser.add_argument("--init-cash", dest="init_cash", type=float, help="初始资金")
     parser.add_argument("--fees", dest="fees", type=float, help="手续费率")
@@ -90,7 +96,7 @@ def extract_trade_count(portfolio):
 
 
 def build_summary_record(result):
-    # 汇总表固定展开核心指标字段，便于跨基金横向比较。
+    # 汇总表固定展开核心指标字段，便于跨基金或跨策略横向比较。
     return {
         "fund_code": result["fund_code"],
         "strategy_name": result["strategy_name"],
@@ -108,7 +114,7 @@ def build_summary_record(result):
 
 
 def build_summary_table(result_list):
-    # 汇总表按 Sharpe 和年化收益降序排序，优先展示风险收益比更好的基金。
+    # 汇总表按 Sharpe 和年化收益降序排序，优先展示风险收益比更好的结果。
     if len(result_list) == 0:
         raise ValueError("result_list 为空，无法构建汇总表。")
     summary_df = pd.DataFrame([build_summary_record(result) for result in result_list])
@@ -116,18 +122,18 @@ def build_summary_table(result_list):
     return summary_df
 
 
-def save_summary_table(summary_df, output_dir, strategy_name):
-    # 批量模式下把汇总结果落成 CSV，便于后续继续分析与比较。
+def save_summary_table(summary_df, output_dir, summary_name):
+    # 批量模式和单基金多策略模式都用统一 CSV 输出逻辑，便于后续继续分析与比较。
     output_dir.mkdir(parents=True, exist_ok=True)
     date_str = datetime.today().strftime("%Y-%m-%d")
-    output_path = output_dir / f"summary_{strategy_name}_{date_str}.csv"
+    output_path = output_dir / f"summary_{summary_name}_{date_str}.csv"
     summary_df.to_csv(output_path, index=False)
     return output_path
 
 
-def print_summary_table(summary_df, summary_path):
-    # 终端只打印最关键列，避免批量模式输出过长难以阅读。
-    print("批量回测汇总:")
+def print_summary_table(summary_df, summary_path, title):
+    # 终端只打印最关键列，避免汇总模式输出过长难以阅读。
+    print(title)
     printable_df = summary_df[["fund_code", "strategy_name", "annual_return", "sharpe", "max_drawdown", "trade_count"]].copy()
     print(printable_df.to_string(index=False))
     print("汇总输出:", summary_path)
@@ -142,7 +148,7 @@ def resolve_fund_code_list(config):
 
 
 def run_single_fund_strategy_from_data(normalized_data, config, fund_code, print_summary=True):
-    # 复用同一份标准化数据执行单基金回测，避免批量模式对同一天缓存重复读取与解析。
+    # 复用同一份标准化数据执行单基金回测，避免不同模式对同一天缓存重复读取与解析。
     fund_code = str(fund_code).zfill(6)
     fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
     price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
@@ -192,7 +198,7 @@ def run_single_fund_strategy_from_data(normalized_data, config, fund_code, print
 
 
 def run_single_fund_strategy(config_override=None):
-    # 单基金模式在数据准备后复用通用执行函数，保持与批量模式同一回测口径。
+    # 单基金模式在数据准备后复用通用执行函数，保持与其他模式同一回测口径。
     config = build_tradition_config(config_override=config_override)
     raw_data = fetch_fund_data_with_cache(
         code_dict=config["code_dict"],
@@ -230,13 +236,52 @@ def run_multi_fund_strategy(config_override=None):
         )
         result_list.append(result)
     summary_df = build_summary_table(result_list=result_list)
+    strategy_name = str(config["default_strategy_name"]).lower()
     summary_path = save_summary_table(
         summary_df=summary_df,
         output_dir=config["output_dir"],
-        strategy_name=str(config["default_strategy_name"]).lower(),
+        summary_name=strategy_name,
     )
-    print_summary_table(summary_df=summary_df, summary_path=summary_path)
+    print_summary_table(summary_df=summary_df, summary_path=summary_path, title="批量回测汇总:")
     return {
+        "result_list": result_list,
+        "summary_df": summary_df,
+        "summary_path": summary_path,
+    }
+
+
+def run_compare_all_strategies(config_override=None):
+    # 单基金多策略模式统一使用同一份数据，避免对相同基金重复拉数和重复解析。
+    config = build_tradition_config(config_override=config_override)
+    raw_data = fetch_fund_data_with_cache(
+        code_dict=config["code_dict"],
+        cache_dir=config["data_dir"],
+        force_refresh=bool(config["force_refresh"]),
+        cache_prefix=config["cache_prefix"],
+    )
+    normalized_data = normalize_fund_data(raw_data)
+    fund_code = str(config["default_fund_code"]).zfill(6)
+    result_list = []
+    for strategy_name in ALL_STRATEGY_NAME_LIST:
+        strategy_config = dict(config)
+        strategy_config["default_strategy_name"] = strategy_name
+        result = run_single_fund_strategy_from_data(
+            normalized_data=normalized_data,
+            config=strategy_config,
+            fund_code=fund_code,
+            print_summary=False,
+        )
+        result_list.append(result)
+    summary_df = build_summary_table(result_list=result_list)
+    summary_name = f"{fund_code}_all_strategies"
+    summary_path = save_summary_table(
+        summary_df=summary_df,
+        output_dir=config["output_dir"],
+        summary_name=summary_name,
+    )
+    print_summary_table(summary_df=summary_df, summary_path=summary_path, title=f"单基金多策略对比: {fund_code}")
+    return {
+        "fund_code": fund_code,
         "result_list": result_list,
         "summary_df": summary_df,
         "summary_path": summary_path,
@@ -260,7 +305,7 @@ def print_run_summary(result):
 
 
 def main(argv=None):
-    # 第一阶段支持单基金和批量模式，命令行只用于覆盖少量默认配置。
+    # 第一阶段支持单基金、单基金多策略和批量模式，命令行只用于覆盖少量默认配置。
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     cli_override = build_cli_override(args)
@@ -274,7 +319,11 @@ def main(argv=None):
                 override_param_dict=strategy_param_dict,
             )
         config_override = base_config
-    if bool((config_override or {}).get("batch_run", False)):
+    mode_config = config_override or {}
+    if bool(mode_config.get("compare_all", False)):
+        run_compare_all_strategies(config_override=config_override)
+        return
+    if bool(mode_config.get("batch_run", False)):
         run_multi_fund_strategy(config_override=config_override)
         return
     run_single_fund_strategy(config_override=config_override)
