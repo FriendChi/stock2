@@ -119,6 +119,13 @@ def test_compute_objective_value_penalizes_drawdown():
     assert round(value, 4) == 0.94
 
 
+
+def test_resolve_top_k_count_uses_trial_ratio_with_minimum():
+    assert optimizer.resolve_top_k_count({"n_trials": 3}) == 5
+    assert optimizer.resolve_top_k_count({"n_trials": 20}) == 5
+    assert optimizer.resolve_top_k_count({"n_trials": 50}) == 10
+
+
 def test_build_top_k_params_list_sorts_by_train_objective():
     study = FakeStudy(
         [
@@ -131,9 +138,9 @@ def test_build_top_k_params_list_sorts_by_train_objective():
         study=study,
         strategy_name="momentum",
         base_params={"window": 20},
-        optimization_config={"top_k": 2},
+        optimization_config={"n_trials": 50},
     )
-    assert [item["trial_number"] for item in top_k] == [1, 2]
+    assert [item["trial_number"] for item in top_k] == [1, 2, 0]
 
 
 
