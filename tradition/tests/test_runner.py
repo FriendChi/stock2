@@ -151,6 +151,17 @@ def test_build_param_signature_supports_nested_dict():
     assert signature[1][0] == "factor_weight_dict"
 
 
+
+def test_extract_segment_equity_curves_keeps_previous_day():
+    equity_curve = pd.Series([100.0, 101.0, 103.0, 102.0], index=pd.date_range("2024-01-01", periods=4, freq="D"))
+    metric_curve, display_curve = runner.extract_segment_equity_curves(
+        equity_curve=equity_curve,
+        segment_index=equity_curve.index[2:],
+    )
+    assert list(display_curve.index) == list(equity_curve.index[2:])
+    assert list(metric_curve.index) == list(equity_curve.index[1:])
+
+
 def test_run_single_price_series_strategy_returns_summary(monkeypatch, tmp_path):
     config = {
         "output_dir": tmp_path,
@@ -171,7 +182,7 @@ def test_run_single_price_series_strategy_returns_summary(monkeypatch, tmp_path)
     monkeypatch.setattr(
         runner,
         "compute_return_metrics",
-        lambda equity_curve: {
+        lambda equity_curve, rf_series=None: {
             "cumulative_return": 0.02,
             "annual_return": 0.5,
             "annual_volatility": 0.1,
@@ -463,28 +474,64 @@ def test_run_optimize_single_fund_strategy_returns_summary(monkeypatch, sample_f
             "trial_df": pd.DataFrame([{"value": 0.95}]),
         },
     )
-    monkeypatch.setattr(
-        runner,
-        "run_single_price_series_strategy",
-        lambda price_series, config, fund_code, strategy_name, strategy_params=None, print_summary=False, save_plot=False, data_mode="nav_price_series", output_name=None: {
+    execution_call_lengths = []
+    metric_segment_starts = []
+
+    def fake_execute_price_series_strategy(price_series, config, strategy_name, strategy_params=None):
+        execution_call_lengths.append(len(price_series))
+        return {
+            "price_series": price_series,
+            "entries": pd.Series(False, index=price_series.index),
+            "exits": pd.Series(False, index=price_series.index),
+            "resolved_params": strategy_params or {},
+            "portfolio": FakePortfolio(price_series, None, None, config["init_cash"], config["fees"], 0.0, "1D"),
+            "equity_curve": pd.Series(range(100, 100 + len(price_series)), index=price_series.index, dtype=float),
+        }
+
+    def fake_build_result_from_execution(
+        execution_result,
+        fund_code,
+        strategy_name,
+        data_mode="nav_price_series",
+        save_plot=False,
+        output_dir=None,
+        output_name=None,
+        title=None,
+        print_summary=False,
+        segment_index=None,
+        rf_series=None,
+    ):
+        if segment_index is None:
+            segment_index = execution_result["price_series"].index
+        segment_index = pd.Index(segment_index)
+        metric_segment_starts.append(segment_index.min())
+        short_window = (execution_result["resolved_params"] or {}).get("momentum_window_short", 0)
+        sharpe = 0.8
+        if segment_index.min() == pd.Timestamp("2024-01-07"):
+            sharpe = 1.0 if short_window == 30 else 0.6
+        elif segment_index.min() == pd.Timestamp("2024-01-10"):
+            sharpe = 0.7
+        return {
             "fund_code": fund_code,
             "strategy_name": strategy_name,
-            "strategy_params": strategy_params or {},
+            "strategy_params": execution_result["resolved_params"],
             "stats": {
                 "cumulative_return": 0.1,
                 "annual_return": 0.2,
                 "annual_volatility": 0.1,
-                "sharpe": 0.8,
+                "sharpe": sharpe,
                 "max_drawdown": -0.2,
             },
-            "equity_curve": pd.Series([1.0, 1.1]),
+            "equity_curve": execution_result["equity_curve"].loc[segment_index],
             "output_path": tmp_path / (output_name or "test.png"),
             "data_mode": data_mode,
-            "sample_start": price_series.index.min(),
-            "sample_end": price_series.index.max(),
-            "trade_count": 2,
-        },
-    )
+            "sample_start": segment_index.min(),
+            "sample_end": segment_index.max(),
+            "trade_count": 0,
+        }
+
+    monkeypatch.setattr(runner, "execute_price_series_strategy", fake_execute_price_series_strategy)
+    monkeypatch.setattr(runner, "build_result_from_execution", fake_build_result_from_execution)
 
     result = runner.run_optimize_single_fund_strategy()
 
@@ -494,3 +541,5 @@ def test_run_optimize_single_fund_strategy_returns_summary(monkeypatch, sample_f
     assert len(result["candidate_result_list"]) == 2
     assert result["best_candidate_source"] in {"top_k", "improving_best", "improving_best,top_k", "top_k,improving_best"}
     assert result["trial_path"].exists()
+    assert execution_call_lengths == [12, 12]
+    assert metric_segment_starts == [pd.Timestamp("2024-01-07"), pd.Timestamp("2024-01-07"), pd.Timestamp("2024-01-10")]

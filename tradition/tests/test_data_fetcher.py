@@ -3,7 +3,7 @@ import types
 
 import pandas as pd
 
-from tradition.data_fetcher import build_cache_path, fetch_fund_data_with_cache
+from tradition.data_fetcher import build_cache_path, build_range_cache_path, fetch_fund_data_with_cache, fetch_treasury_yield_with_cache
 
 
 class FakeAkshareModule:
@@ -75,3 +75,50 @@ def test_fetch_fund_data_with_cache_hits_existing_cache(tmp_path, monkeypatch):
     )
 
     assert data.iloc[0]["code"] == "007301"
+
+
+def test_build_range_cache_path_uses_start_end(tmp_path):
+    cache_path = build_range_cache_path(tmp_path, cache_prefix="tradition_rf", start_date="2024-01-01", end_date="2024-12-31")
+    assert cache_path.name == "tradition_rf_2024-01-01_2024-12-31.csv"
+
+
+def test_fetch_treasury_yield_with_cache_writes_cache(tmp_path, monkeypatch):
+    fake_module = types.SimpleNamespace(
+        bond_china_yield=lambda start_date, end_date: pd.DataFrame(
+            {
+                "曲线名称": ["中债国债收益率曲线", "中债国债收益率曲线"],
+                "日期": ["2024-01-01", "2024-01-02"],
+                "1年": [2.10, 2.20],
+            }
+        )
+    )
+    monkeypatch.setitem(sys.modules, "akshare", fake_module)
+
+    data = fetch_treasury_yield_with_cache(
+        cache_dir=tmp_path,
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        force_refresh=True,
+        cache_prefix="tradition_rf",
+    )
+
+    assert list(data.columns) == ["date", "annual_rf"]
+    assert data.iloc[0]["annual_rf"] == 0.021
+    assert (tmp_path / "tradition_rf_2024-01-01_2024-01-02.csv").exists()
+
+
+def test_fetch_treasury_yield_with_cache_hits_existing_cache(tmp_path, monkeypatch):
+    cache_path = tmp_path / "tradition_rf_2024-01-01_2024-01-02.csv"
+    pd.DataFrame({"date": ["2024-01-01"], "annual_rf": [0.021]}).to_csv(cache_path, index=False)
+    fake_module = types.SimpleNamespace(bond_china_yield=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not call akshare")))
+    monkeypatch.setitem(sys.modules, "akshare", fake_module)
+
+    data = fetch_treasury_yield_with_cache(
+        cache_dir=tmp_path,
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        force_refresh=False,
+        cache_prefix="tradition_rf",
+    )
+
+    assert float(data.iloc[0]["annual_rf"]) == 0.021

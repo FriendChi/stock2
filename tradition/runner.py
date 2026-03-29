@@ -5,7 +5,7 @@ import pandas as pd
 
 from tradition.config import build_tradition_config
 from tradition.data_adapter import adapt_to_price_series
-from tradition.data_fetcher import fetch_fund_data_with_cache
+from tradition.data_fetcher import fetch_fund_data_with_cache, fetch_treasury_yield_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.optimizer import optimize_strategy_params
@@ -116,6 +116,27 @@ def extract_trade_count(portfolio):
     return int(trade_count)
 
 
+
+def load_rf_series_for_price_series(config, price_series):
+    # 无风险利率在评估层按基金日期区间拉取并对齐，避免影响策略信号与回测执行逻辑。
+    rf_config = config.get("rf_config")
+    if not isinstance(rf_config, dict) or not bool(rf_config.get("enabled", False)):
+        return None
+    price_index = pd.DatetimeIndex(pd.Series(price_series).dropna().index)
+    if len(price_index) == 0:
+        return None
+    rf_df = fetch_treasury_yield_with_cache(
+        cache_dir=config["data_dir"],
+        start_date=price_index.min().strftime("%Y-%m-%d"),
+        end_date=price_index.max().strftime("%Y-%m-%d"),
+        force_refresh=bool(config.get("force_refresh", False)),
+        cache_prefix=str(rf_config["cache_prefix"]),
+        curve_name=str(rf_config["curve_name"]),
+        tenor=str(rf_config["tenor"]),
+    )
+    return pd.Series(rf_df["annual_rf"].values, index=pd.to_datetime(rf_df["date"]), dtype=float)
+
+
 def build_summary_record(result):
     # 汇总表固定展开核心指标字段，便于跨基金或跨策略横向比较。
     return {
@@ -186,18 +207,9 @@ def build_param_signature(params):
         return tuple(build_param_signature(item) for item in params)
     return params
 
-def run_single_price_series_strategy(
-    price_series,
-    config,
-    fund_code,
-    strategy_name,
-    strategy_params=None,
-    print_summary=True,
-    save_plot=True,
-    data_mode="nav_price_series",
-    output_name=None,
-):
-    # 单段价格序列回测统一收敛在这里，普通运行和参数优化都复用同一执行口径。
+
+def execute_price_series_strategy(price_series, config, strategy_name, strategy_params=None):
+    # 执行层只负责在完整价格序列上生成信号与权益曲线，评估区间切片交给上层处理。
     price_series = pd.Series(price_series, copy=True).astype(float)
     entries, exits, resolved_params = generate_signals(
         price_series=price_series,
@@ -214,36 +226,125 @@ def run_single_price_series_strategy(
         slippage=0.0,
         freq="1D",
     )
-    equity_curve = portfolio.value()
-    metric_dict = compute_return_metrics(equity_curve=equity_curve)
+    return {
+        "price_series": price_series,
+        "entries": entries.astype(bool),
+        "exits": exits.astype(bool),
+        "resolved_params": resolved_params,
+        "portfolio": portfolio,
+        "equity_curve": pd.Series(portfolio.value(), dtype=float).dropna(),
+    }
+
+
+def extract_segment_equity_curves(equity_curve, segment_index):
+    # 分段评估时保留目标区间上一日权益作为 warm-up，避免首日收益被切片边界吞掉。
+    full_equity_curve = pd.Series(equity_curve, dtype=float).dropna()
+    segment_index = pd.Index(segment_index)
+    segment_equity_curve = full_equity_curve.loc[segment_index].copy()
+    if segment_equity_curve.empty:
+        raise ValueError("segment_index 对应的权益曲线为空，无法评估分段结果。")
+
+    metric_equity_curve = segment_equity_curve.copy()
+    first_loc = full_equity_curve.index.get_loc(segment_equity_curve.index[0])
+    if isinstance(first_loc, int) and first_loc > 0:
+        metric_equity_curve = pd.concat([full_equity_curve.iloc[[first_loc - 1]], segment_equity_curve])
+    return metric_equity_curve, segment_equity_curve
+
+
+def build_result_from_execution(
+    execution_result,
+    fund_code,
+    strategy_name,
+    data_mode="nav_price_series",
+    save_plot=False,
+    output_dir=None,
+    output_name=None,
+    title=None,
+    print_summary=False,
+    segment_index=None,
+    rf_series=None,
+):
+    # 同一份完整执行结果可以按全样本或子区间复用，避免验证集和测试集重复冷启动回测。
+    price_series = execution_result["price_series"]
+    equity_curve = execution_result["equity_curve"]
+    entries = execution_result["entries"]
+
+    sample_index = price_series.index if segment_index is None else pd.Index(segment_index)
+    metric_equity_curve = equity_curve
+    display_equity_curve = equity_curve
+    if segment_index is not None:
+        metric_equity_curve, display_equity_curve = extract_segment_equity_curves(
+            equity_curve=equity_curve,
+            segment_index=sample_index,
+        )
+    metric_dict = compute_return_metrics(equity_curve=metric_equity_curve, rf_series=rf_series)
 
     output_path = None
     if save_plot:
+        if output_dir is None:
+            raise ValueError("save_plot=True 时必须提供 output_dir。")
         date_str = datetime.today().strftime("%Y-%m-%d")
         if output_name is None:
             output_name = f"{fund_code}_{strategy_name}_{date_str}.png"
-        output_path = config["output_dir"] / output_name
+        output_path = output_dir / output_name
         save_equity_curve_plot(
-            equity_curve=equity_curve,
+            equity_curve=display_equity_curve,
             output_path=output_path,
-            title=f"{fund_code} {strategy_name}",
+            title=title or f"{fund_code} {strategy_name}",
         )
+
+    trade_count = extract_trade_count(portfolio=execution_result["portfolio"])
+    if segment_index is not None:
+        trade_count = int(entries.reindex(sample_index, fill_value=False).sum())
 
     result = {
         "fund_code": str(fund_code).zfill(6),
         "strategy_name": str(strategy_name).lower(),
-        "strategy_params": resolved_params,
+        "strategy_params": execution_result["resolved_params"],
         "stats": metric_dict,
-        "equity_curve": equity_curve,
+        "equity_curve": display_equity_curve,
         "output_path": output_path,
         "data_mode": data_mode,
-        "sample_start": price_series.index.min(),
-        "sample_end": price_series.index.max(),
-        "trade_count": extract_trade_count(portfolio=portfolio),
+        "sample_start": sample_index.min(),
+        "sample_end": sample_index.max(),
+        "trade_count": trade_count,
     }
     if print_summary:
         print_run_summary(result=result)
     return result
+
+
+def run_single_price_series_strategy(
+    price_series,
+    config,
+    fund_code,
+    strategy_name,
+    strategy_params=None,
+    print_summary=True,
+    save_plot=True,
+    data_mode="nav_price_series",
+    output_name=None,
+):
+    # 单段价格序列普通回测仍复用完整执行结果，但默认按全样本输出指标与图像。
+    execution_result = execute_price_series_strategy(
+        price_series=price_series,
+        config=config,
+        strategy_name=strategy_name,
+        strategy_params=strategy_params,
+    )
+    rf_series = load_rf_series_for_price_series(config=config, price_series=price_series)
+    return build_result_from_execution(
+        execution_result=execution_result,
+        fund_code=fund_code,
+        strategy_name=strategy_name,
+        data_mode=data_mode,
+        save_plot=save_plot,
+        output_dir=config["output_dir"],
+        output_name=output_name,
+        title=f"{fund_code} {strategy_name}",
+        print_summary=print_summary,
+        rf_series=rf_series,
+    )
 
 
 def run_single_fund_strategy_from_data(normalized_data, config, fund_code, print_summary=True):
@@ -394,22 +495,29 @@ def run_optimize_single_fund_strategy(config_override=None):
     fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
     price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
     split_dict = split_time_series_by_ratio(price_series=price_series, split_config=config["data_split_dict"])
+    rf_series = load_rf_series_for_price_series(config=config, price_series=price_series)
 
     strategy_name = resolve_optimization_strategy_name(config)
     base_params = config["strategy_param_dict"].get(strategy_name)
     optimization_config = dict(config["optimization_config"])
 
     def evaluate_params_fn(strategy_params):
-        # 训练集是唯一允许 Optuna objective 直接消费的数据区间。
-        return run_single_price_series_strategy(
-            price_series=split_dict["train"],
+        # 训练集 objective 改为基于完整历史执行后切片评估，避免分段独立回测导致窗口冷启动。
+        execution_result = execute_price_series_strategy(
+            price_series=price_series,
             config=config,
-            fund_code=fund_code,
             strategy_name=strategy_name,
             strategy_params=strategy_params,
-            print_summary=False,
-            save_plot=False,
+        )
+        return build_result_from_execution(
+            execution_result=execution_result,
+            fund_code=fund_code,
+            strategy_name=strategy_name,
             data_mode=data_mode,
+            save_plot=False,
+            print_summary=False,
+            segment_index=split_dict["train"].index,
+            rf_series=rf_series,
         )
 
     optimization_result = optimize_strategy_params(
@@ -437,44 +545,63 @@ def run_optimize_single_fund_strategy(config_override=None):
             deduplicated_candidate_dict[param_key]["train_objective"] = candidate["train_objective"]
             deduplicated_candidate_dict[param_key]["trial_number"] = candidate["trial_number"]
 
-    candidate_result_list = []
+    candidate_evaluation_list = []
     for candidate in deduplicated_candidate_dict.values():
-        valid_result = run_single_price_series_strategy(
-            price_series=split_dict["valid"],
+        execution_result = execute_price_series_strategy(
+            price_series=price_series,
             config=config,
-            fund_code=fund_code,
             strategy_name=strategy_name,
             strategy_params=candidate["params"],
-            print_summary=False,
-            save_plot=False,
-            data_mode=data_mode,
         )
-        candidate_result_list.append(
+        valid_result = build_result_from_execution(
+            execution_result=execution_result,
+            fund_code=fund_code,
+            strategy_name=strategy_name,
+            data_mode=data_mode,
+            save_plot=False,
+            print_summary=False,
+            segment_index=split_dict["valid"].index,
+            rf_series=rf_series,
+        )
+        candidate_evaluation_list.append(
             {
                 "trial_number": candidate["trial_number"],
                 "train_objective": candidate["train_objective"],
                 "params": candidate["params"],
                 "candidate_source_set": sorted(candidate["candidate_source_set"]),
                 "valid_result": valid_result,
+                "execution_result": execution_result,
             }
         )
 
-    best_candidate = max(candidate_result_list, key=lambda item: float(item["valid_result"]["stats"]["sharpe"]))
+    best_candidate = max(candidate_evaluation_list, key=lambda item: float(item["valid_result"]["stats"]["sharpe"]))
     best_params = dict(best_candidate["params"])
     valid_result = best_candidate["valid_result"]
     best_candidate_source = ",".join(best_candidate["candidate_source_set"])
+    candidate_result_list = [
+        {
+            "trial_number": item["trial_number"],
+            "train_objective": item["train_objective"],
+            "params": item["params"],
+            "candidate_source_set": item["candidate_source_set"],
+            "valid_result": item["valid_result"],
+        }
+        for item in candidate_evaluation_list
+    ]
 
     test_output_name = f"{fund_code}_{strategy_name}_test_best_{datetime.today().strftime('%Y-%m-%d')}.png"
-    test_result = run_single_price_series_strategy(
-        price_series=split_dict["test"],
-        config=config,
+    test_result = build_result_from_execution(
+        execution_result=best_candidate["execution_result"],
         fund_code=fund_code,
         strategy_name=strategy_name,
-        strategy_params=best_params,
-        print_summary=False,
-        save_plot=True,
         data_mode=data_mode,
+        save_plot=True,
+        output_dir=config["output_dir"],
         output_name=test_output_name,
+        title=f"{fund_code} {strategy_name}",
+        print_summary=False,
+        segment_index=split_dict["test"].index,
+        rf_series=rf_series,
     )
     trial_path = save_trial_table(
         trial_df=optimization_result["trial_df"],
