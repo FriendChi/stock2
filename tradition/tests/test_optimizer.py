@@ -111,6 +111,30 @@ def test_suggest_strategy_params_for_multi_factor_score():
     assert params["exit_threshold"] == -0.1
 
 
+def test_suggest_strategy_params_caps_exit_threshold_by_entry_threshold():
+    params = optimizer.suggest_strategy_params(
+        trial=FakeTrial({
+            "momentum_window_short": 20,
+            "momentum_window_long": 80,
+            "entry_threshold": 0.1,
+            "exit_threshold": 0.2,
+        }),
+        strategy_name="multi_factor_score",
+        base_params={
+            "momentum_window_short": 10,
+            "momentum_window_long": 60,
+            "volatility_window": 20,
+            "drawdown_window": 60,
+            "score_window": 60,
+            "factor_weight_dict": {"momentum_20": 0.3},
+            "entry_threshold": 0.1,
+            "exit_threshold": 0.0,
+        },
+    )
+    assert params["entry_threshold"] == 0.1
+    assert params["exit_threshold"] <= params["entry_threshold"]
+
+
 def test_compute_objective_value_penalizes_drawdown():
     value = optimizer.compute_objective_value(
         metric_dict={"sharpe": 1.0, "max_drawdown": -0.3},

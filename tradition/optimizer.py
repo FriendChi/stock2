@@ -30,12 +30,14 @@ def suggest_strategy_params(trial, strategy_name, base_params):
     if strategy_name == "multi_factor_score":
         short_window = trial.suggest_int("momentum_window_short", 10, 40, step=5)
         long_window = trial.suggest_int("momentum_window_long", short_window + 20, 120)
+        entry_threshold = trial.suggest_float("entry_threshold", -0.2, 1.0, step=0.1)
+        exit_threshold = trial.suggest_float("exit_threshold", -0.8, min(0.2, entry_threshold), step=0.1)
         params.update(
             {
                 "momentum_window_short": short_window,
                 "momentum_window_long": long_window,
-                "entry_threshold": trial.suggest_float("entry_threshold", -0.2, 1.0, step=0.1),
-                "exit_threshold": trial.suggest_float("exit_threshold", -0.8, 0.2, step=0.1),
+                "entry_threshold": entry_threshold,
+                "exit_threshold": min(exit_threshold, entry_threshold),
             }
         )
         return params
