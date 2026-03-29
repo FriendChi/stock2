@@ -44,6 +44,23 @@ DEFAULT_STRATEGY_PARAM_DICT = {
     },
 }
 
+DEFAULT_DATA_SPLIT_DICT = {
+    "train_ratio": 0.6,
+    "valid_ratio": 0.2,
+    "test_ratio": 0.2,
+    "min_segment_size": 60,
+}
+
+DEFAULT_OPTIMIZATION_CONFIG = {
+    "default_target_strategy_name": "multi_factor_score",
+    "n_trials": 30,
+    "top_k": 5,
+    "study_direction": "maximize",
+    "study_name_prefix": "tradition_optuna",
+    "target_metric": "sharpe",
+    "penalty_weight": 0.2,
+}
+
 
 @dataclass
 class TraditionConfig:
@@ -51,6 +68,8 @@ class TraditionConfig:
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1])
     code_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_CODE_DICT))
     strategy_param_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_STRATEGY_PARAM_DICT))
+    data_split_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_DATA_SPLIT_DICT))
+    optimization_config: dict = field(default_factory=lambda: deepcopy(DEFAULT_OPTIMIZATION_CONFIG))
     default_fund_code: str = "007301"
     default_strategy_name: str = "buy_and_hold"
     init_cash: float = 10000.0

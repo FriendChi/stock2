@@ -8,6 +8,8 @@ from tradition.data_adapter import adapt_to_price_series
 from tradition.data_fetcher import fetch_fund_data_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
+from tradition.optimizer import optimize_strategy_params
+from tradition.splitter import split_time_series_by_ratio
 from tradition.strategies import generate_signals
 
 
@@ -40,6 +42,8 @@ def build_cli_override(args):
         override["batch_run"] = True
     if args.compare_all:
         override["compare_all"] = True
+    if args.optimize:
+        override["optimize"] = True
 
     strategy_param_override = {}
     if args.ma_fast is not None:
@@ -50,6 +54,12 @@ def build_cli_override(args):
         strategy_param_override.setdefault("momentum", {})["window"] = int(args.momentum_window)
     if len(strategy_param_override) > 0:
         override["strategy_param_dict"] = strategy_param_override
+
+    optimization_override = {}
+    if args.n_trials is not None:
+        optimization_override["n_trials"] = int(args.n_trials)
+    if len(optimization_override) > 0:
+        override["optimization_config"] = optimization_override
     return override
 
 
@@ -66,12 +76,14 @@ def build_arg_parser():
     )
     parser.add_argument("--batch-run", action="store_true", help="按基金池批量运行当前策略并输出汇总表")
     parser.add_argument("--compare-all", action="store_true", help="对单只基金运行全部策略并输出对比表")
+    parser.add_argument("--optimize", action="store_true", help="对单只基金执行训练/验证/测试切分后的 Optuna 参数优化")
     parser.add_argument("--force-refresh", action="store_true", help="忽略当天缓存并重新拉取 AkShare 数据")
     parser.add_argument("--init-cash", dest="init_cash", type=float, help="初始资金")
     parser.add_argument("--fees", dest="fees", type=float, help="手续费率")
     parser.add_argument("--ma-fast", dest="ma_fast", type=int, help="ma_cross 策略短均线窗口")
     parser.add_argument("--ma-slow", dest="ma_slow", type=int, help="ma_cross 策略长均线窗口")
     parser.add_argument("--momentum-window", dest="momentum_window", type=int, help="momentum 策略动量窗口")
+    parser.add_argument("--n-trials", dest="n_trials", type=int, help="Optuna trial 数量")
     return parser
 
 
@@ -84,6 +96,15 @@ def merge_strategy_params(default_param_dict, override_param_dict=None):
         current_params = dict(merged.get(strategy_name, {}))
         current_params.update(param_dict)
         merged[strategy_name] = current_params
+    return merged
+
+
+def merge_optimization_config(default_optimization_config, override_optimization_config=None):
+    # 优化配置独立合并，避免把 Optuna 细节散落到 runner 其余逻辑。
+    merged = dict(default_optimization_config)
+    if override_optimization_config is None:
+        return merged
+    merged.update(override_optimization_config)
     return merged
 
 
@@ -147,17 +168,41 @@ def resolve_fund_code_list(config):
     return sorted([str(code).zfill(6) for code in config["code_dict"].keys()])
 
 
-def run_single_fund_strategy_from_data(normalized_data, config, fund_code, print_summary=True):
-    # 复用同一份标准化数据执行单基金回测，避免不同模式对同一天缓存重复读取与解析。
-    fund_code = str(fund_code).zfill(6)
-    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
-    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
+def resolve_optimization_strategy_name(config):
+    # 优化默认聚焦 multi_factor_score，但允许用户通过 strategy_name 显式覆盖。
+    default_strategy_name = str(config["default_strategy_name"]).lower()
+    if default_strategy_name != "buy_and_hold":
+        return default_strategy_name
+    optimization_config = config["optimization_config"]
+    return str(optimization_config["default_target_strategy_name"]).lower()
 
-    strategy_name = str(config["default_strategy_name"]).lower()
-    entries, exits, strategy_params = generate_signals(
+
+
+def build_param_signature(params):
+    # 候选去重需要支持嵌套字典参数，统一递归转成可哈希签名。
+    if isinstance(params, dict):
+        return tuple((key, build_param_signature(value)) for key, value in sorted(params.items(), key=lambda item: item[0]))
+    if isinstance(params, list):
+        return tuple(build_param_signature(item) for item in params)
+    return params
+
+def run_single_price_series_strategy(
+    price_series,
+    config,
+    fund_code,
+    strategy_name,
+    strategy_params=None,
+    print_summary=True,
+    save_plot=True,
+    data_mode="nav_price_series",
+    output_name=None,
+):
+    # 单段价格序列回测统一收敛在这里，普通运行和参数优化都复用同一执行口径。
+    price_series = pd.Series(price_series, copy=True).astype(float)
+    entries, exits, resolved_params = generate_signals(
         price_series=price_series,
         strategy_name=strategy_name,
-        strategy_params=config["strategy_param_dict"].get(strategy_name),
+        strategy_params=strategy_params,
     )
     vbt = load_vectorbt_module()
     portfolio = vbt.Portfolio.from_signals(
@@ -172,18 +217,22 @@ def run_single_fund_strategy_from_data(normalized_data, config, fund_code, print
     equity_curve = portfolio.value()
     metric_dict = compute_return_metrics(equity_curve=equity_curve)
 
-    date_str = datetime.today().strftime("%Y-%m-%d")
-    output_path = config["output_dir"] / f"{fund_code}_{strategy_name}_{date_str}.png"
-    save_equity_curve_plot(
-        equity_curve=equity_curve,
-        output_path=output_path,
-        title=f"{fund_code} {strategy_name}",
-    )
+    output_path = None
+    if save_plot:
+        date_str = datetime.today().strftime("%Y-%m-%d")
+        if output_name is None:
+            output_name = f"{fund_code}_{strategy_name}_{date_str}.png"
+        output_path = config["output_dir"] / output_name
+        save_equity_curve_plot(
+            equity_curve=equity_curve,
+            output_path=output_path,
+            title=f"{fund_code} {strategy_name}",
+        )
 
     result = {
-        "fund_code": fund_code,
-        "strategy_name": strategy_name,
-        "strategy_params": strategy_params,
+        "fund_code": str(fund_code).zfill(6),
+        "strategy_name": str(strategy_name).lower(),
+        "strategy_params": resolved_params,
         "stats": metric_dict,
         "equity_curve": equity_curve,
         "output_path": output_path,
@@ -195,6 +244,24 @@ def run_single_fund_strategy_from_data(normalized_data, config, fund_code, print
     if print_summary:
         print_run_summary(result=result)
     return result
+
+
+def run_single_fund_strategy_from_data(normalized_data, config, fund_code, print_summary=True):
+    # 复用同一份标准化数据执行单基金回测，避免不同模式对同一天缓存重复读取与解析。
+    fund_code = str(fund_code).zfill(6)
+    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
+    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
+    strategy_name = str(config["default_strategy_name"]).lower()
+    return run_single_price_series_strategy(
+        price_series=price_series,
+        config=config,
+        fund_code=fund_code,
+        strategy_name=strategy_name,
+        strategy_params=config["strategy_param_dict"].get(strategy_name),
+        print_summary=print_summary,
+        save_plot=True,
+        data_mode=data_mode,
+    )
 
 
 def run_single_fund_strategy(config_override=None):
@@ -288,6 +355,152 @@ def run_compare_all_strategies(config_override=None):
     }
 
 
+def save_trial_table(trial_df, output_dir, fund_code, strategy_name):
+    # 优化试验历史单独落盘，便于后续分析参数敏感性，不和普通回测汇总混在一起。
+    output_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.today().strftime("%Y-%m-%d")
+    output_path = output_dir / f"optuna_trials_{fund_code}_{strategy_name}_{date_str}.csv"
+    trial_df.to_csv(output_path, index=False)
+    return output_path
+
+
+def print_optimization_summary(optimization_result):
+    # 参数优化只打印最关键结论，避免 trial 级细节淹没验证集和测试集结果。
+    print("参数优化结果:")
+    print("基金代码:", optimization_result["fund_code"])
+    print("目标策略:", optimization_result["strategy_name"])
+    print("训练集最优目标值:", optimization_result["best_value"])
+    print("Top-K 候选数量:", len(optimization_result["top_k_params_list"]))
+    print("逐次刷新最优候选数量:", len(optimization_result["improving_best_params_list"]))
+    print("验证集最优参数:", optimization_result["best_params"])
+    print("验证集最优来源:", optimization_result["best_candidate_source"])
+    print("验证集 Sharpe:", optimization_result["valid_result"]["stats"]["sharpe"])
+    print("测试集 Sharpe:", optimization_result["test_result"]["stats"]["sharpe"])
+    print("测试集最大回撤:", optimization_result["test_result"]["stats"]["max_drawdown"])
+    print("trial 输出:", optimization_result["trial_path"])
+
+
+def run_optimize_single_fund_strategy(config_override=None):
+    # 优化模式固定使用 train/valid/test 时序切分，训练集搜索，验证集选 Top-K，测试集最终评估。
+    config = build_tradition_config(config_override=config_override)
+    raw_data = fetch_fund_data_with_cache(
+        code_dict=config["code_dict"],
+        cache_dir=config["data_dir"],
+        force_refresh=bool(config["force_refresh"]),
+        cache_prefix=config["cache_prefix"],
+    )
+    normalized_data = normalize_fund_data(raw_data)
+    fund_code = str(config["default_fund_code"]).zfill(6)
+    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
+    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
+    split_dict = split_time_series_by_ratio(price_series=price_series, split_config=config["data_split_dict"])
+
+    strategy_name = resolve_optimization_strategy_name(config)
+    base_params = config["strategy_param_dict"].get(strategy_name)
+    optimization_config = dict(config["optimization_config"])
+
+    def evaluate_params_fn(strategy_params):
+        # 训练集是唯一允许 Optuna objective 直接消费的数据区间。
+        return run_single_price_series_strategy(
+            price_series=split_dict["train"],
+            config=config,
+            fund_code=fund_code,
+            strategy_name=strategy_name,
+            strategy_params=strategy_params,
+            print_summary=False,
+            save_plot=False,
+            data_mode=data_mode,
+        )
+
+    optimization_result = optimize_strategy_params(
+        strategy_name=strategy_name,
+        base_params=base_params,
+        evaluate_params_fn=evaluate_params_fn,
+        optimization_config=optimization_config,
+    )
+
+    # Top-K 与逐次刷新最优集合并行产出后，在验证集阶段统一合并、去重并选优。
+    raw_candidate_list = optimization_result["top_k_params_list"] + optimization_result["improving_best_params_list"]
+    deduplicated_candidate_dict = {}
+    for candidate in raw_candidate_list:
+        param_key = build_param_signature(candidate["params"])
+        if param_key not in deduplicated_candidate_dict:
+            deduplicated_candidate_dict[param_key] = {
+                "trial_number": candidate["trial_number"],
+                "train_objective": candidate["train_objective"],
+                "params": candidate["params"],
+                "candidate_source_set": {candidate["source"]},
+            }
+            continue
+        deduplicated_candidate_dict[param_key]["candidate_source_set"].add(candidate["source"])
+        if float(candidate["train_objective"]) > float(deduplicated_candidate_dict[param_key]["train_objective"]):
+            deduplicated_candidate_dict[param_key]["train_objective"] = candidate["train_objective"]
+            deduplicated_candidate_dict[param_key]["trial_number"] = candidate["trial_number"]
+
+    candidate_result_list = []
+    for candidate in deduplicated_candidate_dict.values():
+        valid_result = run_single_price_series_strategy(
+            price_series=split_dict["valid"],
+            config=config,
+            fund_code=fund_code,
+            strategy_name=strategy_name,
+            strategy_params=candidate["params"],
+            print_summary=False,
+            save_plot=False,
+            data_mode=data_mode,
+        )
+        candidate_result_list.append(
+            {
+                "trial_number": candidate["trial_number"],
+                "train_objective": candidate["train_objective"],
+                "params": candidate["params"],
+                "candidate_source_set": sorted(candidate["candidate_source_set"]),
+                "valid_result": valid_result,
+            }
+        )
+
+    best_candidate = max(candidate_result_list, key=lambda item: float(item["valid_result"]["stats"]["sharpe"]))
+    best_params = dict(best_candidate["params"])
+    valid_result = best_candidate["valid_result"]
+    best_candidate_source = ",".join(best_candidate["candidate_source_set"])
+
+    test_output_name = f"{fund_code}_{strategy_name}_test_best_{datetime.today().strftime('%Y-%m-%d')}.png"
+    test_result = run_single_price_series_strategy(
+        price_series=split_dict["test"],
+        config=config,
+        fund_code=fund_code,
+        strategy_name=strategy_name,
+        strategy_params=best_params,
+        print_summary=False,
+        save_plot=True,
+        data_mode=data_mode,
+        output_name=test_output_name,
+    )
+    trial_path = save_trial_table(
+        trial_df=optimization_result["trial_df"],
+        output_dir=config["output_dir"],
+        fund_code=fund_code,
+        strategy_name=strategy_name,
+    )
+    result = {
+        "fund_code": fund_code,
+        "strategy_name": strategy_name,
+        "split_dict": split_dict,
+        "best_params": best_params,
+        "best_value": optimization_result["best_value"],
+        "top_k_params_list": optimization_result["top_k_params_list"],
+        "improving_best_params_list": optimization_result["improving_best_params_list"],
+        "candidate_result_list": candidate_result_list,
+        "best_candidate_source": best_candidate_source,
+        "valid_result": valid_result,
+        "test_result": test_result,
+        "trial_df": optimization_result["trial_df"],
+        "trial_path": trial_path,
+    }
+    print_optimization_summary(result)
+    return result
+
+
 def print_run_summary(result):
     # 终端摘要统一由这里负责，避免 runner 主链混入大量打印细节。
     print("基金代码:", result["fund_code"])
@@ -305,21 +518,30 @@ def print_run_summary(result):
 
 
 def main(argv=None):
-    # 第一阶段支持单基金、单基金多策略和批量模式，命令行只用于覆盖少量默认配置。
+    # 第一阶段支持单基金、单基金多策略、批量和参数优化模式，命令行只用于覆盖少量默认配置。
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     cli_override = build_cli_override(args)
     config_override = None
     if len(cli_override) > 0:
         strategy_param_dict = cli_override.pop("strategy_param_dict", None)
+        optimization_override = cli_override.pop("optimization_config", None)
         base_config = build_tradition_config(config_override=cli_override)
         if strategy_param_dict is not None:
             base_config["strategy_param_dict"] = merge_strategy_params(
                 default_param_dict=base_config["strategy_param_dict"],
                 override_param_dict=strategy_param_dict,
             )
+        if optimization_override is not None:
+            base_config["optimization_config"] = merge_optimization_config(
+                default_optimization_config=base_config["optimization_config"],
+                override_optimization_config=optimization_override,
+            )
         config_override = base_config
     mode_config = config_override or {}
+    if bool(mode_config.get("optimize", False)):
+        run_optimize_single_fund_strategy(config_override=config_override)
+        return
     if bool(mode_config.get("compare_all", False)):
         run_compare_all_strategies(config_override=config_override)
         return
