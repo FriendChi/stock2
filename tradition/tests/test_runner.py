@@ -80,6 +80,14 @@ def test_build_cli_override_collects_optimize_flag_and_trials():
     assert override["default_fund_code"] == "007301"
 
 
+def test_build_cli_override_collects_walk_forward_config():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(["--walk-forward", "--wf-window-size", "600", "--wf-step-size", "50"])
+    override = runner.build_cli_override(args)
+    assert override["walk_forward"] is True
+    assert override["walk_forward_config"] == {"window_size": 600, "step_size": 50}
+
+
 def test_merge_strategy_params_overrides_single_strategy():
     merged = runner.merge_strategy_params(
         default_param_dict={"buy_and_hold": {}, "ma_cross": {"fast": 5, "slow": 20}},
@@ -96,6 +104,15 @@ def test_merge_optimization_config_overrides_trials():
     )
     assert merged["n_trials"] == 12
     assert merged["target_metric"] == "sharpe"
+
+
+def test_merge_walk_forward_config_overrides_sizes():
+    merged = runner.merge_walk_forward_config(
+        default_walk_forward_config={"window_size": 700, "step_size": 60},
+        override_walk_forward_config={"step_size": 30},
+    )
+    assert merged["window_size"] == 700
+    assert merged["step_size"] == 30
 
 
 def test_build_summary_table_sorts_by_sharpe():
@@ -632,3 +649,112 @@ def test_run_optimize_single_fund_strategy_returns_summary(monkeypatch, sample_f
     assert result["trial_path"].exists()
     assert execution_call_lengths == [12, 12]
     assert metric_segment_starts == [pd.Timestamp("2024-01-07"), pd.Timestamp("2024-01-07"), pd.Timestamp("2024-01-10")]
+
+
+def test_run_walk_forward_single_fund_strategy_collects_fold_results(monkeypatch, tmp_path):
+    sample_index = pd.date_range("2024-01-01", periods=1000, freq="D")
+    sample_df = pd.DataFrame({
+        "date": sample_index,
+        "code": ["007301"] * len(sample_index),
+        "fund": ["半导体"] * len(sample_index),
+        "nav": range(1000, 2000),
+    })
+    monkeypatch.setattr(
+        runner,
+        "build_tradition_config",
+        lambda config_override=None: {
+            "code_dict": {"007301": "半导体"},
+            "data_dir": tmp_path,
+            "output_dir": tmp_path,
+            "force_refresh": False,
+            "cache_prefix": "tradition_fund",
+            "default_fund_code": "007301",
+            "default_strategy_name": "buy_and_hold",
+            "strategy_param_dict": {"multi_factor_score": {}},
+            "optimization_config": {
+                "default_target_strategy_name": "multi_factor_score",
+                "n_trials": 5,
+                "study_direction": "maximize",
+                "study_name_prefix": "tradition_optuna",
+                "target_metric": "sharpe",
+                "penalty_weight": 0.2,
+                "top_k": 5,
+            },
+            "walk_forward_config": {
+                "window_size": 700,
+                "step_size": 60,
+                "min_fold_count": 1,
+            },
+            "data_split_dict": {
+                "train_ratio": 0.6,
+                "valid_ratio": 0.2,
+                "test_ratio": 0.2,
+                "min_segment_size": 60,
+            },
+            "rf_config": {"enabled": False},
+            "init_cash": 10000.0,
+            "fees": 0.001,
+            "walk_forward": True,
+        },
+    )
+    monkeypatch.setattr(runner, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
+    monkeypatch.setattr(runner, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(runner, "filter_single_fund", lambda data, fund_code: data)
+    monkeypatch.setattr(runner, "adapt_to_price_series", lambda fund_df: (pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float), "nav_price_series"))
+    monkeypatch.setattr(runner, "load_rf_series_for_price_series", lambda config, price_series: None)
+    monkeypatch.setattr(
+        runner,
+        "execute_optimization_fold",
+        lambda price_series, config, fund_code, strategy_name, data_mode, rf_series, split_dict: {
+            "best_params": {"entry_threshold": 0.2},
+            "best_value": 0.8,
+            "top_k_params_list": [],
+            "improving_best_params_list": [],
+            "candidate_result_list": [],
+            "best_candidate_source": "top_k",
+            "valid_result": {"stats": {"cumulative_return": 0.05, "sharpe": 0.6}},
+            "best_execution_result": {
+                "price_series": price_series,
+                "entries": pd.Series(False, index=price_series.index),
+                "exits": pd.Series(False, index=price_series.index),
+                "resolved_params": {"entry_threshold": 0.2},
+                "portfolio": FakePortfolio(price_series, None, None, config["init_cash"], config["fees"], 0.0, "1D"),
+                "equity_curve": pd.Series(range(100, 100 + len(price_series)), index=price_series.index, dtype=float),
+            },
+            "trial_df": pd.DataFrame([{"value": 0.8}]),
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "build_result_from_execution",
+        lambda execution_result, fund_code, strategy_name, data_mode="nav_price_series", save_plot=False, output_dir=None, output_name=None, title=None, print_summary=False, segment_index=None, rf_series=None: {
+            "fund_code": fund_code,
+            "strategy_name": strategy_name,
+            "strategy_params": execution_result["resolved_params"],
+            "stats": {
+                "cumulative_return": 0.1,
+                "annual_return": 0.2,
+                "annual_volatility": 0.1,
+                "sharpe": 0.7,
+                "max_drawdown": -0.15,
+            },
+            "equity_curve": execution_result["equity_curve"].loc[segment_index],
+            "output_path": None,
+            "data_mode": data_mode,
+            "sample_start": pd.Index(segment_index).min(),
+            "sample_end": pd.Index(segment_index).max(),
+            "trade_count": 0,
+        },
+    )
+
+    result = runner.run_walk_forward_single_fund_strategy()
+
+    assert result["fund_code"] == "007301"
+    assert len(result["fold_result_list"]) == 6
+    assert result["summary_df"].shape[0] == 6
+    assert "test_cumulative_return" in result["summary_df"].columns
+    assert "test_mean_daily_return" in result["summary_df"].columns
+    assert "walk_forward_efficiency" in result["summary_dict"]
+    assert abs(result["summary_dict"]["test_sharpe_mean"] - 0.7) < 1e-12
+    assert result["summary_dict"]["positive_test_return_ratio"] == 1.0
+    assert result["summary_path"].exists()

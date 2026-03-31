@@ -9,7 +9,7 @@ from tradition.data_fetcher import fetch_fund_data_with_cache, fetch_treasury_yi
 from tradition.data_loader import filter_single_fund, normalize_fund_data
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.optimizer import optimize_strategy_params
-from tradition.splitter import split_time_series_by_ratio
+from tradition.splitter import build_walk_forward_fold_list, split_time_series_by_ratio
 from tradition.strategies import generate_signals
 
 
@@ -44,6 +44,8 @@ def build_cli_override(args):
         override["compare_all"] = True
     if args.optimize:
         override["optimize"] = True
+    if args.walk_forward:
+        override["walk_forward"] = True
 
     strategy_param_override = {}
     if args.ma_fast is not None:
@@ -60,6 +62,13 @@ def build_cli_override(args):
         optimization_override["n_trials"] = int(args.n_trials)
     if len(optimization_override) > 0:
         override["optimization_config"] = optimization_override
+    walk_forward_override = {}
+    if args.wf_window_size is not None:
+        walk_forward_override["window_size"] = int(args.wf_window_size)
+    if args.wf_step_size is not None:
+        walk_forward_override["step_size"] = int(args.wf_step_size)
+    if len(walk_forward_override) > 0:
+        override["walk_forward_config"] = walk_forward_override
     return override
 
 
@@ -77,6 +86,7 @@ def build_arg_parser():
     parser.add_argument("--batch-run", action="store_true", help="按基金池批量运行当前策略并输出汇总表")
     parser.add_argument("--compare-all", action="store_true", help="对单只基金运行全部策略并输出对比表")
     parser.add_argument("--optimize", action="store_true", help="对单只基金执行训练/验证/测试切分后的 Optuna 参数优化")
+    parser.add_argument("--walk-forward", action="store_true", help="对单只基金执行固定窗口 walk-forward 参数优化")
     parser.add_argument("--force-refresh", action="store_true", help="忽略当天缓存并重新拉取 AkShare 数据")
     parser.add_argument("--init-cash", dest="init_cash", type=float, help="初始资金")
     parser.add_argument("--fees", dest="fees", type=float, help="手续费率")
@@ -84,6 +94,8 @@ def build_arg_parser():
     parser.add_argument("--ma-slow", dest="ma_slow", type=int, help="ma_cross 策略长均线窗口")
     parser.add_argument("--momentum-window", dest="momentum_window", type=int, help="momentum 策略动量窗口")
     parser.add_argument("--n-trials", dest="n_trials", type=int, help="Optuna trial 数量")
+    parser.add_argument("--wf-window-size", dest="wf_window_size", type=int, help="walk-forward 总窗口长度")
+    parser.add_argument("--wf-step-size", dest="wf_step_size", type=int, help="walk-forward 滚动步长")
     return parser
 
 
@@ -108,12 +120,29 @@ def merge_optimization_config(default_optimization_config, override_optimization
     return merged
 
 
+def merge_walk_forward_config(default_walk_forward_config, override_walk_forward_config=None):
+    # walk-forward 只维护总窗口和步长配置，区间比例复用全局 data_split_dict。
+    merged = dict(default_walk_forward_config)
+    if override_walk_forward_config is None:
+        return merged
+    merged.update(override_walk_forward_config)
+    return merged
+
+
 def extract_trade_count(portfolio):
     # 统一把 vectorbt 的交易统计转成标量，避免不同返回类型污染结果结构。
     trade_count = portfolio.trades.count()
     if hasattr(trade_count, "item"):
         return int(trade_count.item())
     return int(trade_count)
+
+
+def compute_mean_daily_return_from_equity_curve(equity_curve):
+    # WFE 使用区间权益曲线的平均日收益率，避免引入新的指标计算入口。
+    returns = pd.Series(equity_curve, dtype=float).pct_change().dropna()
+    if len(returns) == 0:
+        return 0.0
+    return float(returns.mean())
 
 
 
@@ -484,28 +513,21 @@ def print_optimization_summary(optimization_result):
     print("trial 输出:", optimization_result["trial_path"])
 
 
-def run_optimize_single_fund_strategy(config_override=None):
-    # 优化模式固定使用 train/valid/test 时序切分，训练集搜索，验证集选 Top-K，测试集最终评估。
-    config = build_tradition_config(config_override=config_override)
-    raw_data = fetch_fund_data_with_cache(
-        code_dict=config["code_dict"],
-        cache_dir=config["data_dir"],
-        force_refresh=bool(config["force_refresh"]),
-        cache_prefix=config["cache_prefix"],
-    )
-    normalized_data = normalize_fund_data(raw_data)
-    fund_code = str(config["default_fund_code"]).zfill(6)
-    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
-    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
-    split_dict = split_time_series_by_ratio(price_series=price_series, split_config=config["data_split_dict"])
-    rf_series = load_rf_series_for_price_series(config=config, price_series=price_series)
-
-    strategy_name = resolve_optimization_strategy_name(config)
+def execute_optimization_fold(
+    price_series,
+    config,
+    fund_code,
+    strategy_name,
+    data_mode,
+    rf_series,
+    split_dict,
+):
+    # 单折执行函数复用当前训练集搜索、验证集选优、测试集评估链路，供单次 optimize 和 walk-forward 共用。
     base_params = config["strategy_param_dict"].get(strategy_name)
     optimization_config = dict(config["optimization_config"])
 
     def evaluate_params_fn(strategy_params):
-        # 训练集 objective 改为基于完整历史执行后切片评估，避免分段独立回测导致窗口冷启动。
+        # 训练集 objective 固定基于完整历史执行后切片评估，避免分段独立回测导致窗口冷启动。
         execution_result = execute_price_series_strategy(
             price_series=price_series,
             config=config,
@@ -591,10 +613,49 @@ def run_optimize_single_fund_strategy(config_override=None):
         }
         for item in candidate_evaluation_list
     ]
+    return {
+        "best_params": best_params,
+        "best_value": optimization_result["best_value"],
+        "top_k_params_list": optimization_result["top_k_params_list"],
+        "improving_best_params_list": optimization_result["improving_best_params_list"],
+        "candidate_result_list": candidate_result_list,
+        "best_candidate_source": best_candidate_source,
+        "valid_result": valid_result,
+        "best_execution_result": best_candidate["execution_result"],
+        "trial_df": optimization_result["trial_df"],
+    }
+
+
+def run_optimize_single_fund_strategy(config_override=None):
+    # 优化模式固定使用 train/valid/test 时序切分，训练集搜索，验证集选 Top-K，测试集最终评估。
+    config = build_tradition_config(config_override=config_override)
+    raw_data = fetch_fund_data_with_cache(
+        code_dict=config["code_dict"],
+        cache_dir=config["data_dir"],
+        force_refresh=bool(config["force_refresh"]),
+        cache_prefix=config["cache_prefix"],
+    )
+    normalized_data = normalize_fund_data(raw_data)
+    fund_code = str(config["default_fund_code"]).zfill(6)
+    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
+    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
+    split_dict = split_time_series_by_ratio(price_series=price_series, split_config=config["data_split_dict"])
+    rf_series = load_rf_series_for_price_series(config=config, price_series=price_series)
+
+    strategy_name = resolve_optimization_strategy_name(config)
+    optimization_result = execute_optimization_fold(
+        price_series=price_series,
+        config=config,
+        fund_code=fund_code,
+        strategy_name=strategy_name,
+        data_mode=data_mode,
+        rf_series=rf_series,
+        split_dict=split_dict,
+    )
 
     test_output_name = f"{fund_code}_{strategy_name}_test_best_{datetime.today().strftime('%Y-%m-%d')}.png"
     test_result = build_result_from_execution(
-        execution_result=best_candidate["execution_result"],
+        execution_result=optimization_result["best_execution_result"],
         fund_code=fund_code,
         strategy_name=strategy_name,
         data_mode=data_mode,
@@ -616,18 +677,168 @@ def run_optimize_single_fund_strategy(config_override=None):
         "fund_code": fund_code,
         "strategy_name": strategy_name,
         "split_dict": split_dict,
-        "best_params": best_params,
+        "best_params": optimization_result["best_params"],
         "best_value": optimization_result["best_value"],
         "top_k_params_list": optimization_result["top_k_params_list"],
         "improving_best_params_list": optimization_result["improving_best_params_list"],
-        "candidate_result_list": candidate_result_list,
-        "best_candidate_source": best_candidate_source,
-        "valid_result": valid_result,
+        "candidate_result_list": optimization_result["candidate_result_list"],
+        "best_candidate_source": optimization_result["best_candidate_source"],
+        "valid_result": optimization_result["valid_result"],
         "test_result": test_result,
         "trial_df": optimization_result["trial_df"],
         "trial_path": trial_path,
     }
     print_optimization_summary(result)
+    return result
+
+
+def print_walk_forward_summary(result):
+    # walk-forward 汇总集中打印测试窗口分布指标，便于快速判断滚动结果是否稳定。
+    print("Walk-forward 结果:")
+    print("基金代码:", result["fund_code"])
+    print("目标策略:", result["strategy_name"])
+    print("折数:", len(result["fold_result_list"]))
+    print("测试集累计收益均值:", result["summary_dict"]["test_cumulative_return_mean"])
+    print("测试集累计收益中位数:", result["summary_dict"]["test_cumulative_return_median"])
+    print("测试集累计收益标准差:", result["summary_dict"]["test_cumulative_return_std"])
+    print("测试集累计收益最差值:", result["summary_dict"]["test_cumulative_return_min"])
+    print("测试集年化收益均值:", result["summary_dict"]["test_annual_return_mean"])
+    print("测试集年化收益中位数:", result["summary_dict"]["test_annual_return_median"])
+    print("测试集年化收益标准差:", result["summary_dict"]["test_annual_return_std"])
+    print("测试集年化收益最差值:", result["summary_dict"]["test_annual_return_min"])
+    print("测试集年化波动均值:", result["summary_dict"]["test_annual_volatility_mean"])
+    print("测试集年化波动中位数:", result["summary_dict"]["test_annual_volatility_median"])
+    print("测试集年化波动标准差:", result["summary_dict"]["test_annual_volatility_std"])
+    print("测试集年化波动最差值:", result["summary_dict"]["test_annual_volatility_max"])
+    print("测试集 Sharpe 均值:", result["summary_dict"]["test_sharpe_mean"])
+    print("测试集 Sharpe 中位数:", result["summary_dict"]["test_sharpe_median"])
+    print("测试集 Sharpe 标准差:", result["summary_dict"]["test_sharpe_std"])
+    print("测试集 Sharpe 最差值:", result["summary_dict"]["test_sharpe_min"])
+    print("测试集最大回撤均值:", result["summary_dict"]["test_max_drawdown_mean"])
+    print("测试集最大回撤中位数:", result["summary_dict"]["test_max_drawdown_median"])
+    print("测试集最差回撤:", result["summary_dict"]["test_max_drawdown_min"])
+    print("测试集正收益窗口占比:", result["summary_dict"]["positive_test_return_ratio"])
+    print("Walk Forward Efficiency:", result["summary_dict"]["walk_forward_efficiency"])
+    print("汇总输出:", result["summary_path"])
+
+
+def run_walk_forward_single_fund_strategy(config_override=None):
+    # walk-forward 第一版固定为单基金、固定窗口滚动优化，逐折复用当前单次优化链路。
+    config = build_tradition_config(config_override=config_override)
+    raw_data = fetch_fund_data_with_cache(
+        code_dict=config["code_dict"],
+        cache_dir=config["data_dir"],
+        force_refresh=bool(config["force_refresh"]),
+        cache_prefix=config["cache_prefix"],
+    )
+    normalized_data = normalize_fund_data(raw_data)
+    fund_code = str(config["default_fund_code"]).zfill(6)
+    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
+    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
+    rf_series = load_rf_series_for_price_series(config=config, price_series=price_series)
+    strategy_name = resolve_optimization_strategy_name(config)
+    walk_forward_config = dict(config["walk_forward_config"])
+    fold_list = build_walk_forward_fold_list(
+        price_series=price_series,
+        walk_forward_config=walk_forward_config,
+        split_config=config["data_split_dict"],
+    )
+
+    fold_result_list = []
+    for fold_dict in fold_list:
+        optimization_result = execute_optimization_fold(
+            price_series=price_series,
+            config=config,
+            fund_code=fund_code,
+            strategy_name=strategy_name,
+            data_mode=data_mode,
+            rf_series=rf_series,
+            split_dict=fold_dict,
+        )
+        train_result = build_result_from_execution(
+            execution_result=optimization_result["best_execution_result"],
+            fund_code=fund_code,
+            strategy_name=strategy_name,
+            data_mode=data_mode,
+            save_plot=False,
+            print_summary=False,
+            segment_index=fold_dict["train"].index,
+            rf_series=rf_series,
+        )
+        test_result = build_result_from_execution(
+            execution_result=optimization_result["best_execution_result"],
+            fund_code=fund_code,
+            strategy_name=strategy_name,
+            data_mode=data_mode,
+            save_plot=False,
+            print_summary=False,
+            segment_index=fold_dict["test"].index,
+            rf_series=rf_series,
+        )
+        fold_result_list.append(
+            {
+                "fold_id": fold_dict["fold_id"],
+                "train_start": fold_dict["train_start"],
+                "train_end": fold_dict["train_end"],
+                "valid_start": fold_dict["valid_start"],
+                "valid_end": fold_dict["valid_end"],
+                "test_start": fold_dict["test_start"],
+                "test_end": fold_dict["test_end"],
+                "best_params": optimization_result["best_params"],
+                "best_value": optimization_result["best_value"],
+                "best_candidate_source": optimization_result["best_candidate_source"],
+                "train_mean_daily_return": compute_mean_daily_return_from_equity_curve(train_result["equity_curve"]),
+                "valid_cumulative_return": optimization_result["valid_result"]["stats"]["cumulative_return"],
+                "valid_sharpe": optimization_result["valid_result"]["stats"]["sharpe"],
+                "test_cumulative_return": test_result["stats"]["cumulative_return"],
+                "test_annual_return": test_result["stats"]["annual_return"],
+                "test_annual_volatility": test_result["stats"]["annual_volatility"],
+                "test_sharpe": test_result["stats"]["sharpe"],
+                "test_max_drawdown": test_result["stats"]["max_drawdown"],
+                "test_mean_daily_return": compute_mean_daily_return_from_equity_curve(test_result["equity_curve"]),
+            }
+        )
+
+    summary_df = pd.DataFrame(fold_result_list)
+    summary_name = f"{fund_code}_{strategy_name}_walk_forward"
+    summary_path = save_summary_table(summary_df=summary_df, output_dir=config["output_dir"], summary_name=summary_name)
+    train_mean_daily_return_mean = float(summary_df["train_mean_daily_return"].mean())
+    test_mean_daily_return_mean = float(summary_df["test_mean_daily_return"].mean())
+    walk_forward_efficiency = None
+    if abs(train_mean_daily_return_mean) > 1e-12:
+        walk_forward_efficiency = float(test_mean_daily_return_mean / train_mean_daily_return_mean)
+    summary_dict = {
+        "test_cumulative_return_mean": float(summary_df["test_cumulative_return"].mean()),
+        "test_cumulative_return_median": float(summary_df["test_cumulative_return"].median()),
+        "test_cumulative_return_std": float(summary_df["test_cumulative_return"].std(ddof=0)),
+        "test_cumulative_return_min": float(summary_df["test_cumulative_return"].min()),
+        "test_annual_return_mean": float(summary_df["test_annual_return"].mean()),
+        "test_annual_return_median": float(summary_df["test_annual_return"].median()),
+        "test_annual_return_std": float(summary_df["test_annual_return"].std(ddof=0)),
+        "test_annual_return_min": float(summary_df["test_annual_return"].min()),
+        "test_annual_volatility_mean": float(summary_df["test_annual_volatility"].mean()),
+        "test_annual_volatility_median": float(summary_df["test_annual_volatility"].median()),
+        "test_annual_volatility_std": float(summary_df["test_annual_volatility"].std(ddof=0)),
+        "test_annual_volatility_max": float(summary_df["test_annual_volatility"].max()),
+        "test_sharpe_mean": float(summary_df["test_sharpe"].mean()),
+        "test_sharpe_median": float(summary_df["test_sharpe"].median()),
+        "test_sharpe_std": float(summary_df["test_sharpe"].std(ddof=0)),
+        "test_sharpe_min": float(summary_df["test_sharpe"].min()),
+        "test_max_drawdown_mean": float(summary_df["test_max_drawdown"].mean()),
+        "test_max_drawdown_median": float(summary_df["test_max_drawdown"].median()),
+        "test_max_drawdown_min": float(summary_df["test_max_drawdown"].min()),
+        "positive_test_return_ratio": float((summary_df["test_cumulative_return"] > 0).mean()),
+        "walk_forward_efficiency": walk_forward_efficiency,
+    }
+    result = {
+        "fund_code": fund_code,
+        "strategy_name": strategy_name,
+        "fold_result_list": fold_result_list,
+        "summary_df": summary_df,
+        "summary_dict": summary_dict,
+        "summary_path": summary_path,
+    }
+    print_walk_forward_summary(result)
     return result
 
 
@@ -656,6 +867,7 @@ def main(argv=None):
     if len(cli_override) > 0:
         strategy_param_dict = cli_override.pop("strategy_param_dict", None)
         optimization_override = cli_override.pop("optimization_config", None)
+        walk_forward_override = cli_override.pop("walk_forward_config", None)
         base_config = build_tradition_config(config_override=cli_override)
         if strategy_param_dict is not None:
             base_config["strategy_param_dict"] = merge_strategy_params(
@@ -667,8 +879,16 @@ def main(argv=None):
                 default_optimization_config=base_config["optimization_config"],
                 override_optimization_config=optimization_override,
             )
+        if walk_forward_override is not None:
+            base_config["walk_forward_config"] = merge_walk_forward_config(
+                default_walk_forward_config=base_config["walk_forward_config"],
+                override_walk_forward_config=walk_forward_override,
+            )
         config_override = base_config
     mode_config = config_override or {}
+    if bool(mode_config.get("walk_forward", False)):
+        run_walk_forward_single_fund_strategy(config_override=config_override)
+        return
     if bool(mode_config.get("optimize", False)):
         run_optimize_single_fund_strategy(config_override=config_override)
         return

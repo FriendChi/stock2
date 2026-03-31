@@ -98,6 +98,13 @@ DEFAULT_OPTIMIZATION_CONFIG = {
     "penalty_weight": 0.2,
 }
 
+DEFAULT_WALK_FORWARD_CONFIG = {
+    "enabled": False,
+    "window_size": 700,
+    "step_size": 60,
+    "min_fold_count": 1,
+}
+
 DEFAULT_RF_CONFIG = {
     "enabled": True,
     "curve_name": "中债国债收益率曲线",
@@ -114,6 +121,7 @@ class TraditionConfig:
     strategy_param_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_STRATEGY_PARAM_DICT))
     data_split_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_DATA_SPLIT_DICT))
     optimization_config: dict = field(default_factory=lambda: deepcopy(DEFAULT_OPTIMIZATION_CONFIG))
+    walk_forward_config: dict = field(default_factory=lambda: deepcopy(DEFAULT_WALK_FORWARD_CONFIG))
     rf_config: dict = field(default_factory=lambda: deepcopy(DEFAULT_RF_CONFIG))
     default_fund_code: str = "007301"
     default_strategy_name: str = "buy_and_hold"
