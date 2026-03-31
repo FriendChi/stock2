@@ -2,6 +2,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from tradition.factor_engine import build_factor_search_param_spec_dict
 from tradition.strategies import get_strategy_params
 
 
@@ -10,6 +11,17 @@ def load_optuna_module():
     import optuna
 
     return optuna
+
+
+def build_strategy_search_param_spec_dict(strategy_name):
+    # 策略级搜索参数单独管理，和因子参数区分职责，避免被误塞进因子池。
+    strategy_name = str(strategy_name).lower()
+    if strategy_name == "multi_factor_score":
+        return {
+            "entry_threshold": (-0.2, 1.0, 0.1),
+            "exit_threshold": (-0.8, 0.2, 0.1),
+        }
+    return {}
 
 
 def suggest_strategy_params(trial, strategy_name, base_params):
@@ -28,17 +40,56 @@ def suggest_strategy_params(trial, strategy_name, base_params):
         return params
 
     if strategy_name == "multi_factor_score":
-        short_window = trial.suggest_int("momentum_window_short", 10, 40, step=5)
-        long_window = trial.suggest_int("momentum_window_long", short_window + 20, 120)
-        entry_threshold = trial.suggest_float("entry_threshold", -0.2, 1.0, step=0.1)
-        exit_threshold = trial.suggest_float("exit_threshold", -0.8, min(0.2, entry_threshold), step=0.1)
-        params.update(
-            {
-                "momentum_window_short": short_window,
-                "momentum_window_long": long_window,
-                "entry_threshold": entry_threshold,
-                "exit_threshold": min(exit_threshold, entry_threshold),
-            }
+        search_factor_param_name_dict = {
+            str(factor_name): [str(param_name) for param_name in param_name_list]
+            for factor_name, param_name_list in dict(params.get("search_factor_param_name_dict", {})).items()
+        }
+        search_strategy_param_name_list = [
+            str(param_name) for param_name in params.get("search_strategy_param_name_list", [])
+        ]
+        strategy_search_param_spec_dict = build_strategy_search_param_spec_dict(strategy_name=strategy_name)
+        factor_search_param_spec_dict = build_factor_search_param_spec_dict(strategy_params=params)
+        factor_param_dict = {
+            str(factor_name): dict(param_dict) for factor_name, param_dict in dict(params["factor_param_dict"]).items()
+        }
+        for factor_name, param_name_list in search_factor_param_name_dict.items():
+            if factor_name not in factor_search_param_spec_dict:
+                raise ValueError(f"search_factor_param_name_dict 中存在未定义搜索范围的因子: {factor_name}")
+            for param_name in param_name_list:
+                if param_name not in factor_search_param_spec_dict[factor_name]:
+                    raise ValueError(f"{factor_name} 未定义可搜索参数: {param_name}")
+                low, high, step = factor_search_param_spec_dict[factor_name][param_name]
+                trial_param_name = f"{factor_name}__{param_name}"
+                factor_param_dict.setdefault(factor_name, {})
+                factor_param_dict[factor_name][param_name] = trial.suggest_int(
+                    trial_param_name,
+                    int(low),
+                    int(high),
+                    step=1 if step is None else int(step),
+                )
+        params["factor_param_dict"] = factor_param_dict
+
+        for param_name in search_strategy_param_name_list:
+            if param_name not in strategy_search_param_spec_dict:
+                raise ValueError(f"search_strategy_param_name_list 中存在未定义策略参数: {param_name}")
+
+        if "entry_threshold" in search_strategy_param_name_list:
+            low, high, step = strategy_search_param_spec_dict["entry_threshold"]
+            params["entry_threshold"] = trial.suggest_float("entry_threshold", low, high, step=step)
+        entry_threshold = float(params["entry_threshold"])
+
+        if "exit_threshold" in search_strategy_param_name_list:
+            low, high, step = strategy_search_param_spec_dict["exit_threshold"]
+            exit_threshold = trial.suggest_float("exit_threshold", low, min(high, entry_threshold), step=step)
+            params["exit_threshold"] = min(exit_threshold, entry_threshold)
+
+        momentum_short_window = int(params["factor_param_dict"]["momentum_short"]["window"])
+        momentum_mid_window = int(params["factor_param_dict"]["momentum_mid"]["window"])
+        momentum_long_window = int(params["factor_param_dict"]["momentum_long"]["window"])
+        params["factor_param_dict"]["momentum_mid"]["window"] = max(momentum_short_window, momentum_mid_window)
+        params["factor_param_dict"]["momentum_long"]["window"] = max(
+            int(params["factor_param_dict"]["momentum_mid"]["window"]),
+            momentum_long_window,
         )
         return params
 
@@ -79,8 +130,11 @@ def build_top_k_params_list(study, strategy_name, base_params, optimization_conf
 
     top_k_params_list = []
     for trial in sorted_trial_list[:top_k]:
-        candidate_params = dict(resolved_base_params)
-        candidate_params.update(trial.params)
+        candidate_params = suggest_strategy_params(
+            trial=trial,
+            strategy_name=strategy_name,
+            base_params=resolved_base_params,
+        )
         top_k_params_list.append(
             {
                 "trial_number": int(trial.number),
@@ -104,8 +158,11 @@ def build_improving_best_params_list(study, strategy_name, base_params):
         current_value = float(trial.value)
         if best_value is None or current_value > best_value:
             best_value = current_value
-            candidate_params = dict(resolved_base_params)
-            candidate_params.update(trial.params)
+            candidate_params = suggest_strategy_params(
+                trial=trial,
+                strategy_name=strategy_name,
+                base_params=resolved_base_params,
+            )
             improving_best_params_list.append(
                 {
                     "trial_number": int(trial.number),
@@ -156,7 +213,13 @@ def optimize_strategy_params(strategy_name, base_params, evaluate_params_fn, opt
     return {
         "study": study,
         "study_name": study_name,
-        "best_params": study.best_params,
+        "best_params": suggest_strategy_params(
+            trial=study.best_trial if hasattr(study, "best_trial") else next(
+                trial for trial in study.trials if trial.params == study.best_params
+            ),
+            strategy_name=strategy_name,
+            base_params=resolved_base_params,
+        ),
         "best_value": float(study.best_value),
         "top_k_params_list": build_top_k_params_list(
             study=study,

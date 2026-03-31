@@ -70,14 +70,16 @@ class FakeOptuna:
         return FakeStudy(
             [
                 FakeTrial({
-                    "momentum_window_short": 20,
-                    "momentum_window_long": 60,
+                    "momentum_short__window": 20,
+                    "momentum_mid__window": 40,
+                    "momentum_long__window": 60,
                     "entry_threshold": 0.2,
                     "exit_threshold": 0.0,
                 }, number=0),
                 FakeTrial({
-                    "momentum_window_short": 30,
-                    "momentum_window_long": 90,
+                    "momentum_short__window": 30,
+                    "momentum_mid__window": 55,
+                    "momentum_long__window": 90,
                     "entry_threshold": 0.3,
                     "exit_threshold": -0.1,
                 }, number=1),
@@ -88,25 +90,64 @@ class FakeOptuna:
 def test_suggest_strategy_params_for_multi_factor_score():
     params = optimizer.suggest_strategy_params(
         trial=FakeTrial({
-            "momentum_window_short": 20,
-            "momentum_window_long": 80,
+            "momentum_short__window": 20,
+            "momentum_mid__window": 45,
+            "momentum_long__window": 80,
+            "ma_trend_state__window": 75,
+            "price_position__window": 70,
+            "breakout_strength__window": 85,
+            "volatility__window": 25,
+            "drawdown__window": 65,
             "entry_threshold": 0.2,
             "exit_threshold": -0.1,
         }),
         strategy_name="multi_factor_score",
         base_params={
-            "momentum_window_short": 10,
-            "momentum_window_long": 60,
-            "volatility_window": 20,
-            "drawdown_window": 60,
+            "enabled_factor_list": [
+                "momentum_short",
+                "momentum_mid",
+                "momentum_long",
+                "ma_trend_state",
+                "price_position",
+                "breakout_strength",
+                "volatility",
+                "drawdown",
+            ],
+            "search_factor_param_name_dict": {
+                "momentum_short": ["window"],
+                "momentum_mid": ["window"],
+                "momentum_long": ["window"],
+                "ma_trend_state": ["window"],
+                "price_position": ["window"],
+                "breakout_strength": ["window"],
+                "volatility": ["window"],
+                "drawdown": ["window"],
+            },
+            "search_strategy_param_name_list": ["entry_threshold", "exit_threshold"],
+            "factor_param_dict": {
+                "momentum_short": {"window": 10},
+                "momentum_mid": {"window": 40},
+                "momentum_long": {"window": 60},
+                "ma_trend_state": {"window": 60},
+                "price_position": {"window": 60},
+                "breakout_strength": {"window": 60},
+                "volatility": {"window": 20},
+                "drawdown": {"window": 60},
+            },
             "score_window": 60,
-            "factor_weight_dict": {"momentum_20": 0.3},
+            "factor_weight_dict": {"momentum_short": 0.3},
             "entry_threshold": 0.1,
             "exit_threshold": 0.0,
         },
     )
-    assert params["momentum_window_short"] == 20
-    assert params["momentum_window_long"] == 80
+    assert params["factor_param_dict"]["momentum_short"]["window"] == 20
+    assert params["factor_param_dict"]["momentum_mid"]["window"] == 45
+    assert params["factor_param_dict"]["momentum_long"]["window"] == 80
+    assert params["factor_param_dict"]["ma_trend_state"]["window"] == 75
+    assert params["factor_param_dict"]["price_position"]["window"] == 70
+    assert params["factor_param_dict"]["breakout_strength"]["window"] == 85
+    assert params["factor_param_dict"]["volatility"]["window"] == 25
+    assert params["factor_param_dict"]["drawdown"]["window"] == 65
     assert params["entry_threshold"] == 0.2
     assert params["exit_threshold"] == -0.1
 
@@ -114,25 +155,57 @@ def test_suggest_strategy_params_for_multi_factor_score():
 def test_suggest_strategy_params_caps_exit_threshold_by_entry_threshold():
     params = optimizer.suggest_strategy_params(
         trial=FakeTrial({
-            "momentum_window_short": 20,
-            "momentum_window_long": 80,
+            "momentum_short__window": 20,
+            "momentum_mid__window": 40,
+            "momentum_long__window": 80,
             "entry_threshold": 0.1,
             "exit_threshold": 0.2,
         }),
         strategy_name="multi_factor_score",
         base_params={
-            "momentum_window_short": 10,
-            "momentum_window_long": 60,
-            "volatility_window": 20,
-            "drawdown_window": 60,
+            "enabled_factor_list": ["momentum_short", "momentum_mid", "momentum_long"],
+            "search_factor_param_name_dict": {
+                "momentum_short": ["window"],
+                "momentum_mid": ["window"],
+                "momentum_long": ["window"],
+            },
+            "search_strategy_param_name_list": ["entry_threshold", "exit_threshold"],
+            "factor_param_dict": {
+                "momentum_short": {"window": 10},
+                "momentum_mid": {"window": 40},
+                "momentum_long": {"window": 60},
+            },
             "score_window": 60,
-            "factor_weight_dict": {"momentum_20": 0.3},
+            "factor_weight_dict": {"momentum_short": 0.3},
             "entry_threshold": 0.1,
             "exit_threshold": 0.0,
         },
     )
     assert params["entry_threshold"] == 0.1
     assert params["exit_threshold"] <= params["entry_threshold"]
+
+
+def test_suggest_strategy_params_raises_for_unknown_strategy_search_param():
+    try:
+        optimizer.suggest_strategy_params(
+            trial=FakeTrial({"entry_threshold": 0.1}),
+            strategy_name="multi_factor_score",
+            base_params={
+                "enabled_factor_list": ["momentum_short"],
+                "search_factor_param_name_dict": {},
+                "search_strategy_param_name_list": ["unknown_threshold"],
+                "factor_param_dict": {
+                    "momentum_short": {"window": 10},
+                },
+                "score_window": 60,
+                "factor_weight_dict": {"momentum_short": 1.0},
+                "entry_threshold": 0.1,
+                "exit_threshold": 0.0,
+            },
+        )
+        raise AssertionError("预期应抛出 ValueError")
+    except ValueError as exc:
+        assert "search_strategy_param_name_list 中存在未定义策略参数" in str(exc)
 
 
 def test_compute_objective_value_penalizes_drawdown():
@@ -189,7 +262,7 @@ def test_optimize_strategy_params_returns_best_result(monkeypatch):
     monkeypatch.setattr(optimizer, "load_optuna_module", lambda: FakeOptuna)
 
     def evaluate_params_fn(params):
-        sharpe = 1.0 if params["momentum_window_short"] == 30 else 0.8
+        sharpe = 1.0 if params["factor_param_dict"]["momentum_short"]["window"] == 30 else 0.8
         return {
             "stats": {
                 "annual_return": 0.1,
@@ -202,16 +275,45 @@ def test_optimize_strategy_params_returns_best_result(monkeypatch):
     result = optimizer.optimize_strategy_params(
         strategy_name="multi_factor_score",
         base_params={
-            "momentum_window_short": 20,
-            "momentum_window_long": 60,
-            "volatility_window": 20,
-            "drawdown_window": 60,
+            "enabled_factor_list": [
+                "momentum_short",
+                "momentum_mid",
+                "momentum_long",
+                "ma_trend_state",
+                "price_position",
+                "breakout_strength",
+                "volatility",
+                "drawdown",
+            ],
+            "search_factor_param_name_dict": {
+                "momentum_short": ["window"],
+                "momentum_mid": ["window"],
+                "momentum_long": ["window"],
+                "ma_trend_state": ["window"],
+                "price_position": ["window"],
+                "breakout_strength": ["window"],
+            },
+            "search_strategy_param_name_list": ["entry_threshold", "exit_threshold"],
+            "factor_param_dict": {
+                "momentum_short": {"window": 20},
+                "momentum_mid": {"window": 40},
+                "momentum_long": {"window": 60},
+                "ma_trend_state": {"window": 60},
+                "price_position": {"window": 60},
+                "breakout_strength": {"window": 60},
+                "volatility": {"window": 20},
+                "drawdown": {"window": 60},
+            },
             "score_window": 60,
             "factor_weight_dict": {
-                "momentum_20": 0.30,
-                "momentum_60": 0.30,
-                "volatility_20": 0.20,
-                "drawdown_60": 0.20,
+                "momentum_short": 0.12,
+                "momentum_mid": 0.12,
+                "momentum_long": 0.12,
+                "ma_trend_state": 0.12,
+                "price_position": 0.12,
+                "breakout_strength": 0.12,
+                "volatility": 0.20,
+                "drawdown": 0.20,
             },
             "entry_threshold": 0.2,
             "exit_threshold": 0.0,
@@ -227,7 +329,7 @@ def test_optimize_strategy_params_returns_best_result(monkeypatch):
         },
     )
 
-    assert result["best_params"]["momentum_window_short"] == 30
+    assert result["best_params"]["factor_param_dict"]["momentum_short"]["window"] == 30
     assert result["best_value"] > 0.9
     assert len(result["top_k_params_list"]) == 2
     assert len(result["improving_best_params_list"]) == 2

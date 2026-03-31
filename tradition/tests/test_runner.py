@@ -143,8 +143,8 @@ def test_build_param_signature_supports_nested_dict():
     signature = runner.build_param_signature({
         "entry_threshold": 0.2,
         "factor_weight_dict": {
-            "momentum_20": 0.3,
-            "drawdown_60": 0.2,
+            "momentum_short": 0.3,
+            "drawdown": 0.2,
         },
     })
     assert isinstance(signature, tuple)
@@ -326,13 +326,49 @@ def test_run_compare_all_strategies_returns_summary(monkeypatch, tmp_path):
             "ma_cross": {"fast": 5, "slow": 20},
             "momentum": {"window": 20},
             "multi_factor_score": {
+                "enabled_factor_list": [
+                    "momentum_short",
+                    "momentum_mid",
+                    "momentum_long",
+                    "ma_trend_state",
+                    "ma_slope",
+                    "price_position",
+                    "breakout_strength",
+                    "volatility",
+                    "drawdown",
+                ],
+                "search_factor_param_name_dict": {
+                    "momentum_short": ["window"],
+                    "momentum_mid": ["window"],
+                    "momentum_long": ["window"],
+                    "volatility": ["window"],
+                    "drawdown": ["window"],
+                },
+                "search_strategy_param_name_list": ["entry_threshold", "exit_threshold"],
                 "entry_threshold": 0.2,
                 "exit_threshold": 0.0,
-                "factor_weight_dict": {},
-                "momentum_window_short": 20,
-                "momentum_window_long": 60,
-                "volatility_window": 20,
-                "drawdown_window": 60,
+                "factor_weight_dict": {
+                    "momentum_short": 0.12,
+                    "momentum_mid": 0.12,
+                    "momentum_long": 0.12,
+                    "ma_trend_state": 0.15,
+                    "ma_slope": 0.12,
+                    "price_position": 0.10,
+                    "breakout_strength": 0.10,
+                    "volatility": 0.10,
+                    "drawdown": 0.07,
+                },
+                "factor_param_dict": {
+                    "momentum_short": {"window": 20},
+                    "momentum_mid": {"window": 40},
+                    "momentum_long": {"window": 60},
+                    "ma_trend_state": {"window": 60},
+                    "ma_slope": {"window": 20, "lookback": 5},
+                    "price_position": {"window": 60},
+                    "breakout_strength": {"window": 60},
+                    "volatility": {"window": 20},
+                    "drawdown": {"window": 60},
+                },
                 "score_window": 60,
             },
         },
@@ -386,16 +422,47 @@ def test_run_optimize_single_fund_strategy_returns_summary(monkeypatch, sample_f
         "strategy_param_dict": {
             "buy_and_hold": {},
             "multi_factor_score": {
-                "momentum_window_short": 20,
-                "momentum_window_long": 60,
-                "volatility_window": 20,
-                "drawdown_window": 60,
+                "enabled_factor_list": [
+                    "momentum_short",
+                    "momentum_mid",
+                    "momentum_long",
+                    "ma_trend_state",
+                    "ma_slope",
+                    "price_position",
+                    "breakout_strength",
+                    "volatility",
+                    "drawdown",
+                ],
+                "search_factor_param_name_dict": {
+                    "momentum_short": ["window"],
+                    "momentum_mid": ["window"],
+                    "momentum_long": ["window"],
+                    "volatility": ["window"],
+                    "drawdown": ["window"],
+                },
+                "search_strategy_param_name_list": ["entry_threshold", "exit_threshold"],
+                "factor_param_dict": {
+                    "momentum_short": {"window": 20},
+                    "momentum_mid": {"window": 40},
+                    "momentum_long": {"window": 60},
+                    "ma_trend_state": {"window": 60},
+                    "ma_slope": {"window": 20, "lookback": 5},
+                    "price_position": {"window": 60},
+                    "breakout_strength": {"window": 60},
+                    "volatility": {"window": 20},
+                    "drawdown": {"window": 60},
+                },
                 "score_window": 60,
                 "factor_weight_dict": {
-                    "momentum_20": 0.30,
-                    "momentum_60": 0.30,
-                    "volatility_20": 0.20,
-                    "drawdown_60": 0.20,
+                    "momentum_short": 0.12,
+                    "momentum_mid": 0.12,
+                    "momentum_long": 0.12,
+                    "ma_trend_state": 0.15,
+                    "ma_slope": 0.12,
+                    "price_position": 0.10,
+                    "breakout_strength": 0.10,
+                    "volatility": 0.20,
+                    "drawdown": 0.07,
                 },
                 "entry_threshold": 0.2,
                 "exit_threshold": 0.0,
@@ -439,8 +506,11 @@ def test_run_optimize_single_fund_strategy_returns_summary(monkeypatch, sample_f
         "optimize_strategy_params",
         lambda strategy_name, base_params, evaluate_params_fn, optimization_config: {
             "best_params": {
-                "momentum_window_short": 30,
-                "momentum_window_long": 90,
+                "factor_param_dict": {
+                    "momentum_short": {"window": 30},
+                    "momentum_mid": {"window": 55},
+                    "momentum_long": {"window": 90},
+                },
                 "entry_threshold": 0.3,
                 "exit_threshold": -0.1,
             },
@@ -450,8 +520,11 @@ def test_run_optimize_single_fund_strategy_returns_summary(monkeypatch, sample_f
                     "trial_number": 0,
                     "train_objective": 0.95,
                     "params": {
-                        "momentum_window_short": 30,
-                        "momentum_window_long": 90,
+                        "factor_param_dict": {
+                            "momentum_short": {"window": 30},
+                            "momentum_mid": {"window": 55},
+                            "momentum_long": {"window": 90},
+                        },
                         "entry_threshold": 0.3,
                         "exit_threshold": -0.1,
                     },
@@ -463,8 +536,11 @@ def test_run_optimize_single_fund_strategy_returns_summary(monkeypatch, sample_f
                     "trial_number": 1,
                     "train_objective": 0.90,
                     "params": {
-                        "momentum_window_short": 25,
-                        "momentum_window_long": 80,
+                        "factor_param_dict": {
+                            "momentum_short": {"window": 25},
+                            "momentum_mid": {"window": 50},
+                            "momentum_long": {"window": 80},
+                        },
                         "entry_threshold": 0.2,
                         "exit_threshold": 0.0,
                     },
@@ -505,7 +581,12 @@ def test_run_optimize_single_fund_strategy_returns_summary(monkeypatch, sample_f
             segment_index = execution_result["price_series"].index
         segment_index = pd.Index(segment_index)
         metric_segment_starts.append(segment_index.min())
-        short_window = (execution_result["resolved_params"] or {}).get("momentum_window_short", 0)
+        short_window = (
+            (execution_result["resolved_params"] or {})
+            .get("factor_param_dict", {})
+            .get("momentum_short", {})
+            .get("window", 0)
+        )
         sharpe = 0.8
         if segment_index.min() == pd.Timestamp("2024-01-07"):
             sharpe = 1.0 if short_window == 30 else 0.6
@@ -537,7 +618,7 @@ def test_run_optimize_single_fund_strategy_returns_summary(monkeypatch, sample_f
 
     assert result["fund_code"] == "007301"
     assert result["strategy_name"] == "multi_factor_score"
-    assert result["best_params"]["momentum_window_short"] == 30
+    assert result["best_params"]["factor_param_dict"]["momentum_short"]["window"] == 30
     assert len(result["candidate_result_list"]) == 2
     assert result["best_candidate_source"] in {"top_k", "improving_best", "improving_best,top_k", "top_k,improving_best"}
     assert result["trial_path"].exists()

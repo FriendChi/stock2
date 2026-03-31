@@ -33,7 +33,13 @@ def get_strategy_params(strategy_name, strategy_params=None):
     if strategy_params is not None:
         if not isinstance(strategy_params, dict):
             raise ValueError("strategy_params 必须为dict。")
-        merged_params.update(strategy_params)
+        for key, value in strategy_params.items():
+            if isinstance(value, dict) and isinstance(merged_params.get(key), dict):
+                nested_dict = dict(merged_params[key])
+                nested_dict.update(value)
+                merged_params[key] = nested_dict
+                continue
+            merged_params[key] = value
     return merged_params
 
 

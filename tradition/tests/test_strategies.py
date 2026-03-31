@@ -32,6 +32,10 @@ def test_get_strategy_params_returns_multi_factor_defaults():
     params = get_strategy_params("multi_factor_score")
     assert params["entry_threshold"] == 0.2
     assert "factor_weight_dict" in params
+    assert "enabled_factor_list" in params
+    assert "search_factor_param_name_dict" in params
+    assert "search_strategy_param_name_list" in params
+    assert "factor_param_dict" in params
 
 
 def test_generate_signals_buy_and_hold_enters_once():
@@ -68,16 +72,39 @@ def test_generate_signals_multi_factor_score_returns_boolean_series():
         price_series,
         "multi_factor_score",
         {
-            "momentum_window_short": 2,
-            "momentum_window_long": 4,
-            "volatility_window": 2,
-            "drawdown_window": 4,
+            "enabled_factor_list": [
+                "momentum_short",
+                "momentum_mid",
+                "momentum_long",
+                "ma_trend_state",
+                "ma_slope",
+                "price_position",
+                "breakout_strength",
+                "volatility",
+                "drawdown",
+            ],
+            "factor_param_dict": {
+                "momentum_short": {"window": 2},
+                "momentum_mid": {"window": 3},
+                "momentum_long": {"window": 4},
+                "ma_trend_state": {"window": 4},
+                "ma_slope": {"window": 3, "lookback": 1},
+                "price_position": {"window": 4},
+                "breakout_strength": {"window": 4},
+                "volatility": {"window": 2},
+                "drawdown": {"window": 4},
+            },
             "score_window": 3,
             "factor_weight_dict": {
-                "momentum_20": 0.3,
-                "momentum_60": 0.3,
-                "volatility_20": 0.2,
-                "drawdown_60": 0.2,
+                "momentum_short": 0.12,
+                "momentum_mid": 0.12,
+                "momentum_long": 0.12,
+                "ma_trend_state": 0.15,
+                "ma_slope": 0.12,
+                "price_position": 0.10,
+                "breakout_strength": 0.10,
+                "volatility": 0.10,
+                "drawdown": 0.07,
             },
             "entry_threshold": 0.0,
             "exit_threshold": -0.2,
