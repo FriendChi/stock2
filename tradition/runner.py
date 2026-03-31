@@ -272,11 +272,13 @@ def build_result_from_execution(
     sample_index = price_series.index if segment_index is None else pd.Index(segment_index)
     metric_equity_curve = equity_curve
     display_equity_curve = equity_curve
+    display_price_series = price_series
     if segment_index is not None:
         metric_equity_curve, display_equity_curve = extract_segment_equity_curves(
             equity_curve=equity_curve,
             segment_index=sample_index,
         )
+        display_price_series = price_series.loc[sample_index].copy()
     metric_dict = compute_return_metrics(equity_curve=metric_equity_curve, rf_series=rf_series)
 
     output_path = None
@@ -291,6 +293,7 @@ def build_result_from_execution(
             equity_curve=display_equity_curve,
             output_path=output_path,
             title=title or f"{fund_code} {strategy_name}",
+            benchmark_curve=display_price_series,
         )
 
     trade_count = extract_trade_count(portfolio=execution_result["portfolio"])

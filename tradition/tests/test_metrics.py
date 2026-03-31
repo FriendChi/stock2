@@ -12,6 +12,17 @@ def test_save_equity_curve_plot_creates_file(tmp_path):
     assert output_path.exists()
 
 
+def test_save_equity_curve_plot_accepts_benchmark_curve(tmp_path):
+    output_path = tmp_path / "equity_with_fund.png"
+    save_equity_curve_plot(
+        [100.0, 101.0, 103.0],
+        output_path,
+        title="demo",
+        benchmark_curve=[1.0, 1.01, 1.02],
+    )
+    assert output_path.exists()
+
+
 def test_align_rf_series_to_returns_converts_annual_rate_to_daily():
     returns_index = __import__("pandas").date_range("2024-01-02", periods=2, freq="D")
     rf_series = __import__("pandas").Series([0.0365], index=__import__("pandas").to_datetime(["2024-01-01"]))

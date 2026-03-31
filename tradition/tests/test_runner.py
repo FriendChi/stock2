@@ -190,7 +190,14 @@ def test_run_single_price_series_strategy_returns_summary(monkeypatch, tmp_path)
             "max_drawdown": -0.03,
         },
     )
-    monkeypatch.setattr(runner, "save_equity_curve_plot", lambda equity_curve, output_path, title: output_path)
+    captured_plot_kwargs = {}
+
+    def fake_save_equity_curve_plot(equity_curve, output_path, title, benchmark_curve=None):
+        captured_plot_kwargs["equity_curve"] = equity_curve
+        captured_plot_kwargs["benchmark_curve"] = benchmark_curve
+        return output_path
+
+    monkeypatch.setattr(runner, "save_equity_curve_plot", fake_save_equity_curve_plot)
 
     result = runner.run_single_price_series_strategy(
         price_series=price_series,
@@ -205,6 +212,7 @@ def test_run_single_price_series_strategy_returns_summary(monkeypatch, tmp_path)
     assert result["strategy_name"] == "buy_and_hold"
     assert result["trade_count"] == 2
     assert result["data_mode"] == "nav_price_series"
+    assert captured_plot_kwargs["benchmark_curve"].equals(price_series)
 
 
 def test_run_single_fund_strategy_returns_summary(monkeypatch, sample_fund_df, tmp_path):

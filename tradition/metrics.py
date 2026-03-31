@@ -72,8 +72,8 @@ def compute_return_metrics(equity_curve, rf_series=None):
     }
 
 
-def save_equity_curve_plot(equity_curve, output_path, title):
-    # 图像输出固定为静态 PNG，便于第一阶段快速查看策略与基线表现。
+def save_equity_curve_plot(equity_curve, output_path, title, benchmark_curve=None):
+    # 图像输出固定为静态 PNG，默认同时支持展示基金净值归一化曲线，便于直观看相对表现。
     equity_series = pd.Series(equity_curve, dtype=float).dropna()
     if equity_series.empty:
         raise ValueError("equity_curve 为空，无法保存图像。")
@@ -81,11 +81,20 @@ def save_equity_curve_plot(equity_curve, output_path, title):
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(equity_series.index, equity_series.values)
+    normalized_equity = equity_series / float(equity_series.iloc[0])
+    ax.plot(normalized_equity.index, normalized_equity.values, label="strategy")
+    if benchmark_curve is not None:
+        benchmark_series = pd.Series(benchmark_curve, dtype=float).dropna()
+        benchmark_series = benchmark_series.reindex(normalized_equity.index).dropna()
+        if not benchmark_series.empty:
+            normalized_benchmark = benchmark_series / float(benchmark_series.iloc[0])
+            ax.plot(normalized_benchmark.index, normalized_benchmark.values, label="fund")
     ax.set_title(title)
     ax.set_xlabel("date")
-    ax.set_ylabel("equity")
+    ax.set_ylabel("normalized value")
     ax.grid(True, alpha=0.3)
+    if benchmark_curve is not None:
+        ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
