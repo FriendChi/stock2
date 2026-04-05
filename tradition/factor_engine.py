@@ -1,89 +1,23 @@
 import pandas as pd
 
-
-def load_pandas_ta_module():
-    # 技术指标优先复用 pandas-ta-classic，若环境缺失则回退到本地实现。
-    try:
-        import pandas_ta_classic as ta
-
-        return ta
-    except ImportError:
-        return None
-
-
-def calculate_factor_momentum(series, window):
-    # 因子层动量优先复用技术指标库的 percent_return，保持窗口收益率语义不变。
-    price_series = pd.Series(series, copy=True).astype(float)
-    ta = load_pandas_ta_module()
-    if ta is not None:
-        momentum = ta.percent_return(price_series, length=int(window))
-        if momentum is not None:
-            return pd.Series(momentum, index=price_series.index, dtype=float)
-    return price_series.pct_change(int(window))
-
-
-def calculate_volatility(series, window):
-    # 波动率继续使用收益率口径，但优先复用 pandas-ta-classic 的 stdev 实现。
-    returns = pd.Series(series, copy=True).astype(float).pct_change()
-    ta = load_pandas_ta_module()
-    if ta is not None:
-        volatility = ta.stdev(returns, length=int(window))
-        if volatility is not None:
-            return pd.Series(volatility, index=returns.index, dtype=float)
-    return returns.rolling(int(window)).std()
-
-
-def calculate_drawdown(series, window):
-    # 回撤固定相对滚动窗口内最高净值计算，值越小表示回撤越深。
-    price_series = pd.Series(series, copy=True).astype(float)
-    rolling_max = price_series.rolling(int(window)).max()
-    return price_series / rolling_max - 1.0
-
-
-def calculate_ma_trend_state(series, window):
-    # 均线趋势状态优先复用 pandas-ta-classic 的均线实现，避免和策略层口径漂移。
-    price_series = pd.Series(series, copy=True).astype(float)
-    ta = load_pandas_ta_module()
-    if ta is not None:
-        moving_average = ta.sma(price_series, length=int(window))
-        if moving_average is not None:
-            moving_average = pd.Series(moving_average, index=price_series.index, dtype=float)
-        else:
-            moving_average = price_series.rolling(int(window)).mean()
-    else:
-        moving_average = price_series.rolling(int(window)).mean()
-    return price_series / moving_average - 1.0
-
-
-def calculate_ma_slope(series, ma_window, lookback_window):
-    # 均线斜率沿用均线变化率定义，但底层均线优先复用技术指标库。
-    price_series = pd.Series(series, copy=True).astype(float)
-    ta = load_pandas_ta_module()
-    if ta is not None:
-        moving_average = ta.sma(price_series, length=int(ma_window))
-        if moving_average is not None:
-            moving_average = pd.Series(moving_average, index=price_series.index, dtype=float)
-        else:
-            moving_average = price_series.rolling(int(ma_window)).mean()
-    else:
-        moving_average = price_series.rolling(int(ma_window)).mean()
-    return moving_average.pct_change(int(lookback_window))
-
-
-def calculate_price_position(series, window):
-    # 区间位置因子衡量价格位于近期区间的相对高低，越接近 1 表示越靠近阶段高点。
-    price_series = pd.Series(series, copy=True).astype(float)
-    rolling_min = price_series.rolling(int(window)).min()
-    rolling_max = price_series.rolling(int(window)).max()
-    position = (price_series - rolling_min) / (rolling_max - rolling_min)
-    return position.replace([float("inf"), -float("inf")], float("nan"))
-
-
-def calculate_breakout_strength(series, window):
-    # 突破强度因子用价格相对前期高点偏离表示，值大于 0 说明发生了向上突破。
-    price_series = pd.Series(series, copy=True).astype(float)
-    previous_high = price_series.rolling(int(window)).max().shift(1)
-    return price_series / previous_high - 1.0
+from tradition.factor_library import (
+    FACTOR_POOL_DICT,
+    build_raw_factor_series,
+    calculate_breakout_strength,
+    calculate_factor_momentum,
+    calculate_ma_slope,
+    calculate_ma_trend_state,
+    calculate_price_position,
+    calculate_drawdown,
+    calculate_donchian_breakout,
+    calculate_risk_adjusted_momentum,
+    calculate_sharpe_like_trend,
+    calculate_trend_r2,
+    calculate_trend_residual,
+    calculate_trend_tvalue,
+    calculate_volatility,
+    resolve_factor_name_list_by_group,
+)
 
 
 def rolling_zscore(series, window):
@@ -95,72 +29,8 @@ def rolling_zscore(series, window):
     return zscore.fillna(0.0).astype(float)
 
 
-def build_factor_pool_dict():
-    # 轻量因子池集中定义分类、参数和搜索范围，策略层只决定启用哪些因子。
-    return {
-        "momentum_short": {
-            "group": "趋势/动量",
-            "param_spec": {
-                "window": {"default": 20, "search_space": (10, 30, 5)},
-            },
-        },
-        "momentum_mid": {
-            "group": "趋势/动量",
-            "param_spec": {
-                "window": {"default": 40, "search_space": (30, 60, 5)},
-            },
-        },
-        "momentum_long": {
-            "group": "趋势/动量",
-            "param_spec": {
-                "window": {"default": 60, "search_space": (60, 120, 5)},
-            },
-        },
-        "ma_trend_state": {
-            "group": "趋势/动量",
-            "param_spec": {
-                "window": {"default": 60, "search_space": (40, 120, 5)},
-            },
-        },
-        "ma_slope": {
-            "group": "趋势/动量",
-            "param_spec": {
-                "window": {"default": 20, "search_space": None},
-                "lookback": {"default": 5, "search_space": None},
-            },
-        },
-        "price_position": {
-            "group": "趋势/动量",
-            "param_spec": {
-                "window": {"default": 60, "search_space": (30, 120, 5)},
-            },
-        },
-        "breakout_strength": {
-            "group": "趋势/动量",
-            "param_spec": {
-                "window": {"default": 60, "search_space": (30, 120, 5)},
-            },
-        },
-        "volatility": {
-            "group": "波动",
-            "param_spec": {
-                "window": {"default": 20, "search_space": (10, 40, 5)},
-            },
-        },
-        "drawdown": {
-            "group": "波动",
-            "param_spec": {
-                "window": {"default": 60, "search_space": (30, 120, 5)},
-            },
-        },
-    }
-
-
-FACTOR_POOL_DICT = build_factor_pool_dict()
-
-
 def validate_multi_factor_config(strategy_params, enabled_factor_list=None, require_factor_weight_dict=False):
-    # 因子配置校验集中在因子层，尽早拦截未知因子、未知参数和不可搜索参数。
+    # 因子配置校验集中在因子层，尽早拦截未知因子、未知参数和缺失权重配置。
     factor_weight_dict = dict(strategy_params.get("factor_weight_dict", {}))
     if enabled_factor_list is None:
         configured_enabled_factor_list = strategy_params.get("enabled_factor_list")
@@ -187,21 +57,6 @@ def validate_multi_factor_config(strategy_params, enabled_factor_list=None, requ
         if len(missing_weight_factor_list) > 0:
             raise ValueError(f"enabled_factor_list 中存在缺失权重的因子: {missing_weight_factor_list}")
 
-    search_factor_param_name_dict = {
-        str(factor_name): [str(param_name) for param_name in param_name_list]
-        for factor_name, param_name_list in dict(strategy_params.get("search_factor_param_name_dict", {})).items()
-    }
-    for factor_name, param_name_list in search_factor_param_name_dict.items():
-        if factor_name not in enabled_factor_list:
-            raise ValueError(f"search_factor_param_name_dict 中存在未启用因子: {factor_name}")
-        factor_param_spec = dict(FACTOR_POOL_DICT[factor_name]["param_spec"])
-        for param_name in param_name_list:
-            if param_name not in factor_param_spec:
-                raise ValueError(f"{factor_name} 存在未定义搜索参数: {param_name}")
-            if factor_param_spec[param_name].get("search_space") is None:
-                raise ValueError(f"{factor_name}.{param_name} 未定义搜索范围。")
-
-
 def resolve_factor_param_dict(strategy_params):
     # 因子参数统一按因子名做一层字典隔离，避免外层扁平参数名不断膨胀。
     enabled_factor_list = resolve_enabled_factor_list(strategy_params=strategy_params)
@@ -223,38 +78,10 @@ def resolve_factor_param_dict(strategy_params):
     return resolved_factor_param_dict
 
 
-def build_raw_factor_series(price_series, factor_name, factor_param_dict):
-    # 原始因子统一在这里派发，避免因子表构建阶段堆叠大量 if/else。
-    factor_params = dict(factor_param_dict[factor_name])
-    if factor_name == "momentum_short":
-        return calculate_factor_momentum(price_series, window=int(factor_params["window"]))
-    if factor_name == "momentum_mid":
-        return calculate_factor_momentum(price_series, window=int(factor_params["window"]))
-    if factor_name == "momentum_long":
-        return calculate_factor_momentum(price_series, window=int(factor_params["window"]))
-    if factor_name == "ma_trend_state":
-        return calculate_ma_trend_state(price_series, window=int(factor_params["window"]))
-    if factor_name == "ma_slope":
-        return calculate_ma_slope(
-            price_series,
-            ma_window=int(factor_params["window"]),
-            lookback_window=int(factor_params["lookback"]),
-        )
-    if factor_name == "price_position":
-        return calculate_price_position(price_series, window=int(factor_params["window"]))
-    if factor_name == "breakout_strength":
-        return calculate_breakout_strength(price_series, window=int(factor_params["window"]))
-    if factor_name == "volatility":
-        return calculate_volatility(price_series, window=int(factor_params["window"]))
-    if factor_name == "drawdown":
-        return calculate_drawdown(price_series, window=int(factor_params["window"]))
-    raise ValueError(f"当前未定义因子: {factor_name}")
-
-
 def normalize_factor_series(raw_factor_series, factor_name, score_window):
     # 标准化和同向化在统一入口处理，保证新增因子复用同一套评分口径。
     normalized_factor = rolling_zscore(raw_factor_series, window=int(score_window))
-    if factor_name == "volatility":
+    if factor_name in {"volatility", "drawdown", "trend_residual"}:
         return -normalized_factor
     return normalized_factor
 
@@ -274,7 +101,7 @@ def resolve_enabled_factor_list(strategy_params):
 
 
 def build_factor_search_param_spec_dict(strategy_params):
-    # 因子相关搜索范围统一从因子池收集，避免优化层和因子池重复维护参数边界。
+    # 启用因子的全部可搜索参数统一从因子库收集，避免配置层重复维护参数白名单。
     enabled_factor_list = resolve_enabled_factor_list(strategy_params=strategy_params)
     validate_multi_factor_config(
         strategy_params=strategy_params,
@@ -293,7 +120,7 @@ def build_factor_search_param_spec_dict(strategy_params):
 
 
 def build_factor_table(price_series, strategy_params):
-    # 因子表按启用因子列表构建，后续新增因子只需扩充因子池而不改主流程。
+    # 因子表按启用因子列表构建，后续新增因子只需扩充因子库而不改主流程。
     score_window = int(strategy_params["score_window"])
     enabled_factor_list = resolve_enabled_factor_list(strategy_params=strategy_params)
     factor_param_dict = resolve_factor_param_dict(strategy_params=strategy_params)
@@ -331,3 +158,26 @@ def build_multi_factor_score(price_series, strategy_params):
         score_series = score_series + factor_df[factor_name] * float(factor_weight_dict[factor_name])
     score_series.name = "multi_factor_score"
     return factor_df, score_series
+
+
+def build_single_factor_series(price_series, factor_name, strategy_params, factor_param_override=None):
+    # 因子筛选场景既支持直接复用默认参数，也支持显式传入参数化候选覆盖项。
+    resolved_strategy_params = dict(strategy_params)
+    resolved_strategy_params["enabled_factor_list"] = [str(factor_name)]
+    if factor_param_override is not None:
+        resolved_strategy_params["factor_param_dict"] = {
+            str(factor_name): dict(factor_param_override)
+        }
+    factor_param_dict = resolve_factor_param_dict(strategy_params=resolved_strategy_params)
+    raw_factor_series = build_raw_factor_series(
+        price_series=price_series,
+        factor_name=str(factor_name),
+        factor_param_dict=factor_param_dict,
+    )
+    normalized_factor_series = normalize_factor_series(
+        raw_factor_series=raw_factor_series,
+        factor_name=str(factor_name),
+        score_window=int(resolved_strategy_params["score_window"]),
+    )
+    normalized_factor_series.name = str(factor_name)
+    return normalized_factor_series

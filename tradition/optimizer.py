@@ -14,7 +14,7 @@ def load_optuna_module():
 
 
 def build_strategy_search_param_spec_dict(strategy_name):
-    # 策略级搜索参数单独管理，和因子参数区分职责，避免被误塞进因子池。
+    # 策略级搜索参数单独管理，和因子参数区分职责，避免被误塞进因子库。
     strategy_name = str(strategy_name).lower()
     if strategy_name == "multi_factor_score":
         return {
@@ -40,10 +40,6 @@ def suggest_strategy_params(trial, strategy_name, base_params):
         return params
 
     if strategy_name == "multi_factor_score":
-        search_factor_param_name_dict = {
-            str(factor_name): [str(param_name) for param_name in param_name_list]
-            for factor_name, param_name_list in dict(params.get("search_factor_param_name_dict", {})).items()
-        }
         search_strategy_param_name_list = [
             str(param_name) for param_name in params.get("search_strategy_param_name_list", [])
         ]
@@ -52,13 +48,9 @@ def suggest_strategy_params(trial, strategy_name, base_params):
         factor_param_dict = {
             str(factor_name): dict(param_dict) for factor_name, param_dict in dict(params["factor_param_dict"]).items()
         }
-        for factor_name, param_name_list in search_factor_param_name_dict.items():
-            if factor_name not in factor_search_param_spec_dict:
-                raise ValueError(f"search_factor_param_name_dict 中存在未定义搜索范围的因子: {factor_name}")
-            for param_name in param_name_list:
-                if param_name not in factor_search_param_spec_dict[factor_name]:
-                    raise ValueError(f"{factor_name} 未定义可搜索参数: {param_name}")
-                low, high, step = factor_search_param_spec_dict[factor_name][param_name]
+        for factor_name, factor_param_spec_dict in factor_search_param_spec_dict.items():
+            for param_name, search_space in factor_param_spec_dict.items():
+                low, high, step = search_space
                 trial_param_name = f"{factor_name}__{param_name}"
                 factor_param_dict.setdefault(factor_name, {})
                 factor_param_dict[factor_name][param_name] = trial.suggest_int(
@@ -83,14 +75,6 @@ def suggest_strategy_params(trial, strategy_name, base_params):
             exit_threshold = trial.suggest_float("exit_threshold", low, min(high, entry_threshold), step=step)
             params["exit_threshold"] = min(exit_threshold, entry_threshold)
 
-        momentum_short_window = int(params["factor_param_dict"]["momentum_short"]["window"])
-        momentum_mid_window = int(params["factor_param_dict"]["momentum_mid"]["window"])
-        momentum_long_window = int(params["factor_param_dict"]["momentum_long"]["window"])
-        params["factor_param_dict"]["momentum_mid"]["window"] = max(momentum_short_window, momentum_mid_window)
-        params["factor_param_dict"]["momentum_long"]["window"] = max(
-            int(params["factor_param_dict"]["momentum_mid"]["window"]),
-            momentum_long_window,
-        )
         return params
 
     raise ValueError(f"当前未定义可优化的 strategy_name: {strategy_name}")
