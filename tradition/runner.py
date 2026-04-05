@@ -1,5 +1,4 @@
 import argparse
-import json
 from datetime import datetime
 
 import pandas as pd
@@ -8,7 +7,7 @@ from tradition.config import build_tradition_config
 from tradition.data_adapter import adapt_to_price_series
 from tradition.data_fetcher import fetch_fund_data_with_cache, fetch_treasury_yield_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
-from tradition.factor_engine import FACTOR_POOL_DICT, build_single_factor_series, resolve_factor_name_list_by_group
+from tradition.factor_analysis import run_factor_selection_single_fund, run_single_factor_stability_analysis
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.optimizer import optimize_strategy_params
 from tradition.splitter import build_walk_forward_fold_list, split_time_series_by_ratio
@@ -50,6 +49,8 @@ def build_cli_override(args):
         override["walk_forward"] = True
     if args.factor_select:
         override["factor_select"] = True
+    if args.single_factor_stability_analysis:
+        override["single_factor_stability_analysis"] = True
 
     strategy_param_override = {}
     if args.ma_fast is not None:
@@ -79,6 +80,8 @@ def build_cli_override(args):
         override["train_min_spearman_ic"] = float(args.train_min_spearman_ic)
     if args.train_min_spearman_icir is not None:
         override["train_min_spearman_icir"] = float(args.train_min_spearman_icir)
+    if args.factor_selection_path is not None:
+        override["factor_selection_path"] = str(args.factor_selection_path)
     return override
 
 
@@ -98,6 +101,7 @@ def build_arg_parser():
     parser.add_argument("--optimize", action="store_true", help="对单只基金执行训练/验证/测试切分后的 Optuna 参数优化")
     parser.add_argument("--walk-forward", action="store_true", help="对单只基金执行固定窗口 walk-forward 参数优化")
     parser.add_argument("--factor-select", action="store_true", help="对单只基金执行基于 walk-forward 的因子筛选与评估")
+    parser.add_argument("--single-factor-stability-analysis", action="store_true", help="读取 factor_select 结果并执行单因子稳定性分析")
     parser.add_argument("--force-refresh", action="store_true", help="忽略当天缓存并重新拉取 AkShare 数据")
     parser.add_argument("--init-cash", dest="init_cash", type=float, help="初始资金")
     parser.add_argument("--fees", dest="fees", type=float, help="手续费率")
@@ -110,6 +114,7 @@ def build_arg_parser():
     parser.add_argument("--factor-groups", dest="factor_groups", help="因子族名称列表，按因子库分组名输入，逗号分隔")
     parser.add_argument("--train-min-spearman-ic", dest="train_min_spearman_ic", type=float, help="训练集 Spearman IC 最小阈值")
     parser.add_argument("--train-min-spearman-icir", dest="train_min_spearman_icir", type=float, help="训练集 Spearman ICIR 最小阈值")
+    parser.add_argument("--factor-selection-path", dest="factor_selection_path", help="factor_select 流程输出的 JSON 文件路径")
     return parser
 
 
@@ -241,7 +246,6 @@ def resolve_optimization_strategy_name(config):
     return str(optimization_config["default_target_strategy_name"]).lower()
 
 
-
 def build_param_signature(params):
     # 候选去重需要支持嵌套字典参数，统一递归转成可哈希签名。
     if isinstance(params, dict):
@@ -249,351 +253,6 @@ def build_param_signature(params):
     if isinstance(params, list):
         return tuple(build_param_signature(item) for item in params)
     return params
-
-
-def build_forward_return_series(price_series, forward_window=5):
-    # 因子筛选统一使用未来 5 日简单收益标签，并按 t 时点左对齐到当前因子值。
-    series = pd.Series(price_series, copy=True).astype(float).dropna()
-    forward_window = int(forward_window)
-    if forward_window <= 0:
-        raise ValueError("forward_window 必须为正整数。")
-    forward_return_series = series.shift(-forward_window) / series - 1.0
-    forward_return_series.name = f"forward_return_{forward_window}d"
-    return forward_return_series
-
-
-def compute_segment_correlation_metrics(factor_series, forward_return_series, segment_index):
-    # 单基金筛选按时间序列样本计算区间相关性，避免把跨折汇总和单折样本处理耦合在一起。
-    aligned_df = pd.DataFrame(
-        {
-            "factor": pd.Series(factor_series, copy=True).reindex(segment_index),
-            "forward_return": pd.Series(forward_return_series, copy=True).reindex(segment_index),
-        }
-    ).dropna()
-    if len(aligned_df) < 2:
-        return {
-            "sample_size": int(len(aligned_df)),
-            "spearman_ic": float("nan"),
-            "pearson_ic": float("nan"),
-        }
-    return {
-        "sample_size": int(len(aligned_df)),
-        "spearman_ic": float(aligned_df["factor"].corr(aligned_df["forward_return"], method="spearman")),
-        "pearson_ic": float(aligned_df["factor"].corr(aligned_df["forward_return"], method="pearson")),
-    }
-
-
-def build_metric_summary(metric_value_list):
-    # ICIR 统一按折级 IC 序列做汇总，样本不足或零波动时回落到 0，避免得到伪稳定高分。
-    metric_series = pd.Series(metric_value_list, dtype=float).dropna()
-    if len(metric_series) == 0:
-        return {
-            "count": 0,
-            "mean": float("nan"),
-            "std": float("nan"),
-            "icir": 0.0,
-        }
-    metric_std = float(metric_series.std(ddof=0))
-    metric_mean = float(metric_series.mean())
-    metric_icir = 0.0
-    if abs(metric_std) > 1e-12:
-        metric_icir = float(metric_mean / metric_std)
-    return {
-        "count": int(len(metric_series)),
-        "mean": metric_mean,
-        "std": metric_std,
-        "icir": metric_icir,
-    }
-
-
-def build_positive_ic_ratio(metric_value_list):
-    # 正 IC 比例用有效折中的正值占比衡量方向稳定性，无有效折时直接记为 0。
-    metric_series = pd.Series(metric_value_list, dtype=float).dropna()
-    if len(metric_series) == 0:
-        return 0.0
-    return float((metric_series > 0.0).mean())
-
-
-def build_factor_candidate_label(factor_name, factor_param_dict):
-    # 参数化候选需要稳定且可读的显示标签，便于终端输出和 CSV 排序复盘。
-    factor_name = str(factor_name)
-    factor_param_dict = dict(factor_param_dict)
-    if len(factor_param_dict) == 0:
-        return factor_name
-    param_text = ", ".join(
-        [f"{param_name}={factor_param_dict[param_name]}" for param_name in sorted(factor_param_dict.keys())]
-    )
-    return f"{factor_name}({param_text})"
-
-
-def expand_param_values_from_search_space(search_space):
-    # 搜索空间统一按离散候选值展开，保持与现有优化参数边界定义一致。
-    low, high, step = search_space
-    if step is None:
-        raise ValueError(f"当前不支持 step=None 的筛选候选展开: {search_space}")
-    low = int(low)
-    high = int(high)
-    step = int(step)
-    if step <= 0:
-        raise ValueError(f"search_space.step 必须为正整数，当前 step={step}")
-    return list(range(low, high + 1, step))
-
-
-def build_factor_candidate_list(candidate_factor_name_list, strategy_params):
-    # 因子筛选入口将筛选对象从因子名提升到参数化候选，双参数因子按参数组合完整展开。
-    factor_param_dict = dict(strategy_params.get("factor_param_dict", {}))
-    candidate_list = []
-    for factor_name in candidate_factor_name_list:
-        factor_name = str(factor_name)
-        param_spec = dict(runner_factor_pool_dict()[factor_name]["param_spec"])
-        configured_param_dict = dict(factor_param_dict.get(factor_name, {}))
-        searchable_param_name_list = []
-        candidate_value_list_by_param = {}
-        resolved_param_dict = {}
-        for param_name, spec in param_spec.items():
-            param_name = str(param_name)
-            search_space = spec.get("search_space")
-            resolved_default_value = configured_param_dict.get(param_name, spec["default"])
-            if search_space is None:
-                resolved_param_dict[param_name] = resolved_default_value
-                continue
-            searchable_param_name_list.append(param_name)
-            candidate_value_list_by_param[param_name] = expand_param_values_from_search_space(search_space)
-        if len(searchable_param_name_list) == 0:
-            candidate_list.append(
-                {
-                    "factor_name": factor_name,
-                    "factor_group": resolve_factor_group_name(factor_name=factor_name),
-                    "param_dict": resolved_param_dict,
-                    "candidate_label": build_factor_candidate_label(factor_name=factor_name, factor_param_dict=resolved_param_dict),
-                }
-            )
-            continue
-
-        # 单参数和双参数因子统一按笛卡尔积展开，避免筛选阶段遗漏有效参数组合。
-        candidate_param_dict_list = [resolved_param_dict]
-        for param_name in searchable_param_name_list:
-            next_candidate_param_dict_list = []
-            for base_param_dict in candidate_param_dict_list:
-                for candidate_value in candidate_value_list_by_param[param_name]:
-                    next_param_dict = dict(base_param_dict)
-                    next_param_dict[param_name] = candidate_value
-                    next_candidate_param_dict_list.append(next_param_dict)
-            candidate_param_dict_list = next_candidate_param_dict_list
-
-        for candidate_param_dict in candidate_param_dict_list:
-            candidate_list.append(
-                {
-                    "factor_name": factor_name,
-                    "factor_group": resolve_factor_group_name(factor_name=factor_name),
-                    "param_dict": candidate_param_dict,
-                    "candidate_label": build_factor_candidate_label(factor_name=factor_name, factor_param_dict=candidate_param_dict),
-                }
-            )
-    return candidate_list
-
-
-def build_factor_selection_record(factor_candidate, train_metric_list, valid_metric_list, threshold_config):
-    # 单个参数化候选的训练筛选与验证排序指标集中在这里落成行记录，避免输出列在多个地方重复拼接。
-    train_spearman_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list])
-    train_pearson_summary = build_metric_summary([metric_dict["pearson_ic"] for metric_dict in train_metric_list])
-    valid_spearman_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in valid_metric_list])
-    valid_pearson_summary = build_metric_summary([metric_dict["pearson_ic"] for metric_dict in valid_metric_list])
-    train_spearman_positive_ic_ratio = build_positive_ic_ratio([metric_dict["spearman_ic"] for metric_dict in train_metric_list])
-    valid_spearman_positive_ic_ratio = build_positive_ic_ratio([metric_dict["spearman_ic"] for metric_dict in valid_metric_list])
-
-    train_passed = (
-        train_spearman_summary["count"] > 0
-        and train_spearman_summary["mean"] >= float(threshold_config["train_min_spearman_ic"])
-        and train_spearman_summary["icir"] >= float(threshold_config["train_min_spearman_icir"])
-        and train_spearman_positive_ic_ratio > 0.5
-    )
-    valid_passed = (
-        valid_spearman_summary["count"] > 0
-        and valid_spearman_summary["mean"] > 0.0
-        and valid_spearman_summary["icir"] > 0.0
-        and valid_spearman_positive_ic_ratio > 0.5
-    )
-    return {
-        "factor_name": str(factor_candidate["factor_name"]),
-        "factor_group": str(factor_candidate["factor_group"]),
-        "factor_param_dict": dict(factor_candidate["param_dict"]),
-        "candidate_label": str(factor_candidate["candidate_label"]),
-        "train_sample_fold_count": train_spearman_summary["count"],
-        "train_spearman_ic_mean": train_spearman_summary["mean"],
-        "train_spearman_ic_std": train_spearman_summary["std"],
-        "train_spearman_icir": train_spearman_summary["icir"],
-        "train_spearman_positive_ic_ratio": train_spearman_positive_ic_ratio,
-        "train_pearson_ic_mean": train_pearson_summary["mean"],
-        "train_pearson_ic_std": train_pearson_summary["std"],
-        "train_pearson_icir": train_pearson_summary["icir"],
-        "train_passed": bool(train_passed),
-        "valid_sample_fold_count": valid_spearman_summary["count"],
-        "valid_spearman_ic_mean": valid_spearman_summary["mean"],
-        "valid_spearman_ic_std": valid_spearman_summary["std"],
-        "valid_spearman_icir": valid_spearman_summary["icir"],
-        "valid_spearman_positive_ic_ratio": valid_spearman_positive_ic_ratio,
-        "valid_pearson_ic_mean": valid_pearson_summary["mean"],
-        "valid_pearson_ic_std": valid_pearson_summary["std"],
-        "valid_pearson_icir": valid_pearson_summary["icir"],
-        "valid_passed": bool(valid_passed),
-    }
-
-
-def save_factor_selection_table(summary_df, output_dir, fund_code):
-    # 因子筛选结果改为 JSON，保留布尔值、空值和参数字典的原始结构，方便程序二次消费。
-    output_dir.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.today().strftime("%Y-%m-%d")
-    output_path = output_dir / f"factor_selection_{str(fund_code).zfill(6)}_{date_str}.json"
-    record_list = summary_df.where(pd.notna(summary_df), None).to_dict(orient="records")
-    with output_path.open("w", encoding="utf-8") as output_file:
-        json.dump(record_list, output_file, ensure_ascii=False, indent=2)
-    return output_path
-
-
-def print_factor_selection_summary(result):
-    # 终端先打印训练和验证双门槛筛选结果，再展示最终通过候选按验证集 ICIR 排序后的结果。
-    print("因子筛选结果:")
-    print("基金代码:", result["fund_code"])
-    print("输入因子族:", ",".join(result["factor_group_list"]))
-    print("候选参数化因子数量:", len(result["candidate_factor_list"]))
-    print("训练集 Spearman IC 阈值:", result["threshold_config"]["train_min_spearman_ic"])
-    print("训练集 Spearman ICIR 阈值:", result["threshold_config"]["train_min_spearman_icir"])
-    print("训练通过参数化因子数量:", int(result["summary_df"]["train_passed"].astype(bool).sum()))
-    print("验证通过参数化因子数量:", int(result["summary_df"]["valid_passed"].astype(bool).sum()))
-    print("筛选后参数化因子列表:", result["selected_candidate_label_list"])
-    if len(result["selected_summary_df"]) > 0:
-        printable_df = result["selected_summary_df"][
-            [
-                "final_rank",
-                "candidate_label",
-                "factor_group",
-                "train_spearman_positive_ic_ratio",
-                "valid_spearman_ic_mean",
-                "valid_spearman_icir",
-                "valid_pearson_ic_mean",
-                "valid_pearson_icir",
-            ]
-        ].copy()
-        print(printable_df.to_string(index=False))
-    print("汇总输出:", result["summary_path"])
-
-
-def run_factor_selection_single_fund(config_override=None):
-    # 独立因子筛选入口复用现有数据准备与 walk-forward 切分，并从因子库中按因子族展开候选因子。
-    config = build_tradition_config(config_override=config_override)
-    factor_group_list = list(config.get("factor_group_list", []))
-    if len(factor_group_list) == 0:
-        raise ValueError("factor_select 模式必须提供 factor_group_list。")
-    threshold_config = {
-        "train_min_spearman_ic": float(config.get("train_min_spearman_ic", 0.0)),
-        "train_min_spearman_icir": float(config.get("train_min_spearman_icir", 0.0)),
-    }
-
-    raw_data = fetch_fund_data_with_cache(
-        code_dict=config["code_dict"],
-        cache_dir=config["data_dir"],
-        force_refresh=bool(config["force_refresh"]),
-        cache_prefix=config["cache_prefix"],
-    )
-    normalized_data = normalize_fund_data(raw_data)
-    fund_code = str(config["default_fund_code"]).zfill(6)
-    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
-    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
-
-    candidate_factor_name_list = resolve_factor_name_list_by_group(factor_group_list=factor_group_list)
-    fold_list = build_walk_forward_fold_list(
-        price_series=price_series,
-        walk_forward_config=dict(config["walk_forward_config"]),
-        split_config=config["data_split_dict"],
-    )
-    multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
-    candidate_factor_list = build_factor_candidate_list(
-        candidate_factor_name_list=candidate_factor_name_list,
-        strategy_params=multi_factor_params,
-    )
-    forward_return_series = build_forward_return_series(price_series=price_series, forward_window=5)
-
-    factor_record_list = []
-    for factor_candidate in candidate_factor_list:
-        factor_series = build_single_factor_series(
-            price_series=price_series,
-            factor_name=factor_candidate["factor_name"],
-            strategy_params=multi_factor_params,
-            factor_param_override=factor_candidate["param_dict"],
-        )
-
-        # 训练集负责过门槛筛选，验证集只对通过训练筛选的因子做后续排序汇总。
-        train_metric_list = []
-        valid_metric_list = []
-        for fold_dict in fold_list:
-            train_metric_list.append(
-                compute_segment_correlation_metrics(
-                    factor_series=factor_series,
-                    forward_return_series=forward_return_series,
-                    segment_index=fold_dict["train"].index,
-                )
-            )
-            valid_metric_list.append(
-                compute_segment_correlation_metrics(
-                    factor_series=factor_series,
-                    forward_return_series=forward_return_series,
-                    segment_index=fold_dict["valid"].index,
-                )
-            )
-
-        factor_record_list.append(
-            build_factor_selection_record(
-                factor_candidate=factor_candidate,
-                train_metric_list=train_metric_list,
-                valid_metric_list=valid_metric_list,
-                threshold_config=threshold_config,
-            )
-        )
-
-    # 最终结果先过训练门槛，再过验证门槛，最后仅对双通过候选按原验证集排序规则排序。
-    summary_df = pd.DataFrame(factor_record_list)
-    summary_df = summary_df.sort_values(
-        ["train_passed", "valid_passed", "valid_spearman_icir", "valid_spearman_ic_mean", "train_spearman_icir", "candidate_label"],
-        ascending=[False, False, False, False, False, True],
-        na_position="last",
-    ).reset_index(drop=True)
-    selected_mask = summary_df["train_passed"].astype(bool) & summary_df["valid_passed"].astype(bool)
-    summary_df["final_rank"] = pd.Series([None] * len(summary_df), dtype=object)
-    if bool(selected_mask.any()):
-        summary_df.loc[selected_mask, "final_rank"] = list(range(1, int(selected_mask.sum()) + 1))
-    summary_df["selected"] = selected_mask
-    selected_summary_df = summary_df[selected_mask].reset_index(drop=True)
-    summary_path = save_factor_selection_table(summary_df=summary_df, output_dir=config["output_dir"], fund_code=fund_code)
-    result = {
-        "fund_code": fund_code,
-        "data_mode": data_mode,
-        "factor_group_list": factor_group_list,
-        "candidate_factor_name_list": candidate_factor_name_list,
-        "candidate_factor_list": candidate_factor_list,
-        "selected_factor_name_list": selected_summary_df["factor_name"].tolist(),
-        "selected_candidate_label_list": selected_summary_df["candidate_label"].tolist(),
-        "threshold_config": threshold_config,
-        "fold_list": fold_list,
-        "summary_df": summary_df,
-        "selected_summary_df": selected_summary_df,
-        "summary_path": summary_path,
-    }
-    print_factor_selection_summary(result)
-    return result
-
-
-def resolve_factor_group_name(factor_name):
-    # 输出层只消费因子名时仍要补回所属因子族，避免 CSV 结果丢失输入语义。
-    resolved_factor_name = str(factor_name)
-    if resolved_factor_name not in FACTOR_POOL_DICT:
-        raise ValueError(f"未定义因子: {resolved_factor_name}")
-    return str(FACTOR_POOL_DICT[resolved_factor_name]["group"])
-
-
-def runner_factor_pool_dict():
-    # runner 侧只读消费因子库快照，避免候选展开逻辑在多个模块重复拼装元信息。
-    return dict(FACTOR_POOL_DICT)
 
 
 def execute_price_series_strategy(price_series, config, strategy_name, strategy_params=None):
@@ -1218,7 +877,7 @@ def print_run_summary(result):
 
 
 def main(argv=None):
-    # 命令行入口统一支持普通回测、优化、walk-forward 和独立因子筛选模式。
+    # 命令行入口统一支持普通回测、优化、walk-forward、独立因子筛选和单因子稳定性分析模式。
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     cli_override = build_cli_override(args)
@@ -1245,6 +904,9 @@ def main(argv=None):
             )
         config_override = base_config
     mode_config = config_override or {}
+    if bool(mode_config.get("single_factor_stability_analysis", False)):
+        run_single_factor_stability_analysis(config_override=config_override)
+        return
     if bool(mode_config.get("factor_select", False)):
         run_factor_selection_single_fund(config_override=config_override)
         return

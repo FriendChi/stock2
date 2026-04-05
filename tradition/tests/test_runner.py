@@ -1,5 +1,3 @@
-import json
-
 import pandas as pd
 import pytest
 
@@ -114,6 +112,20 @@ def test_build_cli_override_collects_factor_selection_args():
     assert override["train_min_spearman_icir"] == 0.2
 
 
+def test_build_cli_override_collects_single_factor_stability_analysis_args():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--single-factor-stability-analysis",
+            "--factor-selection-path",
+            "/tmp/factor_selection_007301_2026-04-05.json",
+        ]
+    )
+    override = runner.build_cli_override(args)
+    assert override["single_factor_stability_analysis"] is True
+    assert override["factor_selection_path"] == "/tmp/factor_selection_007301_2026-04-05.json"
+
+
 def test_merge_strategy_params_overrides_single_strategy():
     merged = runner.merge_strategy_params(
         default_param_dict={"buy_and_hold": {}, "ma_cross": {"fast": 5, "slow": 20}},
@@ -203,47 +215,6 @@ def test_extract_segment_equity_curves_keeps_previous_day():
     )
     assert list(display_curve.index) == list(equity_curve.index[2:])
     assert list(metric_curve.index) == list(equity_curve.index[1:])
-
-
-def test_build_forward_return_series_uses_future_simple_return():
-    price_series = pd.Series([1.0, 1.1, 1.21, 1.331, 1.4641, 1.61051], index=pd.date_range("2024-01-01", periods=6, freq="D"))
-    forward_return_series = runner.build_forward_return_series(price_series=price_series, forward_window=5)
-    assert abs(float(forward_return_series.iloc[0]) - 0.61051) < 1e-12
-    assert pd.isna(forward_return_series.iloc[-1])
-
-
-def test_build_factor_candidate_list_expands_multi_param_combinations():
-    candidate_list = runner.build_factor_candidate_list(
-        candidate_factor_name_list=["momentum", "ma_slope"],
-        strategy_params={
-            "factor_param_dict": {
-                "momentum": {"window": 20},
-                "ma_slope": {"window": 20, "lookback": 5},
-            }
-        },
-    )
-    momentum_candidate_list = [item for item in candidate_list if item["factor_name"] == "momentum"]
-    ma_slope_candidate_list = [item for item in candidate_list if item["factor_name"] == "ma_slope"]
-    assert len(momentum_candidate_list) == len(range(10, 121, 5))
-    assert len(ma_slope_candidate_list) == len(range(10, 61, 5)) * len(range(2, 21, 1))
-    assert ma_slope_candidate_list[0]["candidate_label"].startswith("ma_slope(")
-
-
-def test_build_metric_summary_returns_zero_icir_for_constant_metric_series():
-    summary = runner.build_metric_summary([0.1, 0.1, 0.1])
-    assert abs(summary["mean"] - 0.1) < 1e-12
-    assert abs(summary["std"] - 0.0) < 1e-12
-    assert abs(summary["icir"] - 0.0) < 1e-12
-
-
-def test_build_positive_ic_ratio_uses_positive_valid_fold_ratio():
-    assert abs(runner.build_positive_ic_ratio([0.1, -0.2, 0.0, 0.3, float("nan")]) - (2 / 4)) < 1e-12
-    assert abs(runner.build_positive_ic_ratio([float("nan")]) - 0.0) < 1e-12
-
-
-def test_resolve_factor_group_name_raises_for_unknown_factor():
-    with pytest.raises(ValueError, match="未定义因子"):
-        runner.resolve_factor_group_name("unknown_factor")
 
 
 def test_run_single_price_series_strategy_returns_summary(monkeypatch, tmp_path):
@@ -813,144 +784,19 @@ def test_run_walk_forward_single_fund_strategy_collects_fold_results(monkeypatch
     assert result["summary_path"].exists()
 
 
-def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, sample_fund_df, tmp_path):
-    sample_index = pd.date_range("2024-01-01", periods=30, freq="D")
-    sample_df = pd.DataFrame(
-        {
-            "date": sample_index,
-            "code": ["007301"] * len(sample_index),
-            "fund": ["半导体"] * len(sample_index),
-            "nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
-        }
-    )
-    monkeypatch.setattr(
-        runner,
-        "build_tradition_config",
-        lambda config_override=None: {
-            "code_dict": {"007301": "半导体"},
-            "data_dir": tmp_path,
-            "output_dir": tmp_path,
-            "force_refresh": False,
-            "cache_prefix": "tradition_fund",
-                "default_fund_code": "007301",
-                "strategy_param_dict": {
-                    "multi_factor_score": {
-                        "enabled_factor_list": ["momentum", "ma_slope"],
-                        "factor_param_dict": {
-                            "momentum": {"window": 20},
-                            "ma_slope": {"window": 20, "lookback": 5},
-                        },
-                        "score_window": 60,
-                        "factor_weight_dict": {
-                            "momentum": 0.5,
-                            "ma_slope": 0.5,
-                        },
-                    }
-                },
-            "walk_forward_config": {
-                "window_size": 20,
-                "step_size": 5,
-                "min_fold_count": 2,
-            },
-            "data_split_dict": {
-                "train_ratio": 0.5,
-                "valid_ratio": 0.25,
-                "test_ratio": 0.25,
-                "min_segment_size": 5,
-            },
-                "factor_group_list": ["趋势/动量", "均线趋势"],
-                "train_min_spearman_ic": 0.1,
-                "train_min_spearman_icir": 0.0,
-            },
-        )
-    monkeypatch.setattr(runner, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(runner, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(runner, "filter_single_fund", lambda data, fund_code: data)
-    monkeypatch.setattr(
-        runner,
-        "adapt_to_price_series",
-        lambda fund_df: (
-            pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
-            "nav_price_series",
-        ),
-    )
-    monkeypatch.setattr(
-        runner,
-        "build_walk_forward_fold_list",
-        lambda price_series, walk_forward_config, split_config: [
-            {
-                "fold_id": 1,
-                "train": price_series.iloc[:10],
-                "valid": price_series.iloc[10:15],
-                "test": price_series.iloc[15:20],
-            },
-            {
-                "fold_id": 2,
-                "train": price_series.iloc[5:15],
-                "valid": price_series.iloc[15:20],
-                "test": price_series.iloc[20:25],
-            },
-        ],
-    )
-    monkeypatch.setattr(
-        runner,
-        "build_single_factor_series",
-        lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
-            range(len(price_series))
-            if factor_name == "momentum" and int(factor_param_override["window"]) == 10
-            else list(reversed(range(len(price_series)))),
-            index=price_series.index,
-            dtype=float,
-            name=runner.build_factor_candidate_label(factor_name=factor_name, factor_param_dict=factor_param_override or {}),
-        ),
-    )
-    monkeypatch.setattr(
-        runner,
-        "build_forward_return_series",
-        lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
-    )
-
-    def fake_compute_segment_correlation_metrics(factor_series, forward_return_series, segment_index):
-        segment_start = pd.Index(segment_index).min()
-        if factor_series.name == "momentum(window=10)":
-            if len(segment_index) == 10:
-                return {"sample_size": len(segment_index), "spearman_ic": 0.4, "pearson_ic": 0.3}
-            if segment_start == pd.Timestamp("2024-01-11"):
-                return {"sample_size": len(segment_index), "spearman_ic": 0.4, "pearson_ic": 0.3}
-            return {"sample_size": len(segment_index), "spearman_ic": 0.5, "pearson_ic": 0.35}
-        if factor_series.name == "momentum(window=15)":
-            if len(segment_index) == 10:
-                return {"sample_size": len(segment_index), "spearman_ic": 0.3, "pearson_ic": 0.35}
-            return {"sample_size": len(segment_index), "spearman_ic": 0.3, "pearson_ic": 0.2}
-        return {"sample_size": len(segment_index), "spearman_ic": -0.1, "pearson_ic": -0.1}
-
-    monkeypatch.setattr(runner, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
-
-    result = runner.run_factor_selection_single_fund()
-
-    assert result["fund_code"] == "007301"
-    assert result["selected_factor_name_list"] == ["momentum"]
-    assert result["selected_candidate_label_list"] == ["momentum(window=10)"]
-    assert result["summary_df"].iloc[0]["candidate_label"] == "momentum(window=10)"
-    assert result["summary_df"].iloc[0]["factor_param_dict"] == {"window": 10}
-    assert bool(result["summary_df"].iloc[0]["train_passed"]) is True
-    assert bool(result["summary_df"].iloc[0]["valid_passed"]) is True
-    assert abs(float(result["summary_df"].iloc[0]["train_spearman_positive_ic_ratio"]) - 1.0) < 1e-12
-    assert result["summary_df"].iloc[0]["final_rank"] == 1
-    assert result["summary_df"].iloc[1]["candidate_label"] == "momentum(window=15)"
-    assert bool(result["summary_df"].iloc[1]["train_passed"]) is True
-    assert bool(result["summary_df"].iloc[1]["valid_passed"]) is False
-    assert result["summary_df"].iloc[1]["final_rank"] is None
-    assert result["selected_summary_df"].shape[0] == 1
-    assert result["summary_path"].exists()
-    assert result["summary_path"].suffix == ".json"
-    saved_record_list = json.loads(result["summary_path"].read_text(encoding="utf-8"))
-    assert saved_record_list[0]["candidate_label"] == "momentum(window=10)"
-    assert saved_record_list[0]["factor_param_dict"] == {"window": 10}
-
-
 def test_main_dispatches_factor_selection_mode(monkeypatch):
     called = {}
     monkeypatch.setattr(runner, "run_factor_selection_single_fund", lambda config_override=None: called.setdefault("factor_select", config_override))
     runner.main(["--factor-select", "--factor-groups", "趋势/动量"])
     assert "factor_select" in called
+
+
+def test_main_dispatches_single_factor_stability_analysis_mode(monkeypatch):
+    called = {}
+    monkeypatch.setattr(
+        runner,
+        "run_single_factor_stability_analysis",
+        lambda config_override=None: called.setdefault("single_factor_stability_analysis", config_override),
+    )
+    runner.main(["--single-factor-stability-analysis", "--factor-selection-path", "/tmp/factor_selection_007301_2026-04-05.json"])
+    assert "single_factor_stability_analysis" in called
