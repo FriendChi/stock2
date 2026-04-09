@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from itertools import combinations
 from pathlib import Path
 
 import pandas as pd
@@ -8,7 +9,12 @@ from tradition.config import build_tradition_config
 from tradition.data_adapter import adapt_to_price_series
 from tradition.data_fetcher import fetch_fund_data_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
-from tradition.factor_engine import FACTOR_POOL_DICT, build_single_factor_series, resolve_factor_name_list_by_group
+from tradition.factor_engine import (
+    FACTOR_POOL_DICT,
+    build_single_factor_series,
+    resolve_factor_name_list_by_group,
+)
+from tradition.optimizer import load_optuna_module
 from tradition.splitter import build_walk_forward_fold_list
 
 
@@ -539,6 +545,991 @@ def save_single_factor_stability_analysis_output(factor_selection_input, stabili
     return output_path
 
 
+def load_stability_analysis_input(stability_analysis_path):
+    # 去冗余流程直接消费稳定性分析 JSON 顶层字典，并要求其中已有稳定性分析子字典。
+    stability_analysis_path = Path(stability_analysis_path)
+    if not stability_analysis_path.exists():
+        raise FileNotFoundError(f"稳定性分析结果文件不存在: {stability_analysis_path}")
+    with stability_analysis_path.open("r", encoding="utf-8") as input_file:
+        stability_analysis_input = json.load(input_file)
+    if not isinstance(stability_analysis_input, dict):
+        raise ValueError("稳定性分析结果文件必须是顶层字典。")
+    stability_analysis_output = stability_analysis_input.get("stability_analysis_output")
+    if not isinstance(stability_analysis_output, dict):
+        raise ValueError("稳定性分析结果文件缺少 stability_analysis_output 子字典。")
+    record_dict = stability_analysis_output.get("record_dict")
+    if not isinstance(record_dict, dict):
+        raise ValueError("稳定性分析结果文件缺少 record_dict 子字典。")
+    return stability_analysis_input, stability_analysis_path
+
+
+def resolve_fund_code_from_stability_analysis_input(stability_analysis_input, stability_analysis_path):
+    # 去冗余流程优先复用稳定性分析和因子筛选两层输出中的基金代码，再回退到历史文件名约定。
+    stability_analysis_output = dict(stability_analysis_input.get("stability_analysis_output", {}))
+    candidate_code = str(stability_analysis_output.get("fund_code", "")).strip()
+    if len(candidate_code) > 0:
+        candidate_code = candidate_code.zfill(6)
+        if len(candidate_code) == 6 and candidate_code.isdigit():
+            return candidate_code
+    return resolve_fund_code_from_factor_selection_input(
+        factor_selection_input=stability_analysis_input,
+        factor_selection_path=stability_analysis_path,
+    )
+
+
+def choose_weaker_candidate(left_record, right_record):
+    # 高相关候选对的劣者按 train ICIR 优先比较，再用 valid 指标和标签打破并列。
+    compare_key_list = [
+        ("train_spearman_icir", True),
+        ("valid_spearman_icir", True),
+        ("valid_spearman_ic_mean", True),
+    ]
+    for field_name, higher_is_better in compare_key_list:
+        left_value = left_record.get(field_name)
+        right_value = right_record.get(field_name)
+        if pd.isna(left_value) and pd.isna(right_value):
+            continue
+        if pd.isna(left_value):
+            return str(left_record["candidate_label"])
+        if pd.isna(right_value):
+            return str(right_record["candidate_label"])
+        if float(left_value) == float(right_value):
+            continue
+        if higher_is_better:
+            return str(left_record["candidate_label"]) if float(left_value) < float(right_value) else str(right_record["candidate_label"])
+    return max(str(left_record["candidate_label"]), str(right_record["candidate_label"]))
+
+
+def compute_pair_train_corr(left_factor_series, right_factor_series, fold_list):
+    # 两两相关性只在每折 train 上计算，再对跨折相关性做均值汇总。
+    corr_value_list = []
+    for fold_dict in fold_list:
+        aligned_df = pd.concat(
+            [
+                pd.Series(left_factor_series, copy=True).reindex(fold_dict["train"].index).rename("left"),
+                pd.Series(right_factor_series, copy=True).reindex(fold_dict["train"].index).rename("right"),
+            ],
+            axis=1,
+        ).dropna()
+        if len(aligned_df) < 2:
+            continue
+        corr_value = aligned_df["left"].corr(aligned_df["right"], method="pearson")
+        if pd.notna(corr_value):
+            corr_value_list.append(float(corr_value))
+    if len(corr_value_list) == 0:
+        return float("nan")
+    return float(pd.Series(corr_value_list, dtype=float).mean())
+
+
+def build_corr_dedup_result(selected_summary_df, factor_series_dict, fold_list, corr_threshold=0.90, drop_ratio=0.10, min_drop_count=2):
+    # 相关性去冗余只在稳定性保留候选上工作，并全局严格剔除最差 10% 且至少 2 个高相关劣者。
+    summary_df = pd.DataFrame(selected_summary_df, copy=True).reset_index(drop=True)
+    if len(summary_df) == 0:
+        return summary_df, []
+    corr_threshold = float(corr_threshold)
+    drop_ratio = float(drop_ratio)
+    min_drop_count = int(min_drop_count)
+    loss_count_dict = {str(label): 0 for label in summary_df["candidate_label"].tolist()}
+    mean_train_corr_max_dict = {str(label): float("nan") for label in summary_df["candidate_label"].tolist()}
+    record_by_label = {
+        str(record["candidate_label"]): record
+        for record in summary_df.to_dict(orient="records")
+    }
+
+    for left_label, right_label in combinations(summary_df["candidate_label"].tolist(), 2):
+        mean_train_corr = compute_pair_train_corr(
+            left_factor_series=factor_series_dict[str(left_label)],
+            right_factor_series=factor_series_dict[str(right_label)],
+            fold_list=fold_list,
+        )
+        if pd.isna(mean_train_corr):
+            continue
+        abs_mean_train_corr = abs(float(mean_train_corr))
+        for candidate_label in [str(left_label), str(right_label)]:
+            current_max_corr = mean_train_corr_max_dict[candidate_label]
+            if pd.isna(current_max_corr) or abs_mean_train_corr > float(current_max_corr):
+                mean_train_corr_max_dict[candidate_label] = abs_mean_train_corr
+        if abs_mean_train_corr < corr_threshold:
+            continue
+        weaker_candidate_label = choose_weaker_candidate(
+            left_record=record_by_label[str(left_label)],
+            right_record=record_by_label[str(right_label)],
+        )
+        loss_count_dict[weaker_candidate_label] += 1
+
+    summary_df["corr_loss_count"] = summary_df["candidate_label"].map(loss_count_dict).astype(int)
+    summary_df["mean_train_corr_max"] = summary_df["candidate_label"].map(mean_train_corr_max_dict)
+    summary_df["corr_dedup_drop_reason"] = None
+    summary_df["corr_dedup_selected"] = True
+
+    loss_summary_df = summary_df[summary_df["corr_loss_count"] > 0].copy()
+    drop_count = max(min_drop_count, int(len(summary_df) * drop_ratio))
+    drop_count = min(drop_count, int(len(loss_summary_df)))
+    if drop_count <= 0 or len(loss_summary_df) == 0:
+        return summary_df, []
+
+    loss_summary_df = loss_summary_df.sort_values(
+        ["corr_loss_count", "train_spearman_icir", "valid_spearman_icir", "candidate_label"],
+        ascending=[False, True, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    dropped_candidate_label_list = loss_summary_df.head(drop_count)["candidate_label"].tolist()
+    dropped_candidate_label_set = set(dropped_candidate_label_list)
+    summary_df.loc[summary_df["candidate_label"].isin(dropped_candidate_label_set), "corr_dedup_selected"] = False
+    summary_df.loc[
+        summary_df["candidate_label"].isin(dropped_candidate_label_set),
+        "corr_dedup_drop_reason",
+    ] = "high_train_corr_lower_train_icir"
+    return summary_df, dropped_candidate_label_list
+
+
+def build_instance_factor_table(factor_candidate_list, factor_series_dict):
+    # 实例级组合使用 candidate_label 作为列名，允许同一 factor_name 的不同参数版本同时进入同一组合。
+    factor_table = pd.DataFrame()
+    for factor_candidate in factor_candidate_list:
+        candidate_label = str(factor_candidate["candidate_label"])
+        factor_series = pd.Series(factor_series_dict[candidate_label], copy=True).astype(float)
+        factor_table[candidate_label] = factor_series
+    return factor_table
+
+
+def build_instance_combination_score(factor_candidate_list, factor_series_dict):
+    # 实例级组合评分固定采用等权求和，避免沿用 factor_name 唯一键路径导致参数版本冲突。
+    factor_table = build_instance_factor_table(
+        factor_candidate_list=factor_candidate_list,
+        factor_series_dict=factor_series_dict,
+    )
+    score_series = factor_table.sum(axis=1).astype(float)
+    score_series.name = "|".join([str(item["candidate_label"]) for item in factor_candidate_list])
+    return factor_table, score_series
+
+
+def build_weighted_instance_combination_score(factor_candidate_list, factor_series_dict, candidate_weight_dict):
+    # 因子组合流程使用实例级权重求和，允许不同参数版本按 candidate_label 独立赋权。
+    factor_table = build_instance_factor_table(
+        factor_candidate_list=factor_candidate_list,
+        factor_series_dict=factor_series_dict,
+    )
+    weighted_factor_table = pd.DataFrame(index=factor_table.index)
+    for candidate_label in factor_table.columns.tolist():
+        weighted_factor_table[candidate_label] = factor_table[candidate_label] * float(candidate_weight_dict[candidate_label])
+    score_series = weighted_factor_table.sum(axis=1).astype(float)
+    score_series.name = "|".join([str(item["candidate_label"]) for item in factor_candidate_list])
+    return factor_table, score_series
+
+
+def evaluate_single_factor_train_icir(factor_series, forward_return_series, fold_list):
+    # 加权组合的单因子 ICIR 统一只在 train 上计算，保证权重来源和训练目标一致。
+    train_metric_list = []
+    for fold_dict in fold_list:
+        train_metric_list.append(
+            compute_segment_correlation_metrics(
+                factor_series=factor_series,
+                forward_return_series=forward_return_series,
+                segment_index=fold_dict["train"].index,
+            )
+        )
+    return float(build_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list])["icir"])
+
+
+def build_equal_weight_dict(factor_candidate_list):
+    # 等权组合固定给每个实例同样权重，并统一归一化到 1。
+    if len(factor_candidate_list) == 0:
+        return {}
+    weight_value = 1.0 / float(len(factor_candidate_list))
+    return {
+        str(factor_candidate["candidate_label"]): weight_value
+        for factor_candidate in factor_candidate_list
+    }
+
+
+def build_train_icir_weight_dict(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, candidate_train_icir_dict=None):
+    # 训练集 ICIR 加权先把负值截断到 0，再归一化；若总和为 0，则回退等权。
+    resolved_train_icir_dict = {}
+    for factor_candidate in factor_candidate_list:
+        candidate_label = str(factor_candidate["candidate_label"])
+        if candidate_train_icir_dict is not None and candidate_label in candidate_train_icir_dict:
+            resolved_train_icir_dict[candidate_label] = float(candidate_train_icir_dict[candidate_label])
+            continue
+        resolved_train_icir_dict[candidate_label] = evaluate_single_factor_train_icir(
+            factor_series=factor_series_dict[candidate_label],
+            forward_return_series=forward_return_series,
+            fold_list=fold_list,
+        )
+    nonnegative_weight_dict = {
+        candidate_label: max(float(train_icir), 0.0)
+        for candidate_label, train_icir in resolved_train_icir_dict.items()
+    }
+    total_weight = float(sum(nonnegative_weight_dict.values()))
+    if total_weight <= 1e-12:
+        return build_equal_weight_dict(factor_candidate_list)
+    return {
+        candidate_label: float(weight_value / total_weight)
+        for candidate_label, weight_value in nonnegative_weight_dict.items()
+    }
+
+
+def evaluate_combination_summary(
+    factor_candidate_list,
+    factor_series_dict,
+    forward_return_series,
+    fold_list,
+    method_name,
+    candidate_train_icir_dict=None,
+    include_valid=True,
+    candidate_weight_dict_override=None,
+):
+    # 因子组合阶段统一输出 train 指标，并按需要补算 valid，避免 train 搜索阶段过早消耗样本外评估成本。
+    if candidate_weight_dict_override is not None:
+        candidate_weight_dict = {
+            str(candidate_label): float(weight_value)
+            for candidate_label, weight_value in candidate_weight_dict_override.items()
+        }
+    elif str(method_name) == "equal_weight":
+        candidate_weight_dict = build_equal_weight_dict(factor_candidate_list)
+    elif str(method_name) == "train_icir_weighted":
+        candidate_weight_dict = build_train_icir_weight_dict(
+            factor_candidate_list=factor_candidate_list,
+            factor_series_dict=factor_series_dict,
+            forward_return_series=forward_return_series,
+            fold_list=fold_list,
+            candidate_train_icir_dict=candidate_train_icir_dict,
+        )
+    else:
+        raise ValueError(f"未定义的组合方式: {method_name}")
+
+    _, score_series = build_weighted_instance_combination_score(
+        factor_candidate_list=factor_candidate_list,
+        factor_series_dict=factor_series_dict,
+        candidate_weight_dict=candidate_weight_dict,
+    )
+    train_metric_list = []
+    valid_metric_list = []
+    for fold_dict in fold_list:
+        train_metric_list.append(
+            compute_segment_correlation_metrics(
+                factor_series=score_series,
+                forward_return_series=forward_return_series,
+                segment_index=fold_dict["train"].index,
+            )
+        )
+        if include_valid:
+            valid_metric_list.append(
+                compute_segment_correlation_metrics(
+                    factor_series=score_series,
+                    forward_return_series=forward_return_series,
+                    segment_index=fold_dict["valid"].index,
+                )
+            )
+    train_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list])
+    summary = {
+        "method_name": str(method_name),
+        "candidate_label_list": [str(item["candidate_label"]) for item in factor_candidate_list],
+        "factor_count": int(len(factor_candidate_list)),
+        "candidate_weight_dict": {
+            str(candidate_label): float(weight_value)
+            for candidate_label, weight_value in candidate_weight_dict.items()
+        },
+        "train_spearman_ic_mean": train_summary["mean"],
+        "train_spearman_icir": train_summary["icir"],
+    }
+    if include_valid:
+        valid_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in valid_metric_list])
+        summary["valid_spearman_ic_mean"] = valid_summary["mean"]
+        summary["valid_spearman_icir"] = valid_summary["icir"]
+    return summary
+
+
+def select_best_combination_method_summary(summary_list):
+    # 组合方式比较优先看 valid ICIR，再看 valid IC 和 train ICIR，完全相同则默认等权。
+    summary_list = [dict(summary) for summary in summary_list]
+    if len(summary_list) == 0:
+        return None
+    method_priority_dict = {
+        "equal_weight": 0,
+        "train_icir_weighted": 1,
+    }
+    sorted_summary_list = sorted(
+        summary_list,
+        key=lambda summary: (
+            -float(summary["valid_spearman_icir"]),
+            -float(summary["valid_spearman_ic_mean"]),
+            -float(summary["train_spearman_icir"]),
+            int(method_priority_dict.get(str(summary["method_name"]), 999)),
+        ),
+    )
+    return dict(sorted_summary_list[0])
+
+
+def select_best_combination_trial_summary(summary_list):
+    # 参数微调后的最终参数只在进入 valid 的候选中比较，规则与组合选择保持一致但不依赖 step 字段。
+    summary_list = [dict(summary) for summary in summary_list]
+    if len(summary_list) == 0:
+        return None
+    sorted_summary_list = sorted(
+        summary_list,
+        key=lambda summary: (
+            -float(summary["valid_spearman_icir"]),
+            -float(summary["valid_spearman_ic_mean"]),
+            -float(summary["train_spearman_icir"]),
+            int(summary["trial_number"]),
+        ),
+    )
+    return dict(sorted_summary_list[0])
+
+
+def select_best_combination_trial_summary(summary_list):
+    # 权重微调后的最终方案只在进入 valid 的 trial 中比较，不依赖 forward selection 的 step 字段。
+    summary_list = [dict(summary) for summary in summary_list]
+    if len(summary_list) == 0:
+        return None
+    sorted_summary_list = sorted(
+        summary_list,
+        key=lambda summary: (
+            -float(summary["valid_spearman_icir"]),
+            -float(summary["valid_spearman_ic_mean"]),
+            -float(summary["train_spearman_icir"]),
+            int(summary["trial_number"]),
+        ),
+    )
+    return dict(sorted_summary_list[0])
+
+
+def normalize_candidate_weight_dict(candidate_weight_dict, fallback_weight_dict):
+    # Optuna trial 先生成原始权重，再统一归一化后才进入 train 评估，总和过小则回退基准权重。
+    nonnegative_weight_dict = {
+        str(candidate_label): max(float(weight_value), 0.0)
+        for candidate_label, weight_value in candidate_weight_dict.items()
+    }
+    total_weight = float(sum(nonnegative_weight_dict.values()))
+    if total_weight <= 1e-12:
+        return {
+            str(candidate_label): float(weight_value)
+            for candidate_label, weight_value in fallback_weight_dict.items()
+        }
+    return {
+        str(candidate_label): float(weight_value / total_weight)
+        for candidate_label, weight_value in nonnegative_weight_dict.items()
+    }
+
+
+def build_weight_search_range_dict(base_weight_dict):
+    # 权重微调范围固定为基准权重上下 5%，并保持非负，最终仍需再次归一化。
+    return {
+        str(candidate_label): {
+            "low": float(max(0.0, float(weight_value) * 0.95)),
+            "high": float(max(0.0, float(weight_value) * 1.05)),
+        }
+        for candidate_label, weight_value in base_weight_dict.items()
+    }
+
+
+def run_factor_combination_weight_tuning(
+    factor_candidate_list,
+    factor_series_dict,
+    forward_return_series,
+    fold_list,
+    selected_method_summary,
+):
+    # 权重微调只对优胜组合方式运行，trial 固定 100 轮，再把 train 前 50 个 trial 放到 valid 上比较。
+    optuna_module = load_optuna_module()
+    selected_method_summary = dict(selected_method_summary)
+    base_weight_dict = {
+        str(candidate_label): float(weight_value)
+        for candidate_label, weight_value in dict(selected_method_summary["candidate_weight_dict"]).items()
+    }
+    weight_search_range_dict = build_weight_search_range_dict(base_weight_dict=base_weight_dict)
+    train_trial_summary_list = []
+
+    # trial 只围绕基准权重上下 5% 生成原始权重，再归一化成真正可执行的组合权重。
+    def objective(trial):
+        raw_weight_dict = {}
+        for factor_candidate in factor_candidate_list:
+            candidate_label = str(factor_candidate["candidate_label"])
+            weight_range = dict(weight_search_range_dict[candidate_label])
+            raw_weight_dict[candidate_label] = float(
+                trial.suggest_float(
+                    f"{candidate_label}__weight",
+                    float(weight_range["low"]),
+                    float(weight_range["high"]),
+                )
+            )
+        normalized_weight_dict = normalize_candidate_weight_dict(
+            candidate_weight_dict=raw_weight_dict,
+            fallback_weight_dict=base_weight_dict,
+        )
+        summary = evaluate_combination_summary(
+            factor_candidate_list=factor_candidate_list,
+            factor_series_dict=factor_series_dict,
+            forward_return_series=forward_return_series,
+            fold_list=fold_list,
+            method_name=str(selected_method_summary["method_name"]),
+            include_valid=False,
+            candidate_weight_dict_override=normalized_weight_dict,
+        )
+        summary["trial_number"] = int(trial.number)
+        summary["candidate_weight_dict"] = dict(normalized_weight_dict)
+        train_trial_summary_list.append(dict(summary))
+        return float(summary["train_spearman_icir"])
+
+    study = optuna_module.create_study(
+        direction="maximize",
+        sampler=optuna_module.samplers.TPESampler(seed=42),
+    )
+    study.optimize(objective, n_trials=100)
+    sorted_trial_summary_list = sorted(
+        train_trial_summary_list,
+        key=lambda summary: (
+            -float(summary["train_spearman_icir"]),
+            -float(summary["train_spearman_ic_mean"]),
+            int(summary["trial_number"]),
+        ),
+    )
+    top_train_trial_summary_list = [dict(summary) for summary in sorted_trial_summary_list[:50]]
+    valid_trial_summary_list = []
+    for train_summary in top_train_trial_summary_list:
+        valid_summary = evaluate_combination_summary(
+            factor_candidate_list=factor_candidate_list,
+            factor_series_dict=factor_series_dict,
+            forward_return_series=forward_return_series,
+            fold_list=fold_list,
+            method_name=str(selected_method_summary["method_name"]),
+            include_valid=True,
+            candidate_weight_dict_override=dict(train_summary["candidate_weight_dict"]),
+        )
+        valid_summary["trial_number"] = int(train_summary["trial_number"])
+        valid_summary["candidate_weight_dict"] = dict(train_summary["candidate_weight_dict"])
+        valid_trial_summary_list.append(valid_summary)
+    best_tuned_trial_summary = select_best_combination_trial_summary(valid_trial_summary_list)
+    return {
+        "enabled": True,
+        "selected_method": str(selected_method_summary["method_name"]),
+        "n_trials": 100,
+        "top_k_valid_eval_count": int(len(valid_trial_summary_list)),
+        "base_weight_dict": base_weight_dict,
+        "weight_search_range_dict": weight_search_range_dict,
+        "train_top_trial_summary_list": top_train_trial_summary_list,
+        "best_tuned_trial_summary": best_tuned_trial_summary,
+    }
+
+
+def save_factor_combination_output(dedup_selection_input, factor_combination_output, output_dir, fund_code):
+    # 因子组合流程输出单独落盘，和 dedup 流程同级，避免回写覆盖前一阶段结果。
+    output_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.today().strftime("%Y-%m-%d")
+    output_path = output_dir / f"factor_combination_{str(fund_code).zfill(6)}_{date_str}.json"
+    payload = dict(dedup_selection_input)
+    payload["factor_combination_output"] = factor_combination_output
+    with output_path.open("w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, ensure_ascii=False, indent=2)
+    return output_path
+
+
+def print_factor_combination_summary(result):
+    # 因子组合流程终端只输出当前使用的组合方式和最终微调后的权重结果，完整 trial 细节落盘保存。
+    print("因子组合结果:")
+    print("基金代码:", result["fund_code"])
+    print("输入去冗余文件:", result["dedup_selection_path"])
+    print("输入因子组合:", result["input_candidate_label_list"])
+    print("组合对比优胜方法:", result["combination_compare_output"]["selected_method"])
+    print("权重微调后组合:", result["best_combination_selection_summary"]["candidate_label_list"])
+    print("权重微调后方法:", result["best_combination_selection_summary"]["selected_method"])
+    print("汇总输出:", result["summary_path"])
+
+
+def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, include_valid=True):
+    # 候选组合统一转换成实例级组合分数序列，再按指定阶段复用现有 IC 与 ICIR 汇总逻辑。
+    _, score_series = build_instance_combination_score(
+        factor_candidate_list=factor_candidate_list,
+        factor_series_dict=factor_series_dict,
+    )
+    train_metric_list = []
+    valid_metric_list = []
+    for fold_dict in fold_list:
+        train_metric_list.append(
+            compute_segment_correlation_metrics(
+                factor_series=score_series,
+                forward_return_series=forward_return_series,
+                segment_index=fold_dict["train"].index,
+            )
+        )
+        if include_valid:
+            valid_metric_list.append(
+                compute_segment_correlation_metrics(
+                    factor_series=score_series,
+                    forward_return_series=forward_return_series,
+                    segment_index=fold_dict["valid"].index,
+                )
+            )
+    train_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list])
+    summary_dict = {
+        "candidate_label_list": [str(item["candidate_label"]) for item in factor_candidate_list],
+        "factor_count": int(len(factor_candidate_list)),
+        "train_spearman_ic_mean": train_summary["mean"],
+        "train_spearman_icir": train_summary["icir"],
+    }
+    if include_valid:
+        valid_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in valid_metric_list])
+        summary_dict["valid_spearman_ic_mean"] = valid_summary["mean"]
+        summary_dict["valid_spearman_icir"] = valid_summary["icir"]
+    return summary_dict
+
+
+def build_candidate_label_signature(candidate_label_list):
+    # 树形搜索按组合签名去重，避免不同扩展顺序生成同一候选集合。
+    return tuple(sorted([str(candidate_label) for candidate_label in candidate_label_list]))
+
+
+def run_train_forward_selection(candidate_record_list, factor_series_dict, forward_return_series, fold_list, root_topk=3):
+    # 组合搜索从 train 上最优的 topk 个单因子根节点出发，只保留 train ICIR 不下降的扩展分支。
+    candidate_record_list = list(candidate_record_list)
+    if len(candidate_record_list) == 0:
+        return []
+    root_topk = int(root_topk)
+    if root_topk <= 0:
+        raise ValueError("root_topk 必须为正整数。")
+    sorted_candidate_record_list = sorted(
+        candidate_record_list,
+        key=lambda record: (
+            -float(record["train_spearman_icir"]),
+            -float(record["valid_spearman_icir"]),
+            -float(record["valid_spearman_ic_mean"]),
+            str(record["candidate_label"]),
+        ),
+    )
+    path_summary_dict = {}
+
+    # 第一层只从 train 表现最优的 topk 个单因子根节点出发，控制树形扩展的起始分支数量。
+    frontier_node_list = []
+    for root_candidate_record in sorted_candidate_record_list[:root_topk]:
+        root_candidate_list = [dict(root_candidate_record)]
+        root_summary = evaluate_factor_candidate_subset(
+            factor_candidate_list=root_candidate_list,
+            factor_series_dict=factor_series_dict,
+            forward_return_series=forward_return_series,
+            fold_list=fold_list,
+            include_valid=False,
+        )
+        root_summary["step"] = 1
+        root_signature = build_candidate_label_signature(root_summary["candidate_label_list"])
+        path_summary_dict[root_signature] = root_summary
+        frontier_node_list.append(
+            {
+                "candidate_record_list": root_candidate_list,
+                "summary": root_summary,
+            }
+        )
+
+    while len(frontier_node_list) > 0:
+        next_frontier_node_list = []
+        for frontier_node in frontier_node_list:
+            parent_candidate_list = list(frontier_node["candidate_record_list"])
+            parent_summary = dict(frontier_node["summary"])
+            parent_signature = build_candidate_label_signature(parent_summary["candidate_label_list"])
+            parent_candidate_label_set = set(parent_summary["candidate_label_list"])
+            for candidate_record in sorted_candidate_record_list:
+                candidate_label = str(candidate_record["candidate_label"])
+                if candidate_label in parent_candidate_label_set:
+                    continue
+                child_candidate_list = parent_candidate_list + [dict(candidate_record)]
+                child_signature = build_candidate_label_signature([item["candidate_label"] for item in child_candidate_list])
+                if child_signature in path_summary_dict:
+                    continue
+                child_summary = evaluate_factor_candidate_subset(
+                    factor_candidate_list=child_candidate_list,
+                    factor_series_dict=factor_series_dict,
+                    forward_return_series=forward_return_series,
+                    fold_list=fold_list,
+                    include_valid=False,
+                )
+                child_summary["step"] = int(len(child_candidate_list))
+                if pd.isna(child_summary["train_spearman_icir"]) or pd.isna(parent_summary["train_spearman_icir"]):
+                    continue
+                if float(child_summary["train_spearman_icir"]) < float(parent_summary["train_spearman_icir"]):
+                    continue
+                path_summary_dict[child_signature] = child_summary
+                next_frontier_node_list.append(
+                    {
+                        "candidate_record_list": child_candidate_list,
+                        "summary": child_summary,
+                    }
+                )
+        frontier_node_list = next_frontier_node_list
+
+    path_summary_list = list(path_summary_dict.values())
+    path_summary_list = sorted(
+        path_summary_list,
+        key=lambda summary: (
+            int(summary["factor_count"]),
+            tuple(summary["candidate_label_list"]),
+        ),
+    )
+    return path_summary_list
+
+
+def select_top_train_path_summary_list(train_path_summary_list, top_ratio=0.5):
+    # valid 评估前先按 train ICIR 对组合路径做截断，减少后续样本外评估数量。
+    train_path_summary_list = list(train_path_summary_list)
+    if len(train_path_summary_list) == 0:
+        return []
+    top_count = max(1, int(len(train_path_summary_list) * float(top_ratio)))
+    sorted_path_summary_list = sorted(
+        train_path_summary_list,
+        key=lambda summary: (
+            -float(summary["train_spearman_icir"]),
+            -float(summary["train_spearman_ic_mean"]),
+            int(summary["factor_count"]),
+            int(summary["step"]),
+            tuple(summary["candidate_label_list"]),
+        ),
+    )
+    return [dict(summary) for summary in sorted_path_summary_list[:top_count]]
+
+
+def evaluate_valid_for_path_summary_list(path_summary_list, candidate_record_lookup, factor_series_dict, forward_return_series, fold_list):
+    # 进入 valid 评估的路径只补算 valid 指标，train 指标沿用树搜索阶段的结果。
+    evaluated_summary_list = []
+    for path_summary in path_summary_list:
+        factor_candidate_list = [dict(candidate_record_lookup[candidate_label]) for candidate_label in path_summary["candidate_label_list"]]
+        evaluated_summary = evaluate_factor_candidate_subset(
+            factor_candidate_list=factor_candidate_list,
+            factor_series_dict=factor_series_dict,
+            forward_return_series=forward_return_series,
+            fold_list=fold_list,
+            include_valid=True,
+        )
+        evaluated_summary["step"] = int(path_summary["step"])
+        evaluated_summary_list.append(evaluated_summary)
+    return evaluated_summary_list
+
+
+def select_best_forward_path_summary(forward_selection_path_summary):
+    # 最终组合选择只看 valid 表现，再用 train 稳定性和更小组合打破并列。
+    if len(forward_selection_path_summary) == 0:
+        return None
+    sorted_path_summary_list = sorted(
+        forward_selection_path_summary,
+        key=lambda summary: (
+            -float(summary["valid_spearman_icir"]),
+            -float(summary["valid_spearman_ic_mean"]),
+            -float(summary["train_spearman_icir"]),
+            int(summary["factor_count"]),
+            int(summary["step"]),
+        ),
+    )
+    return dict(sorted_path_summary_list[0])
+
+
+def run_optuna_extension_search(
+    baseline_summary,
+    corr_selected_candidate_list,
+    candidate_record_lookup,
+    factor_series_dict,
+    forward_return_series,
+    fold_list,
+):
+    # Optuna 扩展搜索只在前向选择基准之外的剩余因子上做布尔搜索，并且只保留 train 上优于基准的组合。
+    baseline_summary = dict(baseline_summary)
+    baseline_candidate_label_list = [str(candidate_label) for candidate_label in baseline_summary["candidate_label_list"]]
+    baseline_candidate_label_set = set(baseline_candidate_label_list)
+    remaining_candidate_record_list = [
+        dict(candidate_record)
+        for candidate_record in corr_selected_candidate_list
+        if str(candidate_record["candidate_label"]) not in baseline_candidate_label_set
+    ]
+    remaining_candidate_record_list = sorted(
+        remaining_candidate_record_list,
+        key=lambda record: str(record["candidate_label"]),
+    )
+    remaining_candidate_label_list = [str(record["candidate_label"]) for record in remaining_candidate_record_list]
+    remaining_factor_count = int(len(remaining_candidate_record_list))
+    if remaining_factor_count == 0:
+        return {
+            "enabled": False,
+            "baseline_candidate_label_list": baseline_candidate_label_list,
+            "baseline_train_spearman_icir": float(baseline_summary["train_spearman_icir"]),
+            "baseline_valid_spearman_icir": float(baseline_summary["valid_spearman_icir"]),
+            "remaining_candidate_label_list": remaining_candidate_label_list,
+            "remaining_factor_count": remaining_factor_count,
+            "n_trials": 0,
+            "train_improved_candidate_count": 0,
+            "train_improved_path_summary_list": [],
+            "best_optuna_candidate_summary": None,
+            "final_selected_source": "forward_selection",
+            "best_final_selection_summary": dict(baseline_summary),
+        }
+
+    optuna_module = load_optuna_module()
+    train_improved_summary_dict = {}
+    baseline_train_icir = float(baseline_summary["train_spearman_icir"])
+
+    # 搜索空间只允许在前向选择基准组合上附加剩余因子，避免回头改变已确认的基准结构。
+    def objective(trial):
+        selected_candidate_label_list = list(baseline_candidate_label_list)
+        for idx, candidate_record in enumerate(remaining_candidate_record_list):
+            if int(trial.suggest_int(f"add_{idx}", 0, 1)) == 1:
+                selected_candidate_label_list.append(str(candidate_record["candidate_label"]))
+        selected_candidate_label_list = sorted(selected_candidate_label_list)
+        factor_candidate_list = [dict(candidate_record_lookup[candidate_label]) for candidate_label in selected_candidate_label_list]
+        summary = evaluate_factor_candidate_subset(
+            factor_candidate_list=factor_candidate_list,
+            factor_series_dict=factor_series_dict,
+            forward_return_series=forward_return_series,
+            fold_list=fold_list,
+            include_valid=False,
+        )
+        summary["step"] = int(len(summary["candidate_label_list"]))
+        if float(summary["train_spearman_icir"]) > baseline_train_icir:
+            signature = build_candidate_label_signature(summary["candidate_label_list"])
+            cached_summary = train_improved_summary_dict.get(signature)
+            if cached_summary is None or float(summary["train_spearman_icir"]) > float(cached_summary["train_spearman_icir"]):
+                train_improved_summary_dict[signature] = dict(summary)
+        return float(summary["train_spearman_icir"])
+
+    n_trials = int(remaining_factor_count ** 2)
+    study = optuna_module.create_study(
+        direction="maximize",
+        sampler=optuna_module.samplers.TPESampler(seed=42),
+    )
+    study.optimize(objective, n_trials=n_trials)
+
+    train_improved_path_summary_list = sorted(
+        train_improved_summary_dict.values(),
+        key=lambda summary: (
+            -float(summary["train_spearman_icir"]),
+            -float(summary["train_spearman_ic_mean"]),
+            int(summary["factor_count"]),
+            tuple(summary["candidate_label_list"]),
+        ),
+    )
+    valid_evaluated_summary_list = evaluate_valid_for_path_summary_list(
+        path_summary_list=train_improved_path_summary_list,
+        candidate_record_lookup=candidate_record_lookup,
+        factor_series_dict=factor_series_dict,
+        forward_return_series=forward_return_series,
+        fold_list=fold_list,
+    )
+    best_optuna_candidate_summary = select_best_forward_path_summary(valid_evaluated_summary_list)
+    if best_optuna_candidate_summary is None:
+        return {
+            "enabled": True,
+            "baseline_candidate_label_list": baseline_candidate_label_list,
+            "baseline_train_spearman_icir": baseline_train_icir,
+            "baseline_valid_spearman_icir": float(baseline_summary["valid_spearman_icir"]),
+            "remaining_candidate_label_list": remaining_candidate_label_list,
+            "remaining_factor_count": remaining_factor_count,
+            "n_trials": n_trials,
+            "train_improved_candidate_count": 0,
+            "train_improved_path_summary_list": [],
+            "best_optuna_candidate_summary": None,
+            "final_selected_source": "forward_selection",
+            "best_final_selection_summary": dict(baseline_summary),
+        }
+
+    best_final_selection_summary = select_best_forward_path_summary(
+        [dict(baseline_summary), dict(best_optuna_candidate_summary)]
+    )
+    final_selected_source = "forward_selection"
+    if tuple(best_final_selection_summary["candidate_label_list"]) == tuple(best_optuna_candidate_summary["candidate_label_list"]):
+        final_selected_source = "optuna_extension"
+    return {
+        "enabled": True,
+        "baseline_candidate_label_list": baseline_candidate_label_list,
+        "baseline_train_spearman_icir": baseline_train_icir,
+        "baseline_valid_spearman_icir": float(baseline_summary["valid_spearman_icir"]),
+        "remaining_candidate_label_list": remaining_candidate_label_list,
+        "remaining_factor_count": remaining_factor_count,
+        "n_trials": n_trials,
+        "train_improved_candidate_count": int(len(valid_evaluated_summary_list)),
+        "train_improved_path_summary_list": valid_evaluated_summary_list,
+        "best_optuna_candidate_summary": best_optuna_candidate_summary,
+        "final_selected_source": final_selected_source,
+        "best_final_selection_summary": best_final_selection_summary,
+    }
+
+
+def save_single_factor_dedup_selection_output(stability_analysis_input, dedup_selection_output, output_dir, fund_code):
+    # 去冗余与正向选择结果继续追加到统一结果树中，避免和前两步拆成互相独立的 JSON。
+    output_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.today().strftime("%Y-%m-%d")
+    output_path = output_dir / f"single_factor_dedup_{str(fund_code).zfill(6)}_{date_str}.json"
+    payload = dict(stability_analysis_input)
+    payload["dedup_selection_output"] = dedup_selection_output
+    with output_path.open("w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, ensure_ascii=False, indent=2)
+    return output_path
+
+
+def load_dedup_selection_input(dedup_selection_path):
+    # 因子组合流程直接消费 dedup JSON 顶层字典，并要求其中已有 dedup_selection_output 子字典。
+    dedup_selection_path = Path(dedup_selection_path)
+    if not dedup_selection_path.exists():
+        raise FileNotFoundError(f"去冗余结果文件不存在: {dedup_selection_path}")
+    with dedup_selection_path.open("r", encoding="utf-8") as input_file:
+        dedup_selection_input = json.load(input_file)
+    if not isinstance(dedup_selection_input, dict):
+        raise ValueError("去冗余结果文件必须是顶层字典。")
+    dedup_selection_output = dedup_selection_input.get("dedup_selection_output")
+    if not isinstance(dedup_selection_output, dict):
+        raise ValueError("去冗余结果文件缺少 dedup_selection_output 子字典。")
+    if not isinstance(dedup_selection_output.get("record_dict"), dict):
+        raise ValueError("去冗余结果文件缺少 dedup_selection_output.record_dict。")
+    if not isinstance(dedup_selection_output.get("best_final_selection_summary"), dict):
+        raise ValueError("去冗余结果文件缺少 dedup_selection_output.best_final_selection_summary。")
+    return dedup_selection_input, dedup_selection_path
+
+
+def resolve_fund_code_from_dedup_selection_input(dedup_selection_input, dedup_selection_path):
+    # 因子组合流程优先复用 dedup 输出中的基金代码，再回退到前序结果和文件名约定。
+    dedup_selection_output = dict(dedup_selection_input.get("dedup_selection_output", {}))
+    candidate_code = str(dedup_selection_output.get("fund_code", "")).strip()
+    if len(candidate_code) > 0:
+        candidate_code = candidate_code.zfill(6)
+        if len(candidate_code) == 6 and candidate_code.isdigit():
+            return candidate_code
+    return resolve_fund_code_from_stability_analysis_input(
+        stability_analysis_input=dedup_selection_input,
+        stability_analysis_path=dedup_selection_path,
+    )
+
+
+def run_factor_combination(config_override=None):
+    # 因子组合流程独立消费 dedup 结果，只比较组合方式并在优胜方法上做权重微调，不再改写前一阶段文件。
+    config = build_tradition_config(config_override=config_override)
+    dedup_selection_path = config.get("dedup_selection_path")
+    if dedup_selection_path is None:
+        raise ValueError("factor_combination 模式必须提供 dedup_selection_path。")
+    dedup_selection_input, resolved_dedup_selection_path = load_dedup_selection_input(dedup_selection_path)
+    dedup_selection_output = dict(dedup_selection_input["dedup_selection_output"])
+    best_final_selection_summary = dict(dedup_selection_output["best_final_selection_summary"])
+    input_candidate_label_list = [str(candidate_label) for candidate_label in best_final_selection_summary["candidate_label_list"]]
+    if len(input_candidate_label_list) == 0:
+        raise ValueError("dedup 结果中的 best_final_selection_summary 为空组合。")
+    fund_code = resolve_fund_code_from_dedup_selection_input(
+        dedup_selection_input=dedup_selection_input,
+        dedup_selection_path=resolved_dedup_selection_path,
+    )
+
+    raw_data = fetch_fund_data_with_cache(
+        code_dict=config["code_dict"],
+        cache_dir=config["data_dir"],
+        force_refresh=bool(config["force_refresh"]),
+        cache_prefix=config["cache_prefix"],
+    )
+    normalized_data = normalize_fund_data(raw_data)
+    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
+    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
+    fold_list = build_walk_forward_fold_list(
+        price_series=price_series,
+        walk_forward_config=dict(config["walk_forward_config"]),
+        split_config=config["data_split_dict"],
+    )
+    base_multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
+    forward_return_series = build_forward_return_series(price_series=price_series, forward_window=5)
+
+    candidate_record_lookup = {
+        str(candidate_label): dict(record)
+        for candidate_label, record in dict(dedup_selection_output["record_dict"]).items()
+    }
+    factor_candidate_list = [dict(candidate_record_lookup[candidate_label]) for candidate_label in input_candidate_label_list]
+    factor_series_dict = {}
+    candidate_train_icir_dict = {}
+    for factor_candidate in factor_candidate_list:
+        candidate_label = str(factor_candidate["candidate_label"])
+        factor_series_dict[candidate_label] = build_single_factor_series(
+            price_series=price_series,
+            factor_name=factor_candidate["factor_name"],
+            strategy_params=base_multi_factor_params,
+            factor_param_override=dict(factor_candidate["factor_param_dict"]),
+        )
+        candidate_train_icir_dict[candidate_label] = float(candidate_record_lookup[candidate_label]["train_spearman_icir"])
+
+    combination_summary_list = [
+        evaluate_combination_summary(
+            factor_candidate_list=factor_candidate_list,
+            factor_series_dict=factor_series_dict,
+            forward_return_series=forward_return_series,
+            fold_list=fold_list,
+            method_name="equal_weight",
+            candidate_train_icir_dict=candidate_train_icir_dict,
+            include_valid=True,
+        ),
+        evaluate_combination_summary(
+            factor_candidate_list=factor_candidate_list,
+            factor_series_dict=factor_series_dict,
+            forward_return_series=forward_return_series,
+            fold_list=fold_list,
+            method_name="train_icir_weighted",
+            candidate_train_icir_dict=candidate_train_icir_dict,
+            include_valid=True,
+        ),
+    ]
+    selected_method_summary = select_best_combination_method_summary(combination_summary_list)
+    combination_compare_output = {
+        "candidate_label_list": input_candidate_label_list,
+        "equal_weight_summary": next(summary for summary in combination_summary_list if summary["method_name"] == "equal_weight"),
+        "train_icir_weighted_summary": next(summary for summary in combination_summary_list if summary["method_name"] == "train_icir_weighted"),
+        "selected_method": str(selected_method_summary["method_name"]),
+    }
+    weight_tuning_output = run_factor_combination_weight_tuning(
+        factor_candidate_list=factor_candidate_list,
+        factor_series_dict=factor_series_dict,
+        forward_return_series=forward_return_series,
+        fold_list=fold_list,
+        selected_method_summary=selected_method_summary,
+    )
+    best_tuned_trial_summary = dict(weight_tuning_output["best_tuned_trial_summary"])
+    best_combination_selection_summary = {
+        "candidate_label_list": list(best_tuned_trial_summary["candidate_label_list"]),
+        "selected_method": str(selected_method_summary["method_name"]),
+        "candidate_weight_dict": dict(best_tuned_trial_summary["candidate_weight_dict"]),
+        "train_spearman_ic_mean": float(best_tuned_trial_summary["train_spearman_ic_mean"]),
+        "train_spearman_icir": float(best_tuned_trial_summary["train_spearman_icir"]),
+        "valid_spearman_ic_mean": float(best_tuned_trial_summary["valid_spearman_ic_mean"]),
+        "valid_spearman_icir": float(best_tuned_trial_summary["valid_spearman_icir"]),
+        "trial_number": int(best_tuned_trial_summary["trial_number"]),
+    }
+    factor_combination_output = {
+        "fund_code": fund_code,
+        "dedup_selection_path": str(resolved_dedup_selection_path),
+        "analysis_date": datetime.today().strftime("%Y-%m-%d"),
+        "input_candidate_label_list": input_candidate_label_list,
+        "combination_compare_output": combination_compare_output,
+        "weight_tuning_output": weight_tuning_output,
+        "best_combination_selection_summary": best_combination_selection_summary,
+    }
+    summary_path = save_factor_combination_output(
+        dedup_selection_input=dedup_selection_input,
+        factor_combination_output=factor_combination_output,
+        output_dir=config["output_dir"],
+        fund_code=fund_code,
+    )
+    result = {
+        "fund_code": fund_code,
+        "data_mode": data_mode,
+        "dedup_selection_path": str(resolved_dedup_selection_path),
+        "input_candidate_label_list": input_candidate_label_list,
+        "combination_compare_output": combination_compare_output,
+        "weight_tuning_output": weight_tuning_output,
+        "best_combination_selection_summary": best_combination_selection_summary,
+        "summary_path": summary_path,
+    }
+    print_factor_combination_summary(result)
+    return result
+
+
+def print_single_factor_dedup_selection_summary(result):
+    # 终端摘要只展示去冗余后保留数量和最终正向选择结果，详细路径仍以 JSON 保存。
+    print("单因子去冗余与正向选择结果:")
+    print("基金代码:", result["fund_code"])
+    print("输入稳定性文件:", result["stability_analysis_path"])
+    print("输入稳定性保留候选数量:", len(result["selected_stability_candidate_list"]))
+    print("相关性去冗余后候选数量:", len(result["corr_selected_summary_df"]))
+    print("最终组合来源:", result["optuna_extension_output"]["final_selected_source"])
+    print("最终正向选择组合:", result["best_final_selection_summary"]["candidate_label_list"])
+    print("汇总输出:", result["summary_path"])
+
+
 def print_single_factor_stability_analysis_summary(result):
     # 终端只打印最终稳定性排序结果的高信号摘要，完整输入输出仍以 JSON 落盘保存。
     print("单因子稳定性分析结果:")
@@ -686,4 +1677,150 @@ def run_single_factor_stability_analysis(config_override=None):
         "summary_path": summary_path,
     }
     print_single_factor_stability_analysis_summary(result)
+    return result
+
+
+def run_single_factor_dedup_selection(config_override=None):
+    # 去冗余流程只消费稳定性保留候选，先做 train 相关性去冗余，再跑 train forward selection 并在 valid 上挑最优组合。
+    config = build_tradition_config(config_override=config_override)
+    stability_analysis_path = config.get("stability_analysis_path")
+    if stability_analysis_path is None:
+        raise ValueError("single_factor_dedup_selection 模式必须提供 stability_analysis_path。")
+    dedup_root_topk = int(config.get("dedup_root_topk", 3))
+    if dedup_root_topk <= 0:
+        raise ValueError("dedup_root_topk 必须为正整数。")
+    stability_analysis_input, resolved_stability_analysis_path = load_stability_analysis_input(stability_analysis_path)
+    stability_analysis_output = dict(stability_analysis_input["stability_analysis_output"])
+    selected_stability_candidate_list = [
+        record
+        for record in stability_analysis_output["record_dict"].values()
+        if bool(record.get("selected", False))
+    ]
+    if len(selected_stability_candidate_list) == 0:
+        raise ValueError("稳定性分析结果中不存在 selected=true 的最终候选。")
+    fund_code = resolve_fund_code_from_stability_analysis_input(
+        stability_analysis_input=stability_analysis_input,
+        stability_analysis_path=resolved_stability_analysis_path,
+    )
+
+    raw_data = fetch_fund_data_with_cache(
+        code_dict=config["code_dict"],
+        cache_dir=config["data_dir"],
+        force_refresh=bool(config["force_refresh"]),
+        cache_prefix=config["cache_prefix"],
+    )
+    normalized_data = normalize_fund_data(raw_data)
+    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
+    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
+    fold_list = build_walk_forward_fold_list(
+        price_series=price_series,
+        walk_forward_config=dict(config["walk_forward_config"]),
+        split_config=config["data_split_dict"],
+    )
+    base_multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
+    forward_return_series = build_forward_return_series(price_series=price_series, forward_window=5)
+
+    factor_series_dict = {}
+    for factor_candidate in selected_stability_candidate_list:
+        factor_series_dict[str(factor_candidate["candidate_label"])] = build_single_factor_series(
+            price_series=price_series,
+            factor_name=factor_candidate["factor_name"],
+            strategy_params=base_multi_factor_params,
+            factor_param_override=dict(factor_candidate["factor_param_dict"]),
+        )
+
+    corr_summary_df, dropped_candidate_label_list = build_corr_dedup_result(
+        selected_summary_df=pd.DataFrame(selected_stability_candidate_list),
+        factor_series_dict=factor_series_dict,
+        fold_list=fold_list,
+        corr_threshold=0.90,
+        drop_ratio=0.10,
+        min_drop_count=2,
+    )
+    corr_selected_mask = corr_summary_df["corr_dedup_selected"].astype(bool)
+    corr_selected_summary_df = corr_summary_df[corr_selected_mask].reset_index(drop=True)
+    corr_selected_candidate_list = corr_selected_summary_df.to_dict(orient="records")
+
+    train_forward_selection_path_summary = run_train_forward_selection(
+        candidate_record_list=corr_selected_candidate_list,
+        factor_series_dict=factor_series_dict,
+        forward_return_series=forward_return_series,
+        fold_list=fold_list,
+        root_topk=dedup_root_topk,
+    )
+    candidate_record_lookup = {
+        str(candidate_record["candidate_label"]): dict(candidate_record)
+        for candidate_record in corr_selected_candidate_list
+    }
+    forward_selection_path_summary = select_top_train_path_summary_list(
+        train_path_summary_list=train_forward_selection_path_summary,
+        top_ratio=0.5,
+    )
+    forward_selection_path_summary = evaluate_valid_for_path_summary_list(
+        path_summary_list=forward_selection_path_summary,
+        candidate_record_lookup=candidate_record_lookup,
+        factor_series_dict=factor_series_dict,
+        forward_return_series=forward_return_series,
+        fold_list=fold_list,
+    )
+    best_forward_selection_summary = select_best_forward_path_summary(forward_selection_path_summary)
+    if best_forward_selection_summary is None:
+        raise ValueError("相关性去冗余后无法构建有效的 forward selection 组合。")
+    optuna_extension_output = run_optuna_extension_search(
+        baseline_summary=best_forward_selection_summary,
+        corr_selected_candidate_list=corr_selected_candidate_list,
+        candidate_record_lookup=candidate_record_lookup,
+        factor_series_dict=factor_series_dict,
+        forward_return_series=forward_return_series,
+        fold_list=fold_list,
+    )
+    best_final_selection_summary = dict(optuna_extension_output["best_final_selection_summary"])
+
+    forward_selected_candidate_label_set = set(best_final_selection_summary["candidate_label_list"])
+    corr_summary_df["forward_selected"] = corr_summary_df["candidate_label"].isin(forward_selected_candidate_label_set)
+    corr_summary_df["forward_selection_step"] = pd.Series([None] * len(corr_summary_df), dtype=object)
+    for step_idx, candidate_label in enumerate(best_final_selection_summary["candidate_label_list"], start=1):
+        corr_summary_df.loc[corr_summary_df["candidate_label"] == candidate_label, "forward_selection_step"] = step_idx
+
+    dedup_selection_output = {
+        "fund_code": fund_code,
+        "stability_analysis_path": str(resolved_stability_analysis_path),
+        "analysis_date": datetime.today().strftime("%Y-%m-%d"),
+        "dedup_root_topk": dedup_root_topk,
+        "input_candidate_count": int(len(selected_stability_candidate_list)),
+        "corr_dedup_drop_count": int(len(dropped_candidate_label_list)),
+        "corr_dedup_selected_count": int(corr_selected_mask.sum()),
+        "train_path_count": int(len(train_forward_selection_path_summary)),
+        "valid_eval_count": int(len(forward_selection_path_summary)),
+        "valid_eval_ratio": 0.5,
+        "forward_selected_count": int(len(best_final_selection_summary["candidate_label_list"])),
+        "corr_dedup_dropped_candidate_label_list": dropped_candidate_label_list,
+        "corr_dedup_selected_candidate_label_list": corr_selected_summary_df["candidate_label"].tolist(),
+        "forward_selected_candidate_label_list": list(best_final_selection_summary["candidate_label_list"]),
+        "record_dict": build_candidate_record_dict(summary_df=corr_summary_df),
+        "train_forward_selection_path_summary": train_forward_selection_path_summary,
+        "forward_selection_path_summary": forward_selection_path_summary,
+        "best_forward_selection_summary": best_forward_selection_summary,
+        "optuna_extension_output": optuna_extension_output,
+        "best_final_selection_summary": best_final_selection_summary,
+    }
+    summary_path = save_single_factor_dedup_selection_output(
+        stability_analysis_input=stability_analysis_input,
+        dedup_selection_output=dedup_selection_output,
+        output_dir=config["output_dir"],
+        fund_code=fund_code,
+    )
+    result = {
+        "fund_code": fund_code,
+        "data_mode": data_mode,
+        "stability_analysis_path": str(resolved_stability_analysis_path),
+        "selected_stability_candidate_list": selected_stability_candidate_list,
+        "corr_selected_summary_df": corr_selected_summary_df,
+        "forward_selection_path_summary": forward_selection_path_summary,
+        "best_forward_selection_summary": best_forward_selection_summary,
+        "optuna_extension_output": optuna_extension_output,
+        "best_final_selection_summary": best_final_selection_summary,
+        "summary_path": summary_path,
+    }
+    print_single_factor_dedup_selection_summary(result)
     return result

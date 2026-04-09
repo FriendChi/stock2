@@ -126,6 +126,37 @@ def test_build_cli_override_collects_single_factor_stability_analysis_args():
     assert override["factor_selection_path"] == "/tmp/factor_selection_007301_2026-04-05.json"
 
 
+def test_build_cli_override_collects_single_factor_dedup_selection_args():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--single-factor-dedup-selection",
+            "--stability-analysis-path",
+            "/tmp/single_factor_stability_007301_2026-04-05.json",
+            "--dedup-root-topk",
+            "5",
+        ]
+    )
+    override = runner.build_cli_override(args)
+    assert override["single_factor_dedup_selection"] is True
+    assert override["stability_analysis_path"] == "/tmp/single_factor_stability_007301_2026-04-05.json"
+    assert override["dedup_root_topk"] == 5
+
+
+def test_build_cli_override_collects_factor_combination_args():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--factor-combination",
+            "--dedup-selection-path",
+            "/tmp/single_factor_dedup_007301_2026-04-09.json",
+        ]
+    )
+    override = runner.build_cli_override(args)
+    assert override["factor_combination"] is True
+    assert override["dedup_selection_path"] == "/tmp/single_factor_dedup_007301_2026-04-09.json"
+
+
 def test_merge_strategy_params_overrides_single_strategy():
     merged = runner.merge_strategy_params(
         default_param_dict={"buy_and_hold": {}, "ma_cross": {"fast": 5, "slow": 20}},
@@ -800,3 +831,37 @@ def test_main_dispatches_single_factor_stability_analysis_mode(monkeypatch):
     )
     runner.main(["--single-factor-stability-analysis", "--factor-selection-path", "/tmp/factor_selection_007301_2026-04-05.json"])
     assert "single_factor_stability_analysis" in called
+
+
+def test_main_dispatches_single_factor_dedup_selection_mode(monkeypatch):
+    called = {}
+    monkeypatch.setattr(
+        runner,
+        "run_single_factor_dedup_selection",
+        lambda config_override=None: called.setdefault("single_factor_dedup_selection", config_override),
+    )
+    runner.main(
+        [
+            "--single-factor-dedup-selection",
+            "--stability-analysis-path",
+            "/tmp/single_factor_stability_007301_2026-04-05.json",
+        ]
+    )
+    assert "single_factor_dedup_selection" in called
+
+
+def test_main_dispatches_factor_combination_mode(monkeypatch):
+    called = {}
+    monkeypatch.setattr(
+        runner,
+        "run_factor_combination",
+        lambda config_override=None: called.setdefault("factor_combination", config_override),
+    )
+    runner.main(
+        [
+            "--factor-combination",
+            "--dedup-selection-path",
+            "/tmp/single_factor_dedup_007301_2026-04-09.json",
+        ]
+    )
+    assert "factor_combination" in called

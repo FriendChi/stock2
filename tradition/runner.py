@@ -7,7 +7,12 @@ from tradition.config import build_tradition_config
 from tradition.data_adapter import adapt_to_price_series
 from tradition.data_fetcher import fetch_fund_data_with_cache, fetch_treasury_yield_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
-from tradition.factor_analysis import run_factor_selection_single_fund, run_single_factor_stability_analysis
+from tradition.factor_analysis import (
+    run_factor_combination,
+    run_factor_selection_single_fund,
+    run_single_factor_dedup_selection,
+    run_single_factor_stability_analysis,
+)
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.optimizer import optimize_strategy_params
 from tradition.splitter import build_walk_forward_fold_list, split_time_series_by_ratio
@@ -51,6 +56,10 @@ def build_cli_override(args):
         override["factor_select"] = True
     if args.single_factor_stability_analysis:
         override["single_factor_stability_analysis"] = True
+    if args.single_factor_dedup_selection:
+        override["single_factor_dedup_selection"] = True
+    if args.factor_combination:
+        override["factor_combination"] = True
 
     strategy_param_override = {}
     if args.ma_fast is not None:
@@ -82,6 +91,12 @@ def build_cli_override(args):
         override["train_min_spearman_icir"] = float(args.train_min_spearman_icir)
     if args.factor_selection_path is not None:
         override["factor_selection_path"] = str(args.factor_selection_path)
+    if args.stability_analysis_path is not None:
+        override["stability_analysis_path"] = str(args.stability_analysis_path)
+    if args.dedup_root_topk is not None:
+        override["dedup_root_topk"] = int(args.dedup_root_topk)
+    if args.dedup_selection_path is not None:
+        override["dedup_selection_path"] = str(args.dedup_selection_path)
     return override
 
 
@@ -102,6 +117,8 @@ def build_arg_parser():
     parser.add_argument("--walk-forward", action="store_true", help="对单只基金执行固定窗口 walk-forward 参数优化")
     parser.add_argument("--factor-select", action="store_true", help="对单只基金执行基于 walk-forward 的因子筛选与评估")
     parser.add_argument("--single-factor-stability-analysis", action="store_true", help="读取 factor_select 结果并执行单因子稳定性分析")
+    parser.add_argument("--single-factor-dedup-selection", action="store_true", help="读取稳定性分析结果并执行去冗余与正向选择")
+    parser.add_argument("--factor-combination", action="store_true", help="读取 dedup 结果并执行因子组合方式对比与参数微调")
     parser.add_argument("--force-refresh", action="store_true", help="忽略当天缓存并重新拉取 AkShare 数据")
     parser.add_argument("--init-cash", dest="init_cash", type=float, help="初始资金")
     parser.add_argument("--fees", dest="fees", type=float, help="手续费率")
@@ -115,6 +132,9 @@ def build_arg_parser():
     parser.add_argument("--train-min-spearman-ic", dest="train_min_spearman_ic", type=float, help="训练集 Spearman IC 最小阈值")
     parser.add_argument("--train-min-spearman-icir", dest="train_min_spearman_icir", type=float, help="训练集 Spearman ICIR 最小阈值")
     parser.add_argument("--factor-selection-path", dest="factor_selection_path", help="factor_select 流程输出的 JSON 文件路径")
+    parser.add_argument("--stability-analysis-path", dest="stability_analysis_path", help="single_factor_stability_analysis 流程输出的 JSON 文件路径")
+    parser.add_argument("--dedup-root-topk", dest="dedup_root_topk", type=int, help="single_factor_dedup_selection 树形搜索使用的根节点数量，默认 3")
+    parser.add_argument("--dedup-selection-path", dest="dedup_selection_path", help="single_factor_dedup_selection 流程输出的 JSON 文件路径")
     return parser
 
 
@@ -877,7 +897,7 @@ def print_run_summary(result):
 
 
 def main(argv=None):
-    # 命令行入口统一支持普通回测、优化、walk-forward、独立因子筛选和单因子稳定性分析模式。
+    # 命令行入口统一支持普通回测、优化、walk-forward、因子筛选、稳定性分析、去冗余选择和独立因子组合模式。
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     cli_override = build_cli_override(args)
@@ -904,6 +924,12 @@ def main(argv=None):
             )
         config_override = base_config
     mode_config = config_override or {}
+    if bool(mode_config.get("factor_combination", False)):
+        run_factor_combination(config_override=config_override)
+        return
+    if bool(mode_config.get("single_factor_dedup_selection", False)):
+        run_single_factor_dedup_selection(config_override=config_override)
+        return
     if bool(mode_config.get("single_factor_stability_analysis", False)):
         run_single_factor_stability_analysis(config_override=config_override)
         return
