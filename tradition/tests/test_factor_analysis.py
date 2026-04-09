@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -319,6 +320,45 @@ def test_build_weight_search_range_dict_uses_five_percent_window():
     assert abs(float(weight_search_range_dict["factor_a"]["high"]) - 0.525) < 1e-12
     assert abs(float(weight_search_range_dict["factor_b"]["low"]) - 0.0) < 1e-12
     assert abs(float(weight_search_range_dict["factor_b"]["high"]) - 0.0) < 1e-12
+
+
+def test_build_target_position_series_stays_in_zero_to_one():
+    score_series = pd.Series([-2.0, -0.5, 0.0, 0.5, 2.0], index=pd.date_range("2024-01-01", periods=5, freq="D"))
+    sigmoid_position_series = factor_analysis.build_target_position_series(
+        score_series=score_series,
+        position_function_name="sigmoid",
+        function_param_dict={"center": 0.0, "slope": 2.0},
+        ema_span=3,
+        trade_gate=0.0,
+    )
+    piecewise_position_series = factor_analysis.build_target_position_series(
+        score_series=score_series,
+        position_function_name="piecewise_linear",
+        function_param_dict={"lower": -1.0, "upper": 1.0},
+        ema_span=2,
+        trade_gate=0.1,
+    )
+    assert bool(((sigmoid_position_series >= 0.0) & (sigmoid_position_series <= 1.0)).all()) is True
+    assert bool(((piecewise_position_series >= 0.0) & (piecewise_position_series <= 1.0)).all()) is True
+
+
+def test_select_best_strategy_trial_summary_uses_target_segment_first():
+    best_summary = factor_analysis.select_best_strategy_trial_summary(
+        [
+            {
+                "position_function_name": "sigmoid",
+                "valid_result": {"stats": {"sharpe": 0.8, "annual_return": 0.2, "max_drawdown": -0.1}},
+                "test_result": {"stats": {"sharpe": 0.7, "annual_return": 0.3, "max_drawdown": -0.2}},
+            },
+            {
+                "position_function_name": "piecewise_linear",
+                "valid_result": {"stats": {"sharpe": 0.7, "annual_return": 0.25, "max_drawdown": -0.12}},
+                "test_result": {"stats": {"sharpe": 0.9, "annual_return": 0.25, "max_drawdown": -0.15}},
+            },
+        ],
+        segment_name="test",
+    )
+    assert best_summary["position_function_name"] == "piecewise_linear"
 
 
 def test_resolve_factor_group_name_raises_for_unknown_factor():
@@ -1107,3 +1147,131 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
     assert saved_payload["factor_combination_output"]["weight_tuning_output"]["selected_method"] == "equal_weight"
     assert saved_payload["factor_combination_output"]["best_combination_selection_summary"]["candidate_weight_dict"]["momentum(window=10)"] == 0.5
     assert saved_payload["factor_combination_output"]["best_combination_selection_summary"]["trial_number"] == 7
+
+
+def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
+    factor_combination_path = tmp_path / "factor_combination_007301_2026-04-09.json"
+    factor_combination_payload = {
+        "factor_selection_output": {},
+        "stability_analysis_output": {},
+        "dedup_selection_output": {
+            "record_dict": {
+                "momentum(window=10)": {
+                    "candidate_label": "momentum(window=10)",
+                    "factor_name": "momentum",
+                    "factor_param_dict": {"window": 10},
+                },
+                "trend_tvalue(window=15)": {
+                    "candidate_label": "trend_tvalue(window=15)",
+                    "factor_name": "trend_tvalue",
+                    "factor_param_dict": {"window": 15},
+                },
+            },
+        },
+        "factor_combination_output": {
+            "fund_code": "007301",
+            "best_combination_selection_summary": {
+                "candidate_label_list": ["momentum(window=10)", "trend_tvalue(window=15)"],
+                "selected_method": "equal_weight",
+                "candidate_weight_dict": {
+                    "momentum(window=10)": 0.5,
+                    "trend_tvalue(window=15)": 0.5,
+                },
+            },
+        },
+    }
+    factor_combination_path.write_text(json.dumps(factor_combination_payload, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(
+        factor_analysis,
+        "build_tradition_config",
+        lambda config_override=None: {
+            "code_dict": {"007301": "半导体"},
+            "data_dir": tmp_path,
+            "output_dir": tmp_path,
+            "force_refresh": False,
+            "cache_prefix": "tradition_fund",
+            "factor_combination_path": str(factor_combination_path),
+            "strategy_param_dict": {"multi_factor_score": {}},
+            "data_split_dict": {
+                "train_ratio": 0.5,
+                "valid_ratio": 0.25,
+                "test_ratio": 0.25,
+                "min_segment_size": 2,
+            },
+            "init_cash": 10000.0,
+            "fees": 0.001,
+        },
+    )
+    sample_price_series = pd.Series([1.0, 1.02, 1.03, 1.01, 1.05, 1.07, 1.08, 1.10], index=pd.date_range("2024-01-01", periods=8, freq="D"))
+    monkeypatch.setattr(
+        factor_analysis,
+        "fetch_fund_data_with_cache",
+        lambda **kwargs: pd.DataFrame({"date": sample_price_series.index, "code": ["007301"] * len(sample_price_series), "nav": sample_price_series.values}),
+    )
+    monkeypatch.setattr(factor_analysis, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(factor_analysis, "filter_single_fund", lambda data, fund_code: data)
+    monkeypatch.setattr(
+        factor_analysis,
+        "adapt_to_price_series",
+        lambda fund_df: (pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float), "nav_price_series"),
+    )
+    monkeypatch.setattr(
+        factor_analysis,
+        "build_single_factor_series",
+        lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
+            np.linspace(0.0, 1.0, len(price_series)) if factor_name == "momentum" else np.linspace(1.0, 0.0, len(price_series)),
+            index=price_series.index,
+            dtype=float,
+            name=factor_name,
+        ),
+    )
+    monkeypatch.setattr(
+        factor_analysis,
+        "run_position_function_search",
+        lambda position_function_config, score_series, split_dict, init_cash, fees: {
+            "n_trials": 100,
+            "train_top_trial_summary_list": [{"trial_number": 0}],
+            "best_valid_trial_summary": {
+                "trial_number": 1 if position_function_config["name"] == "sigmoid" else 2,
+                "position_function_name": position_function_config["name"],
+                "position_function_params": {"center": 0.0, "slope": 1.0} if position_function_config["name"] != "piecewise_linear" else {"lower": -0.1, "upper": 0.1},
+                "ema_span": 3,
+                "trade_gate": 0.05,
+                "train_result": {"stats": {"sharpe": 1.0, "annual_return": 0.2, "max_drawdown": -0.1}},
+                "valid_result": {"stats": {"sharpe": 1.1 if position_function_config["name"] == "sigmoid" else 0.9, "annual_return": 0.21, "max_drawdown": -0.09}},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        factor_analysis,
+        "build_backtest_result",
+        lambda price_series, score_series, segment_series, position_function_name, function_param_dict, ema_span, trade_gate, init_cash, fees: {
+            "sample_start": pd.Index(segment_series.index).min(),
+            "sample_end": pd.Index(segment_series.index).max(),
+            "trade_count": 3,
+            "stats": {
+                "cumulative_return": 0.1,
+                "annual_return": 0.2,
+                "annual_volatility": 0.1,
+                "sharpe": 1.2 if position_function_name == "sigmoid" else 0.8,
+                "max_drawdown": -0.05,
+            },
+            "equity_curve": pd.Series([10000.0, 10100.0], index=pd.Index(segment_series.index[:2])),
+            "position_series": pd.Series([0.5, 0.6], index=pd.Index(segment_series.index[:2])),
+        },
+    )
+    monkeypatch.setattr(
+        factor_analysis,
+        "save_equity_curve_plot",
+        lambda equity_curve, output_path, title, benchmark_curve=None: output_path,
+    )
+
+    result = factor_analysis.run_strategy_backtest(config_override={})
+
+    assert result["fund_code"] == "007301"
+    output_path = result["summary_path"]
+    assert output_path.name.startswith("strategy_backtest_007301_")
+    output_payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert "strategy_backtest_output" in output_payload
+    assert output_payload["strategy_backtest_output"]["best_strategy_test_summary"]["position_function_name"] == "sigmoid"
+    assert output_payload["strategy_backtest_output"]["best_function_valid_summary"]["position_function_name"] == "sigmoid"

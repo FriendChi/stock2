@@ -12,6 +12,7 @@ from tradition.factor_analysis import (
     run_factor_selection_single_fund,
     run_single_factor_dedup_selection,
     run_single_factor_stability_analysis,
+    run_strategy_backtest,
 )
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.optimizer import optimize_strategy_params
@@ -60,6 +61,8 @@ def build_cli_override(args):
         override["single_factor_dedup_selection"] = True
     if args.factor_combination:
         override["factor_combination"] = True
+    if args.strategy_backtest:
+        override["strategy_backtest"] = True
 
     strategy_param_override = {}
     if args.ma_fast is not None:
@@ -97,6 +100,8 @@ def build_cli_override(args):
         override["dedup_root_topk"] = int(args.dedup_root_topk)
     if args.dedup_selection_path is not None:
         override["dedup_selection_path"] = str(args.dedup_selection_path)
+    if args.factor_combination_path is not None:
+        override["factor_combination_path"] = str(args.factor_combination_path)
     return override
 
 
@@ -119,6 +124,7 @@ def build_arg_parser():
     parser.add_argument("--single-factor-stability-analysis", action="store_true", help="读取 factor_select 结果并执行单因子稳定性分析")
     parser.add_argument("--single-factor-dedup-selection", action="store_true", help="读取稳定性分析结果并执行去冗余与正向选择")
     parser.add_argument("--factor-combination", action="store_true", help="读取 dedup 结果并执行因子组合方式对比与参数微调")
+    parser.add_argument("--strategy-backtest", action="store_true", help="读取 factor_combination 结果并执行连续仓位策略回测")
     parser.add_argument("--force-refresh", action="store_true", help="忽略当天缓存并重新拉取 AkShare 数据")
     parser.add_argument("--init-cash", dest="init_cash", type=float, help="初始资金")
     parser.add_argument("--fees", dest="fees", type=float, help="手续费率")
@@ -135,6 +141,7 @@ def build_arg_parser():
     parser.add_argument("--stability-analysis-path", dest="stability_analysis_path", help="single_factor_stability_analysis 流程输出的 JSON 文件路径")
     parser.add_argument("--dedup-root-topk", dest="dedup_root_topk", type=int, help="single_factor_dedup_selection 树形搜索使用的根节点数量，默认 3")
     parser.add_argument("--dedup-selection-path", dest="dedup_selection_path", help="single_factor_dedup_selection 流程输出的 JSON 文件路径")
+    parser.add_argument("--factor-combination-path", dest="factor_combination_path", help="factor_combination 流程输出的 JSON 文件路径")
     return parser
 
 
@@ -897,7 +904,7 @@ def print_run_summary(result):
 
 
 def main(argv=None):
-    # 命令行入口统一支持普通回测、优化、walk-forward、因子筛选、稳定性分析、去冗余选择和独立因子组合模式。
+    # 命令行入口统一支持普通回测、优化、walk-forward、因子筛选、稳定性分析、去冗余选择、因子组合和独立策略回测模式。
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     cli_override = build_cli_override(args)
@@ -924,6 +931,9 @@ def main(argv=None):
             )
         config_override = base_config
     mode_config = config_override or {}
+    if bool(mode_config.get("strategy_backtest", False)):
+        run_strategy_backtest(config_override=config_override)
+        return
     if bool(mode_config.get("factor_combination", False)):
         run_factor_combination(config_override=config_override)
         return

@@ -157,6 +157,20 @@ def test_build_cli_override_collects_factor_combination_args():
     assert override["dedup_selection_path"] == "/tmp/single_factor_dedup_007301_2026-04-09.json"
 
 
+def test_build_cli_override_collects_strategy_backtest_args():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--strategy-backtest",
+            "--factor-combination-path",
+            "/tmp/factor_combination_007301_2026-04-09.json",
+        ]
+    )
+    override = runner.build_cli_override(args)
+    assert override["strategy_backtest"] is True
+    assert override["factor_combination_path"] == "/tmp/factor_combination_007301_2026-04-09.json"
+
+
 def test_merge_strategy_params_overrides_single_strategy():
     merged = runner.merge_strategy_params(
         default_param_dict={"buy_and_hold": {}, "ma_cross": {"fast": 5, "slow": 20}},
@@ -865,3 +879,20 @@ def test_main_dispatches_factor_combination_mode(monkeypatch):
         ]
     )
     assert "factor_combination" in called
+
+
+def test_main_dispatches_strategy_backtest_mode(monkeypatch):
+    called = {}
+    monkeypatch.setattr(
+        runner,
+        "run_strategy_backtest",
+        lambda config_override=None: called.setdefault("strategy_backtest", config_override),
+    )
+    runner.main(
+        [
+            "--strategy-backtest",
+            "--factor-combination-path",
+            "/tmp/factor_combination_007301_2026-04-09.json",
+        ]
+    )
+    assert "strategy_backtest" in called
