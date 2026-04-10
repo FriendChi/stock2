@@ -289,11 +289,17 @@ def build_factor_selection_record(factor_candidate, train_metric_list, valid_met
     }
 
 
-def build_candidate_record_dict(summary_df):
-    # JSON 输出统一改成以 candidate_label 为键的子字典，避免后续流程再依赖列表位置索引。
+def build_candidate_record_dict(summary_df, keep_field_list=None):
+    # JSON 输出统一改成以 candidate_label 为键的子字典，并允许在落盘前裁剪为后续流程真正需要的最小字段集合。
     normalized_df = summary_df.where(pd.notna(summary_df), None)
     record_dict = {}
     for record in normalized_df.to_dict(orient="records"):
+        if keep_field_list is not None:
+            record = {
+                field_name: record[field_name]
+                for field_name in keep_field_list
+                if field_name in record
+            }
         candidate_label = str(record["candidate_label"])
         record_dict[candidate_label] = record
     return record_dict
@@ -436,7 +442,16 @@ def run_factor_selection_single_fund(config_override=None):
         "threshold_config": threshold_config,
         "candidate_count": int(len(summary_df)),
         "selected_count": int(selected_mask.sum()),
-        "record_dict": build_candidate_record_dict(summary_df=summary_df),
+        "record_dict": build_candidate_record_dict(
+            summary_df=selected_summary_df,
+            keep_field_list=[
+                "candidate_label",
+                "factor_group",
+                "factor_name",
+                "factor_param_dict",
+                "selected",
+            ],
+        ),
     }
     summary_path = save_factor_selection_table(
         factor_selection_output=factor_selection_output,
@@ -536,12 +551,18 @@ def build_single_factor_stability_record(factor_candidate, train_metric_list, va
 
 
 def save_single_factor_stability_analysis_output(factor_selection_input, stability_analysis_output, output_dir, fund_code):
-    # 稳定性分析输出直接追加到已有顶层字典，形成按流程逐步扩展的统一结果树。
+    # 稳定性分析输出改为独立落盘，只保留上游输入路径引用，避免把完整结果树继续复制到下游文件。
     output_dir.mkdir(parents=True, exist_ok=True)
     date_str = datetime.today().strftime("%Y-%m-%d")
     output_path = output_dir / f"single_factor_stability_{str(fund_code).zfill(6)}_{date_str}.json"
-    payload = dict(factor_selection_input)
-    payload["stability_analysis_output"] = stability_analysis_output
+    factor_selection_output = dict(factor_selection_input.get("factor_selection_output", {}))
+    payload = {
+        "input_ref": {
+            "factor_selection_path": str(output_dir / f"factor_selection_{str(fund_code).zfill(6)}_{date_str}.json"),
+            "fund_code": str(factor_selection_output.get("fund_code", str(fund_code).zfill(6))),
+        },
+        "stability_analysis_output": stability_analysis_output,
+    }
     with output_path.open("w", encoding="utf-8") as output_file:
         json.dump(payload, output_file, ensure_ascii=False, indent=2)
     return output_path
@@ -1010,18 +1031,22 @@ def run_factor_combination_weight_tuning(
         "top_k_valid_eval_count": int(len(valid_trial_summary_list)),
         "base_weight_dict": base_weight_dict,
         "weight_search_range_dict": weight_search_range_dict,
-        "train_top_trial_summary_list": top_train_trial_summary_list,
         "best_tuned_trial_summary": best_tuned_trial_summary,
     }
 
 
 def save_factor_combination_output(dedup_selection_input, factor_combination_output, output_dir, fund_code):
-    # 因子组合流程输出单独落盘，和 dedup 流程同级，避免回写覆盖前一阶段结果。
+    # 因子组合流程输出单独落盘，只保留 dedup 输入路径引用，避免继续复制上游完整结果树。
     output_dir.mkdir(parents=True, exist_ok=True)
     date_str = datetime.today().strftime("%Y-%m-%d")
     output_path = output_dir / f"factor_combination_{str(fund_code).zfill(6)}_{date_str}.json"
-    payload = dict(dedup_selection_input)
-    payload["factor_combination_output"] = factor_combination_output
+    payload = {
+        "input_ref": {
+            "dedup_selection_path": str(factor_combination_output.get("dedup_selection_path", "")),
+            "fund_code": str(factor_combination_output.get("fund_code", str(fund_code).zfill(6))),
+        },
+        "factor_combination_output": factor_combination_output,
+    }
     with output_path.open("w", encoding="utf-8") as output_file:
         json.dump(payload, output_file, ensure_ascii=False, indent=2)
     return output_path
@@ -1053,6 +1078,8 @@ def load_factor_combination_input(factor_combination_path):
         raise ValueError("因子组合结果文件缺少 factor_combination_output 子字典。")
     if not isinstance(factor_combination_output.get("best_combination_selection_summary"), dict):
         raise ValueError("因子组合结果文件缺少 factor_combination_output.best_combination_selection_summary。")
+    if not isinstance(factor_combination_output.get("factor_candidate_record_dict"), dict):
+        raise ValueError("因子组合结果文件缺少 factor_combination_output.factor_candidate_record_dict。")
     return factor_combination_input, factor_combination_path
 
 
@@ -1391,12 +1418,17 @@ def run_position_function_search(position_function_config, score_series, split_d
 
 
 def save_strategy_backtest_output(factor_combination_input, strategy_backtest_output, output_dir, fund_code):
-    # 策略回测输出独立落盘，与 factor_combination 同级保存，便于后续回测结果单独复盘。
+    # 策略回测输出独立落盘，只保留 factor_combination 输入路径引用，避免继续携带上游树结构。
     output_dir.mkdir(parents=True, exist_ok=True)
     date_str = datetime.today().strftime("%Y-%m-%d")
     output_path = output_dir / f"strategy_backtest_{str(fund_code).zfill(6)}_{date_str}.json"
-    payload = dict(factor_combination_input)
-    payload["strategy_backtest_output"] = strategy_backtest_output
+    payload = {
+        "input_ref": {
+            "factor_combination_path": str(strategy_backtest_output.get("factor_combination_path", "")),
+            "fund_code": str(strategy_backtest_output.get("fund_code", str(fund_code).zfill(6))),
+        },
+        "strategy_backtest_output": strategy_backtest_output,
+    }
     with output_path.open("w", encoding="utf-8") as output_file:
         json.dump(payload, output_file, ensure_ascii=False, indent=2)
     return output_path
@@ -1423,6 +1455,10 @@ def run_strategy_backtest(config_override=None):
     factor_combination_input, resolved_factor_combination_path = load_factor_combination_input(factor_combination_path)
     factor_combination_output = dict(factor_combination_input["factor_combination_output"])
     best_combination_selection_summary = dict(factor_combination_output["best_combination_selection_summary"])
+    factor_candidate_record_dict = {
+        str(candidate_label): dict(record)
+        for candidate_label, record in dict(factor_combination_output["factor_candidate_record_dict"]).items()
+    }
     input_candidate_label_list = [str(candidate_label) for candidate_label in best_combination_selection_summary["candidate_label_list"]]
     if len(input_candidate_label_list) == 0:
         raise ValueError("factor_combination 结果中的 best_combination_selection_summary 为空组合。")
@@ -1445,12 +1481,7 @@ def run_strategy_backtest(config_override=None):
         split_config=config["data_split_dict"],
     )
     base_multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
-    dedup_selection_output = dict(factor_combination_input["dedup_selection_output"])
-    candidate_record_lookup = {
-        str(candidate_label): dict(record)
-        for candidate_label, record in dict(dedup_selection_output["record_dict"]).items()
-    }
-    factor_candidate_list = [dict(candidate_record_lookup[candidate_label]) for candidate_label in input_candidate_label_list]
+    factor_candidate_list = [dict(factor_candidate_record_dict[candidate_label]) for candidate_label in input_candidate_label_list]
     factor_series_dict = {}
     for factor_candidate in factor_candidate_list:
         candidate_label = str(factor_candidate["candidate_label"])
@@ -1498,7 +1529,6 @@ def run_strategy_backtest(config_override=None):
         function_trial_summary_list.append(function_summary)
         position_function_search_output[function_name] = {
             "n_trials": int(function_search_output["n_trials"]),
-            "train_top_trial_summary_list": function_search_output["train_top_trial_summary_list"],
             "best_valid_trial_summary": best_valid_trial_summary,
             "test_summary": build_serializable_backtest_result(test_result),
         }
@@ -1537,8 +1567,6 @@ def run_strategy_backtest(config_override=None):
             "selected_method": str(best_combination_selection_summary["selected_method"]),
             "score_name": str(score_series.name),
         },
-        "position_function_search_output": position_function_search_output,
-        "best_function_valid_summary": best_function_valid_summary,
         "best_strategy_test_summary": best_strategy_test_summary,
         "plot_path": str(plot_path),
     }
@@ -1872,12 +1900,18 @@ def run_optuna_extension_search(
 
 
 def save_single_factor_dedup_selection_output(stability_analysis_input, dedup_selection_output, output_dir, fund_code):
-    # 去冗余与正向选择结果继续追加到统一结果树中，避免和前两步拆成互相独立的 JSON。
+    # 去冗余结果独立落盘，只保留稳定性分析输入路径引用，避免继续复制上游完整结果树。
     output_dir.mkdir(parents=True, exist_ok=True)
     date_str = datetime.today().strftime("%Y-%m-%d")
     output_path = output_dir / f"single_factor_dedup_{str(fund_code).zfill(6)}_{date_str}.json"
-    payload = dict(stability_analysis_input)
-    payload["dedup_selection_output"] = dedup_selection_output
+    stability_analysis_output = dict(stability_analysis_input.get("stability_analysis_output", {}))
+    payload = {
+        "input_ref": {
+            "stability_analysis_path": str(dedup_selection_output.get("stability_analysis_path", "")),
+            "fund_code": str(stability_analysis_output.get("fund_code", str(fund_code).zfill(6))),
+        },
+        "dedup_selection_output": dedup_selection_output,
+    }
     with output_path.open("w", encoding="utf-8") as output_file:
         json.dump(payload, output_file, ensure_ascii=False, indent=2)
     return output_path
@@ -2012,11 +2046,21 @@ def run_factor_combination(config_override=None):
         "valid_spearman_icir": float(best_tuned_trial_summary["valid_spearman_icir"]),
         "trial_number": int(best_tuned_trial_summary["trial_number"]),
     }
+    factor_candidate_record_dict = {
+        str(factor_candidate["candidate_label"]): {
+            "candidate_label": str(factor_candidate["candidate_label"]),
+            "factor_name": str(factor_candidate["factor_name"]),
+            "factor_group": str(factor_candidate["factor_group"]),
+            "factor_param_dict": dict(factor_candidate["factor_param_dict"]),
+        }
+        for factor_candidate in factor_candidate_list
+    }
     factor_combination_output = {
         "fund_code": fund_code,
         "dedup_selection_path": str(resolved_dedup_selection_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
         "input_candidate_label_list": input_candidate_label_list,
+        "factor_candidate_record_dict": factor_candidate_record_dict,
         "combination_compare_output": combination_compare_output,
         "weight_tuning_output": weight_tuning_output,
         "best_combination_selection_summary": best_combination_selection_summary,
@@ -2042,13 +2086,13 @@ def run_factor_combination(config_override=None):
 
 
 def print_single_factor_dedup_selection_summary(result):
-    # 终端摘要只展示去冗余后保留数量和最终正向选择结果，详细路径仍以 JSON 保存。
+    # 终端摘要只展示去冗余后保留数量和最终正向选择结果，避免把大体量路径信息打印到控制台。
     print("单因子去冗余与正向选择结果:")
     print("基金代码:", result["fund_code"])
     print("输入稳定性文件:", result["stability_analysis_path"])
     print("输入稳定性保留候选数量:", len(result["selected_stability_candidate_list"]))
     print("相关性去冗余后候选数量:", len(result["corr_selected_summary_df"]))
-    print("最终组合来源:", result["optuna_extension_output"]["final_selected_source"])
+    print("最终组合来源:", result["final_selected_source"])
     print("最终正向选择组合:", result["best_final_selection_summary"]["candidate_label_list"])
     print("汇总输出:", result["summary_path"])
 
@@ -2181,7 +2225,19 @@ def run_single_factor_stability_analysis(config_override=None):
         "selected_count": int(selected_mask.sum()),
         "tail_reject_candidate_label_list": summary_df.loc[~selected_mask, "candidate_label"].tolist(),
         "selected_candidate_label_list": selected_summary_df["candidate_label"].tolist(),
-        "record_dict": build_candidate_record_dict(summary_df=summary_df),
+        "record_dict": build_candidate_record_dict(
+            summary_df=selected_summary_df,
+            keep_field_list=[
+                "candidate_label",
+                "factor_group",
+                "factor_name",
+                "factor_param_dict",
+                "selected",
+                "train_spearman_icir",
+                "valid_spearman_ic_mean",
+                "valid_spearman_icir",
+            ],
+        ),
     }
     summary_path = save_single_factor_stability_analysis_output(
         factor_selection_input=factor_selection_input,
@@ -2320,11 +2376,14 @@ def run_single_factor_dedup_selection(config_override=None):
         "corr_dedup_dropped_candidate_label_list": dropped_candidate_label_list,
         "corr_dedup_selected_candidate_label_list": corr_selected_summary_df["candidate_label"].tolist(),
         "forward_selected_candidate_label_list": list(best_final_selection_summary["candidate_label_list"]),
-        "record_dict": build_candidate_record_dict(summary_df=corr_summary_df),
-        "train_forward_selection_path_summary": train_forward_selection_path_summary,
-        "forward_selection_path_summary": forward_selection_path_summary,
+        "record_dict": {
+            candidate_label: build_candidate_record_dict(
+                summary_df=corr_summary_df[corr_summary_df["candidate_label"] == candidate_label]
+            )[candidate_label]
+            for candidate_label in best_final_selection_summary["candidate_label_list"]
+        },
         "best_forward_selection_summary": best_forward_selection_summary,
-        "optuna_extension_output": optuna_extension_output,
+        "final_selected_source": str(optuna_extension_output["final_selected_source"]),
         "best_final_selection_summary": best_final_selection_summary,
     }
     summary_path = save_single_factor_dedup_selection_output(
@@ -2339,9 +2398,8 @@ def run_single_factor_dedup_selection(config_override=None):
         "stability_analysis_path": str(resolved_stability_analysis_path),
         "selected_stability_candidate_list": selected_stability_candidate_list,
         "corr_selected_summary_df": corr_selected_summary_df,
-        "forward_selection_path_summary": forward_selection_path_summary,
         "best_forward_selection_summary": best_forward_selection_summary,
-        "optuna_extension_output": optuna_extension_output,
+        "final_selected_source": str(optuna_extension_output["final_selected_source"]),
         "best_final_selection_summary": best_final_selection_summary,
         "summary_path": summary_path,
     }

@@ -647,7 +647,7 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
     assert result["summary_path"].exists()
     assert result["summary_path"].suffix == ".json"
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
-    assert saved_payload["factor_selection_output"]["fund_code"] == "007301"
+    assert saved_payload["input_ref"]["fund_code"] == "007301"
     assert "stability_analysis_output" in saved_payload
     assert saved_payload["stability_analysis_output"]["fund_code"] == "007301"
     assert saved_payload["stability_analysis_output"]["candidate_count"] == 1
@@ -805,10 +805,6 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     stability_analysis_path.write_text(
         json.dumps(
             {
-                "factor_selection_output": {
-                    "fund_code": "007301",
-                    "record_dict": {},
-                },
                 "stability_analysis_output": {
                     "fund_code": "007301",
                     "record_dict": {
@@ -953,15 +949,15 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     assert result["best_forward_selection_summary"]["candidate_label_list"] == ["ma_slope(lookback=5, window=20)"]
     assert result["summary_path"].exists()
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
-    assert "factor_selection_output" in saved_payload
-    assert "stability_analysis_output" in saved_payload
+    assert saved_payload["input_ref"]["fund_code"] == "007301"
     assert "dedup_selection_output" in saved_payload
-    assert "optuna_extension_output" in saved_payload["dedup_selection_output"]
     assert saved_payload["dedup_selection_output"]["train_path_count"] == 3
     assert saved_payload["dedup_selection_output"]["valid_eval_count"] == 1
     assert saved_payload["dedup_selection_output"]["valid_eval_ratio"] == 0.5
-    assert len(saved_payload["dedup_selection_output"]["train_forward_selection_path_summary"]) == 3
-    assert len(saved_payload["dedup_selection_output"]["forward_selection_path_summary"]) == 1
+    assert "train_forward_selection_path_summary" not in saved_payload["dedup_selection_output"]
+    assert "forward_selection_path_summary" not in saved_payload["dedup_selection_output"]
+    assert "optuna_extension_output" not in saved_payload["dedup_selection_output"]
+    assert saved_payload["dedup_selection_output"]["final_selected_source"] == "forward_selection"
     assert saved_payload["dedup_selection_output"]["forward_selected_candidate_label_list"] == ["ma_slope(lookback=5, window=20)"]
     assert saved_payload["dedup_selection_output"]["best_final_selection_summary"]["candidate_label_list"] == ["ma_slope(lookback=5, window=20)"]
 
@@ -980,8 +976,6 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
     dedup_selection_path.write_text(
         json.dumps(
             {
-                "factor_selection_output": {"fund_code": "007301", "record_dict": {}},
-                "stability_analysis_output": {"fund_code": "007301", "record_dict": {}},
                 "dedup_selection_output": {
                     "fund_code": "007301",
                     "record_dict": {
@@ -1116,7 +1110,6 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
             "top_k_valid_eval_count": 50,
             "base_weight_dict": {"momentum(window=10)": 0.5, "ma_slope(lookback=5, window=20)": 0.5},
             "weight_search_range_dict": {},
-            "train_top_trial_summary_list": [],
             "best_tuned_trial_summary": {
                 "candidate_label_list": [item["candidate_label"] for item in factor_candidate_list],
                 "candidate_weight_dict": {
@@ -1139,12 +1132,11 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
     assert result["best_combination_selection_summary"]["selected_method"] == "equal_weight"
     assert result["summary_path"].exists()
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
-    assert "factor_selection_output" in saved_payload
-    assert "stability_analysis_output" in saved_payload
-    assert "dedup_selection_output" in saved_payload
+    assert saved_payload["input_ref"]["fund_code"] == "007301"
     assert "factor_combination_output" in saved_payload
     assert saved_payload["factor_combination_output"]["combination_compare_output"]["selected_method"] == "equal_weight"
     assert saved_payload["factor_combination_output"]["weight_tuning_output"]["selected_method"] == "equal_weight"
+    assert "train_top_trial_summary_list" not in saved_payload["factor_combination_output"]["weight_tuning_output"]
     assert saved_payload["factor_combination_output"]["best_combination_selection_summary"]["candidate_weight_dict"]["momentum(window=10)"] == 0.5
     assert saved_payload["factor_combination_output"]["best_combination_selection_summary"]["trial_number"] == 7
 
@@ -1152,24 +1144,22 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
 def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     factor_combination_path = tmp_path / "factor_combination_007301_2026-04-09.json"
     factor_combination_payload = {
-        "factor_selection_output": {},
-        "stability_analysis_output": {},
-        "dedup_selection_output": {
-            "record_dict": {
+        "factor_combination_output": {
+            "fund_code": "007301",
+            "factor_candidate_record_dict": {
                 "momentum(window=10)": {
                     "candidate_label": "momentum(window=10)",
                     "factor_name": "momentum",
                     "factor_param_dict": {"window": 10},
+                    "factor_group": "趋势/动量",
                 },
                 "trend_tvalue(window=15)": {
                     "candidate_label": "trend_tvalue(window=15)",
                     "factor_name": "trend_tvalue",
                     "factor_param_dict": {"window": 15},
+                    "factor_group": "趋势强度",
                 },
             },
-        },
-        "factor_combination_output": {
-            "fund_code": "007301",
             "best_combination_selection_summary": {
                 "candidate_label_list": ["momentum(window=10)", "trend_tvalue(window=15)"],
                 "selected_method": "equal_weight",
@@ -1230,7 +1220,6 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
         "run_position_function_search",
         lambda position_function_config, score_series, split_dict, init_cash, fees: {
             "n_trials": 100,
-            "train_top_trial_summary_list": [{"trial_number": 0}],
             "best_valid_trial_summary": {
                 "trial_number": 1 if position_function_config["name"] == "sigmoid" else 2,
                 "position_function_name": position_function_config["name"],
@@ -1272,6 +1261,8 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     output_path = result["summary_path"]
     assert output_path.name.startswith("strategy_backtest_007301_")
     output_payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert output_payload["input_ref"]["fund_code"] == "007301"
     assert "strategy_backtest_output" in output_payload
     assert output_payload["strategy_backtest_output"]["best_strategy_test_summary"]["position_function_name"] == "sigmoid"
-    assert output_payload["strategy_backtest_output"]["best_function_valid_summary"]["position_function_name"] == "sigmoid"
+    assert "best_function_valid_summary" not in output_payload["strategy_backtest_output"]
+    assert "position_function_search_output" not in output_payload["strategy_backtest_output"]
