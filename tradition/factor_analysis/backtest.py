@@ -411,6 +411,10 @@ def run_strategy_backtest(config_override=None):
             "best_valid_trial_summary": best_valid_trial_summary,
             "test_summary": build_serializable_backtest_result(test_result),
         }
+    best_strategy_valid_summary = select_best_strategy_trial_summary(
+        summary_list=function_trial_summary_list,
+        segment_name="valid",
+    )
     best_strategy_test_summary = select_best_strategy_trial_summary(
         summary_list=function_trial_summary_list,
         segment_name="test",
@@ -442,6 +446,7 @@ def run_strategy_backtest(config_override=None):
             "selected_method": str(best_combination_selection_summary["selected_method"]),
             "score_name": str(score_series.name),
         },
+        "best_strategy_valid_summary": best_strategy_valid_summary,
         "best_strategy_test_summary": best_strategy_test_summary,
         "plot_path": str(plot_path),
     }
@@ -455,6 +460,7 @@ def run_strategy_backtest(config_override=None):
         "fund_code": fund_code,
         "data_mode": data_mode,
         "factor_combination_path": str(resolved_factor_combination_path),
+        "best_strategy_valid_summary": best_strategy_valid_summary,
         "best_strategy_test_summary": best_strategy_test_summary,
         "plot_path": plot_path,
         "summary_path": summary_path,

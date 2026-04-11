@@ -1263,6 +1263,7 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     output_payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert output_payload["input_ref"]["fund_code"] == "007301"
     assert "strategy_backtest_output" in output_payload
+    assert output_payload["strategy_backtest_output"]["best_strategy_valid_summary"]["position_function_name"] == "sigmoid"
     assert output_payload["strategy_backtest_output"]["best_strategy_test_summary"]["position_function_name"] == "sigmoid"
     assert "best_function_valid_summary" not in output_payload["strategy_backtest_output"]
     assert "position_function_search_output" not in output_payload["strategy_backtest_output"]

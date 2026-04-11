@@ -204,6 +204,7 @@ def print_strategy_backtest_summary(result):
     print("策略回测结果:")
     print("基金代码:", result["fund_code"])
     print("输入因子组合文件:", result["factor_combination_path"])
+    print("valid 最优仓位函数:", result["best_strategy_valid_summary"]["position_function_name"])
     print("最终仓位函数:", result["best_strategy_test_summary"]["position_function_name"])
     print("最终组合因子:", result["best_strategy_test_summary"]["candidate_label_list"])
     print("最终 test Sharpe:", result["best_strategy_test_summary"]["test_result"]["stats"]["sharpe"])
