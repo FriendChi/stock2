@@ -85,7 +85,7 @@ def test_build_corr_dedup_result_drops_global_worst_ten_percent_with_min_two_and
         ]
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.dedup,
         "compute_pair_train_corr",
         lambda left_factor_series, right_factor_series, fold_list: 0.95
         if {str(left_factor_series.name), str(right_factor_series.name)} in [{"factor_19", "factor_18"}, {"factor_17", "factor_16"}]
@@ -153,7 +153,7 @@ def test_run_train_forward_selection_builds_tree_path_from_topk_singleton_roots(
         selected_metric_dict["factor_count"] = len(label_tuple)
         return selected_metric_dict
 
-    monkeypatch.setattr(factor_analysis, "evaluate_factor_candidate_subset", fake_evaluate_factor_candidate_subset)
+    monkeypatch.setattr(factor_analysis.dedup, "evaluate_factor_candidate_subset", fake_evaluate_factor_candidate_subset)
     path_summary_list = factor_analysis.run_train_forward_selection(
         candidate_record_list=candidate_record_list,
         factor_series_dict={record["candidate_label"]: pd.Series([1.0, 2.0], dtype=float) for record in candidate_record_list},
@@ -271,7 +271,7 @@ def test_run_optuna_extension_search_uses_remaining_factor_square_trials_and_can
             "samplers": type("Samplers", (), {"TPESampler": FakeSampler}),
         },
     )
-    monkeypatch.setattr(factor_analysis, "load_optuna_module", lambda: fake_optuna_module)
+    monkeypatch.setattr(factor_analysis.dedup, "load_optuna_module", lambda: fake_optuna_module)
 
     def fake_evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, include_valid=True):
         label_tuple = tuple(sorted(item["candidate_label"] for item in factor_candidate_list))
@@ -289,7 +289,7 @@ def test_run_optuna_extension_search_uses_remaining_factor_square_trials_and_can
             selected_metric_dict.pop("valid_spearman_icir")
         return selected_metric_dict
 
-    monkeypatch.setattr(factor_analysis, "evaluate_factor_candidate_subset", fake_evaluate_factor_candidate_subset)
+    monkeypatch.setattr(factor_analysis.dedup, "evaluate_factor_candidate_subset", fake_evaluate_factor_candidate_subset)
 
     result = factor_analysis.run_optuna_extension_search(
         baseline_summary=baseline_summary,
@@ -377,7 +377,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
         }
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.selection,
         "build_tradition_config",
         lambda config_override=None: {
             "code_dict": {"007301": "半导体"},
@@ -416,11 +416,11 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
             "train_min_spearman_icir": 0.0,
         },
     )
-    monkeypatch.setattr(factor_analysis, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis, "filter_single_fund", lambda data, fund_code: data)
+    monkeypatch.setattr(factor_analysis.selection, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
+    monkeypatch.setattr(factor_analysis.selection, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(factor_analysis.selection, "filter_single_fund", lambda data, fund_code: data)
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.selection,
         "adapt_to_price_series",
         lambda fund_df: (
             pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
@@ -428,7 +428,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
         ),
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.selection,
         "build_walk_forward_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
@@ -446,7 +446,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
         ],
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.selection,
         "build_single_factor_series",
         lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
             range(len(price_series))
@@ -477,7 +477,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
             return {"sample_size": len(segment_index), "spearman_ic": 0.3, "pearson_ic": 0.2}
         return {"sample_size": len(segment_index), "spearman_ic": -0.1, "pearson_ic": -0.1}
 
-    monkeypatch.setattr(factor_analysis, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
+    monkeypatch.setattr(factor_analysis.selection, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
 
     result = factor_analysis.run_factor_selection_single_fund()
 
@@ -543,7 +543,7 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.stability,
         "build_tradition_config",
         lambda config_override=None: {
             "code_dict": {"007301": "半导体"},
@@ -577,11 +577,11 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
             "factor_selection_path": str(factor_selection_path),
         },
     )
-    monkeypatch.setattr(factor_analysis, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis, "filter_single_fund", lambda data, fund_code: data)
+    monkeypatch.setattr(factor_analysis.stability, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
+    monkeypatch.setattr(factor_analysis.stability, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(factor_analysis.stability, "filter_single_fund", lambda data, fund_code: data)
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.stability,
         "adapt_to_price_series",
         lambda fund_df: (
             pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
@@ -589,7 +589,7 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
         ),
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.stability,
         "build_walk_forward_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
@@ -607,7 +607,7 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
         ],
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.stability,
         "build_single_factor_series",
         lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
             range(len(price_series)),
@@ -629,7 +629,7 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
             return {"sample_size": len(segment_index), "spearman_ic": 0.3, "pearson_ic": 0.15}
         return {"sample_size": len(segment_index), "spearman_ic": 0.2, "pearson_ic": 0.1}
 
-    monkeypatch.setattr(factor_analysis, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
+    monkeypatch.setattr(factor_analysis.stability, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
 
     result = factor_analysis.run_single_factor_stability_analysis()
 
@@ -694,7 +694,7 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.stability,
         "build_tradition_config",
         lambda config_override=None: {
             "code_dict": {"007301": "半导体"},
@@ -724,11 +724,11 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
             "factor_selection_path": str(factor_selection_path),
         },
     )
-    monkeypatch.setattr(factor_analysis, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis, "filter_single_fund", lambda data, fund_code: data)
+    monkeypatch.setattr(factor_analysis.stability, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
+    monkeypatch.setattr(factor_analysis.stability, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(factor_analysis.stability, "filter_single_fund", lambda data, fund_code: data)
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.stability,
         "adapt_to_price_series",
         lambda fund_df: (
             pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
@@ -736,7 +736,7 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
         ),
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.stability,
         "build_walk_forward_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
@@ -754,7 +754,7 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
         ],
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.stability,
         "build_single_factor_series",
         lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
             range(len(price_series)),
@@ -781,7 +781,7 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
             return {"sample_size": len(segment_index), "spearman_ic": 0.20, "pearson_ic": 0.05}
         return {"sample_size": len(segment_index), "spearman_ic": 0.12, "pearson_ic": 0.05}
 
-    monkeypatch.setattr(factor_analysis, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
+    monkeypatch.setattr(factor_analysis.stability, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
 
     result = factor_analysis.run_single_factor_stability_analysis()
 
@@ -836,7 +836,7 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.dedup,
         "build_tradition_config",
         lambda config_override=None: {
             "code_dict": {"007301": "半导体"},
@@ -869,11 +869,11 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
             "stability_analysis_path": str(stability_analysis_path),
         },
     )
-    monkeypatch.setattr(factor_analysis, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis, "filter_single_fund", lambda data, fund_code: data)
+    monkeypatch.setattr(factor_analysis.dedup, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
+    monkeypatch.setattr(factor_analysis.dedup, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(factor_analysis.dedup, "filter_single_fund", lambda data, fund_code: data)
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.dedup,
         "adapt_to_price_series",
         lambda fund_df: (
             pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
@@ -881,7 +881,7 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
         ),
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.dedup,
         "build_walk_forward_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
@@ -899,7 +899,7 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
         ],
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.dedup,
         "build_single_factor_series",
         lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
             range(len(price_series)),
@@ -916,7 +916,7 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
         "build_forward_return_series",
         lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
     )
-    monkeypatch.setattr(factor_analysis, "compute_pair_train_corr", lambda left_factor_series, right_factor_series, fold_list: 0.2)
+    monkeypatch.setattr(factor_analysis.dedup, "compute_pair_train_corr", lambda left_factor_series, right_factor_series, fold_list: 0.2)
 
     def fake_compute_segment_correlation_metrics(factor_series, forward_return_series, segment_index):
         segment_start = pd.Index(segment_index).min()
@@ -941,7 +941,7 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
             "pearson_ic": signed_value,
         }
 
-    monkeypatch.setattr(factor_analysis, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
+    monkeypatch.setattr(factor_analysis.dedup, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
 
     result = factor_analysis.run_single_factor_dedup_selection()
 
@@ -1004,7 +1004,7 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.combination,
         "build_tradition_config",
         lambda config_override=None: {
             "code_dict": {"007301": "半导体"},
@@ -1037,11 +1037,11 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
             "dedup_selection_path": str(dedup_selection_path),
         },
     )
-    monkeypatch.setattr(factor_analysis, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis, "filter_single_fund", lambda data, fund_code: data)
+    monkeypatch.setattr(factor_analysis.combination, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
+    monkeypatch.setattr(factor_analysis.combination, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(factor_analysis.combination, "filter_single_fund", lambda data, fund_code: data)
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.combination,
         "adapt_to_price_series",
         lambda fund_df: (
             pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
@@ -1049,7 +1049,7 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.combination,
         "build_walk_forward_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
@@ -1067,7 +1067,7 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
         ],
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.combination,
         "build_single_factor_series",
         lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
             range(len(price_series)) if factor_name == "momentum" else list(reversed(range(len(price_series)))),
@@ -1099,9 +1099,9 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
             "pearson_ic": 0.0,
         }
 
-    monkeypatch.setattr(factor_analysis, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
+    monkeypatch.setattr(factor_analysis.combination, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.combination,
         "run_factor_combination_weight_tuning",
         lambda factor_candidate_list, factor_series_dict, forward_return_series, fold_list, selected_method_summary: {
             "enabled": True,
@@ -1172,7 +1172,7 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     }
     factor_combination_path.write_text(json.dumps(factor_combination_payload, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.backtest,
         "build_tradition_config",
         lambda config_override=None: {
             "code_dict": {"007301": "半导体"},
@@ -1194,19 +1194,19 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     )
     sample_price_series = pd.Series([1.0, 1.02, 1.03, 1.01, 1.05, 1.07, 1.08, 1.10], index=pd.date_range("2024-01-01", periods=8, freq="D"))
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.backtest,
         "fetch_fund_data_with_cache",
         lambda **kwargs: pd.DataFrame({"date": sample_price_series.index, "code": ["007301"] * len(sample_price_series), "nav": sample_price_series.values}),
     )
-    monkeypatch.setattr(factor_analysis, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis, "filter_single_fund", lambda data, fund_code: data)
+    monkeypatch.setattr(factor_analysis.backtest, "normalize_fund_data", lambda data: data)
+    monkeypatch.setattr(factor_analysis.backtest, "filter_single_fund", lambda data, fund_code: data)
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.backtest,
         "adapt_to_price_series",
         lambda fund_df: (pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float), "nav_price_series"),
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.backtest,
         "build_single_factor_series",
         lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
             np.linspace(0.0, 1.0, len(price_series)) if factor_name == "momentum" else np.linspace(1.0, 0.0, len(price_series)),
@@ -1216,7 +1216,7 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.backtest,
         "run_position_function_search",
         lambda position_function_config, score_series, split_dict, init_cash, fees: {
             "n_trials": 100,
@@ -1232,7 +1232,7 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
         },
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.backtest,
         "build_backtest_result",
         lambda price_series, score_series, segment_series, position_function_name, function_param_dict, ema_span, trade_gate, init_cash, fees: {
             "sample_start": pd.Index(segment_series.index).min(),
@@ -1250,7 +1250,7 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
         },
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.backtest,
         "save_equity_curve_plot",
         lambda equity_curve, output_path, title, benchmark_curve=None: output_path,
     )
