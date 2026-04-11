@@ -18,6 +18,10 @@ DEFAULT_CODE_DICT = {
     "008702": "黄金",
 }
 
+DEFAULT_LINKED_CODE_DICT = {
+    "007301": ["512480", "000510"],
+}
+
 DEFAULT_STRATEGY_PARAM_DICT = {
     "buy_and_hold": {},
     "ma_cross": {
@@ -123,6 +127,7 @@ class TraditionConfig:
     # 固定项目根目录推导规则，避免在不同工作目录下运行时写错缓存和输出路径。
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1])
     code_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_CODE_DICT))
+    linked_code_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_LINKED_CODE_DICT))
     strategy_param_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_STRATEGY_PARAM_DICT))
     data_split_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_DATA_SPLIT_DICT))
     optimization_config: dict = field(default_factory=lambda: deepcopy(DEFAULT_OPTIMIZATION_CONFIG))
@@ -158,3 +163,23 @@ def build_tradition_config(config_override=None):
             raise ValueError("config_override 必须为dict。")
         config_dict.update(config_override)
     return config_dict
+
+
+def resolve_effective_code_dict(config):
+    # 数据抓取代码集合允许按主基金代码做联动扩展，保证主流程可同时拿到辅助序列。
+    if not isinstance(config, dict):
+        raise ValueError("config 必须为dict。")
+    base_code_dict = {
+        str(code).zfill(6): str(name)
+        for code, name in dict(config.get("code_dict", {})).items()
+    }
+    primary_code = str(config.get("default_fund_code", "")).zfill(6)
+    if primary_code and primary_code not in base_code_dict:
+        base_code_dict[primary_code] = primary_code
+    linked_code_dict = dict(config.get("linked_code_dict", {}))
+    linked_code_list = list(linked_code_dict.get(primary_code, []))
+    for linked_code in linked_code_list:
+        normalized_code = str(linked_code).zfill(6)
+        if normalized_code not in base_code_dict:
+            base_code_dict[normalized_code] = normalized_code
+    return base_code_dict

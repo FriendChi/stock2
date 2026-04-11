@@ -3,7 +3,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from tradition.config import build_tradition_config
+from tradition.config import build_tradition_config, resolve_effective_code_dict
 from tradition.data_adapter import adapt_to_price_series
 from tradition.data_fetcher import fetch_fund_data_with_cache, fetch_treasury_yield_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
@@ -624,7 +624,7 @@ def run_single_fund_strategy(config_override=None):
     # 单基金模式在数据准备后复用通用执行函数，保持与其他模式同一回测口径。
     config = build_tradition_config(config_override=config_override)
     raw_data = fetch_fund_data_with_cache(
-        code_dict=config["code_dict"],
+        code_dict=resolve_effective_code_dict(config),
         cache_dir=config["data_dir"],
         force_refresh=bool(config["force_refresh"]),
         cache_prefix=config["cache_prefix"],
@@ -643,7 +643,7 @@ def run_multi_fund_strategy(config_override=None):
     # 批量模式统一拉一次数据，再对基金池逐只回测并落汇总结果。
     config = build_tradition_config(config_override=config_override)
     raw_data = fetch_fund_data_with_cache(
-        code_dict=config["code_dict"],
+        code_dict=resolve_effective_code_dict(config),
         cache_dir=config["data_dir"],
         force_refresh=bool(config["force_refresh"]),
         cache_prefix=config["cache_prefix"],
@@ -677,7 +677,7 @@ def run_compare_all_strategies(config_override=None):
     # 单基金多策略模式统一使用同一份数据，避免对相同基金重复拉数和重复解析。
     config = build_tradition_config(config_override=config_override)
     raw_data = fetch_fund_data_with_cache(
-        code_dict=config["code_dict"],
+        code_dict=resolve_effective_code_dict(config),
         cache_dir=config["data_dir"],
         force_refresh=bool(config["force_refresh"]),
         cache_prefix=config["cache_prefix"],
@@ -853,7 +853,7 @@ def run_optimize_single_fund_strategy(config_override=None):
     # 优化模式固定使用 train/valid/test 时序切分，训练集搜索，验证集选 Top-K，测试集最终评估。
     config = build_tradition_config(config_override=config_override)
     raw_data = fetch_fund_data_with_cache(
-        code_dict=config["code_dict"],
+        code_dict=resolve_effective_code_dict(config),
         cache_dir=config["data_dir"],
         force_refresh=bool(config["force_refresh"]),
         cache_prefix=config["cache_prefix"],
@@ -949,7 +949,7 @@ def run_walk_forward_single_fund_strategy(config_override=None):
     # walk-forward 第一版固定为单基金、固定窗口滚动优化，逐折复用当前单次优化链路。
     config = build_tradition_config(config_override=config_override)
     raw_data = fetch_fund_data_with_cache(
-        code_dict=config["code_dict"],
+        code_dict=resolve_effective_code_dict(config),
         cache_dir=config["data_dir"],
         force_refresh=bool(config["force_refresh"]),
         cache_prefix=config["cache_prefix"],

@@ -2,7 +2,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from tradition.config import build_tradition_config
+from tradition.config import build_tradition_config, resolve_effective_code_dict
 from tradition.data_adapter import adapt_to_price_series
 from tradition.data_fetcher import fetch_fund_data_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
@@ -82,7 +82,7 @@ def run_single_factor_stability_analysis(config_override=None):
     )
 
     raw_data = fetch_fund_data_with_cache(
-        code_dict=config["code_dict"],
+        code_dict=resolve_effective_code_dict(config),
         cache_dir=config["data_dir"],
         force_refresh=bool(config["force_refresh"]),
         cache_prefix=config["cache_prefix"],
