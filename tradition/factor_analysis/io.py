@@ -277,11 +277,11 @@ def resolve_fund_code_from_factor_combination_input(factor_combination_input, fa
     )
 
 
-def save_strategy_backtest_output(factor_combination_input, strategy_backtest_output, output_dir, fund_code):
+def allocate_strategy_backtest_paths(factor_combination_input, factor_combination_path, output_dir, fund_code):
     output_dir.mkdir(parents=True, exist_ok=True)
     inherited_path_code = resolve_input_path_code(
         input_payload=factor_combination_input,
-        input_path=strategy_backtest_output.get("factor_combination_path"),
+        input_path=factor_combination_path,
     )
     output_path, path_code = allocate_stage_output_path(
         output_dir=output_dir,
@@ -290,6 +290,22 @@ def save_strategy_backtest_output(factor_combination_input, strategy_backtest_ou
         stage_index=4,
         inherited_path_code=inherited_path_code,
     )
+    plot_path = output_dir / f"strategy_backtest_{str(fund_code).zfill(6)}_{datetime.today().strftime('%Y-%m-%d')}_{path_code}.png"
+    return output_path, plot_path, path_code
+
+
+def save_strategy_backtest_output(factor_combination_input, strategy_backtest_output, output_dir, fund_code, output_path=None, path_code=None):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_path is None or not is_valid_path_code(path_code):
+        output_path, _, path_code = allocate_strategy_backtest_paths(
+            factor_combination_input=factor_combination_input,
+            factor_combination_path=strategy_backtest_output.get("factor_combination_path"),
+            output_dir=output_dir,
+            fund_code=fund_code,
+        )
+    else:
+        output_path = Path(output_path)
+        path_code = str(path_code)
     payload = {
         "path_code": path_code,
         "input_ref": {

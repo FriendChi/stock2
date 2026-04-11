@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -1222,6 +1223,10 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
             "cache_prefix": "tradition_fund",
             "factor_combination_path": str(factor_combination_path),
             "strategy_param_dict": {"multi_factor_score": {}},
+            "walk_forward_config": {
+                "window_size": 4,
+                "min_fold_count": 1,
+            },
             "data_split_dict": {
                 "train_ratio": 0.5,
                 "valid_ratio": 0.25,
@@ -1258,7 +1263,7 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     monkeypatch.setattr(
         factor_analysis.backtest,
         "run_position_function_search",
-        lambda position_function_config, score_series, split_dict, init_cash, fees: {
+        lambda position_function_config, score_series, fold_list, init_cash, fees: {
             "n_trials": 100,
             "best_valid_trial_summary": {
                 "trial_number": 1 if position_function_config["name"] == "sigmoid" else 2,
@@ -1273,6 +1278,28 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         factor_analysis.backtest,
+        "build_walk_forward_dev_fold_list",
+        lambda price_series, walk_forward_config, split_config: [
+            {
+                "fold_id": 1,
+                "train": price_series.iloc[:4],
+                "valid": price_series.iloc[4:6],
+                "dynamic_step_size": 2,
+                "dynamic_tail_size": 0,
+                "dynamic_step_select_mode": "exact_divisor",
+            },
+            {
+                "fold_id": 2,
+                "train": price_series.iloc[1:5],
+                "valid": price_series.iloc[5:7],
+                "dynamic_step_size": 2,
+                "dynamic_tail_size": 0,
+                "dynamic_step_select_mode": "exact_divisor",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        factor_analysis.backtest,
         "build_backtest_result",
         lambda price_series, score_series, segment_series, position_function_name, function_param_dict, ema_span, trade_gate, init_cash, fees: {
             "sample_start": pd.Index(segment_series.index).min(),
@@ -1282,7 +1309,11 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
                 "cumulative_return": 0.1,
                 "annual_return": 0.2,
                 "annual_volatility": 0.1,
-                "sharpe": 1.2 if position_function_name == "sigmoid" else 0.8,
+                "sharpe": (
+                    0.7
+                    if (len(pd.Index(segment_series.index)) <= 2 and position_function_name == "sigmoid")
+                    else (2.0 if len(pd.Index(segment_series.index)) <= 2 else (1.2 if position_function_name == "sigmoid" else 0.8))
+                ),
                 "max_drawdown": -0.05,
             },
             "equity_curve": pd.Series([10000.0, 10100.0], index=pd.Index(segment_series.index[:2])),
@@ -1309,5 +1340,7 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     assert "strategy_backtest_output" in output_payload
     assert output_payload["strategy_backtest_output"]["best_strategy_valid_summary"]["position_function_name"] == "sigmoid"
     assert output_payload["strategy_backtest_output"]["best_strategy_test_summary"]["position_function_name"] == "sigmoid"
+    assert output_payload["strategy_backtest_output"]["selected_by"] == "valid_wf"
     assert "best_function_valid_summary" not in output_payload["strategy_backtest_output"]
     assert "position_function_search_output" not in output_payload["strategy_backtest_output"]
+    assert Path(output_payload["strategy_backtest_output"]["plot_path"]).stem.split("_")[-1] == output_payload["path_code"]

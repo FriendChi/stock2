@@ -10,10 +10,11 @@ from tradition.data_loader import filter_single_fund, normalize_fund_data
 from tradition.factor_engine import build_single_factor_series
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.optimizer import load_optuna_module
-from tradition.splitter import split_time_series_by_ratio
+from tradition.splitter import build_walk_forward_dev_fold_list, split_time_series_by_ratio
 
 from .common import build_weighted_instance_combination_score
 from .io import (
+    allocate_strategy_backtest_paths,
     load_factor_combination_input,
     print_strategy_backtest_summary,
     resolve_fund_code_from_factor_combination_input,
@@ -172,6 +173,23 @@ def build_serializable_backtest_result(backtest_result):
     }
 
 
+def build_aggregated_backtest_result(backtest_result_list):
+    backtest_result_list = [dict(backtest_result) for backtest_result in list(backtest_result_list)]
+    if len(backtest_result_list) == 0:
+        raise ValueError("backtest_result_list 为空，无法聚合。")
+    metric_name_list = list(dict(backtest_result_list[0]["stats"]).keys())
+    stats_dict = {}
+    for metric_name in metric_name_list:
+        metric_value_list = [float(dict(result["stats"])[metric_name]) for result in backtest_result_list]
+        stats_dict[metric_name] = float(np.mean(metric_value_list))
+    return {
+        "sample_start": min(result["sample_start"] for result in backtest_result_list),
+        "sample_end": max(result["sample_end"] for result in backtest_result_list),
+        "trade_count": int(sum(int(result["trade_count"]) for result in backtest_result_list)),
+        "stats": stats_dict,
+    }
+
+
 def build_position_function_config_list(score_series):
     score_series = pd.Series(score_series, copy=True).astype(float).dropna()
     if score_series.empty:
@@ -244,10 +262,13 @@ def select_best_strategy_trial_summary(summary_list, segment_name):
     return dict(sorted_summary_list[0])
 
 
-def run_position_function_search(position_function_config, score_series, split_dict, init_cash, fees):
+def run_position_function_search(position_function_config, score_series, fold_list, init_cash, fees):
     optuna_module = load_optuna_module()
     position_function_config = dict(position_function_config)
     train_trial_summary_list = []
+    fold_list = [dict(fold) for fold in list(fold_list)]
+    if len(fold_list) == 0:
+        raise ValueError("fold_list 为空，无法执行仓位函数搜索。")
 
     def objective(trial):
         function_param_dict = sample_position_function_param_dict(
@@ -256,17 +277,22 @@ def run_position_function_search(position_function_config, score_series, split_d
         )
         ema_span = int(trial.suggest_int(f"{position_function_config['name']}__ema_span", 1, 30))
         trade_gate = float(trial.suggest_float(f"{position_function_config['name']}__trade_gate", 0.0, 0.2))
-        train_result = build_backtest_result(
-            price_series=split_dict["train"],
-            score_series=score_series,
-            segment_series=split_dict["train"],
-            position_function_name=position_function_config["name"],
-            function_param_dict=function_param_dict,
-            ema_span=ema_span,
-            trade_gate=trade_gate,
-            init_cash=init_cash,
-            fees=fees,
-        )
+        train_fold_result_list = []
+        for fold in fold_list:
+            train_fold_result_list.append(
+                build_backtest_result(
+                    price_series=fold["train"],
+                    score_series=score_series,
+                    segment_series=fold["train"],
+                    position_function_name=position_function_config["name"],
+                    function_param_dict=function_param_dict,
+                    ema_span=ema_span,
+                    trade_gate=trade_gate,
+                    init_cash=init_cash,
+                    fees=fees,
+                )
+            )
+        train_result = build_aggregated_backtest_result(train_fold_result_list)
         train_trial_summary_list.append(
             {
                 "trial_number": int(trial.number),
@@ -275,6 +301,7 @@ def run_position_function_search(position_function_config, score_series, split_d
                 "ema_span": int(ema_span),
                 "trade_gate": float(trade_gate),
                 "train_result": train_result,
+                "train_fold_count": int(len(train_fold_result_list)),
             }
         )
         return float(train_result["stats"]["sharpe"])
@@ -300,20 +327,26 @@ def run_position_function_search(position_function_config, score_series, split_d
         top_train_trial_summary_list.append(serializable_summary)
     valid_trial_summary_list = []
     for train_summary in sorted_train_trial_summary_list[:50]:
-        valid_result = build_backtest_result(
-            price_series=split_dict["valid"],
-            score_series=score_series,
-            segment_series=split_dict["valid"],
-            position_function_name=position_function_config["name"],
-            function_param_dict=dict(train_summary["position_function_params"]),
-            ema_span=int(train_summary["ema_span"]),
-            trade_gate=float(train_summary["trade_gate"]),
-            init_cash=init_cash,
-            fees=fees,
-        )
+        valid_fold_result_list = []
+        for fold in fold_list:
+            valid_fold_result_list.append(
+                build_backtest_result(
+                    price_series=fold["valid"],
+                    score_series=score_series,
+                    segment_series=fold["valid"],
+                    position_function_name=position_function_config["name"],
+                    function_param_dict=dict(train_summary["position_function_params"]),
+                    ema_span=int(train_summary["ema_span"]),
+                    trade_gate=float(train_summary["trade_gate"]),
+                    init_cash=init_cash,
+                    fees=fees,
+                )
+            )
+        valid_result = build_aggregated_backtest_result(valid_fold_result_list)
         valid_summary = dict(train_summary)
         valid_summary["valid_result"] = build_serializable_backtest_result(valid_result)
         valid_summary["train_result"] = build_serializable_backtest_result(train_summary["train_result"])
+        valid_summary["valid_fold_count"] = int(len(valid_fold_result_list))
         valid_trial_summary_list.append(valid_summary)
     best_valid_trial_summary = select_best_strategy_trial_summary(
         summary_list=valid_trial_summary_list,
@@ -359,6 +392,12 @@ def run_strategy_backtest(config_override=None):
         price_series=price_series,
         split_config=config["data_split_dict"],
     )
+    fold_list = build_walk_forward_dev_fold_list(
+        price_series=price_series,
+        walk_forward_config=dict(config["walk_forward_config"]),
+        split_config=dict(config["data_split_dict"]),
+    )
+    dev_series = pd.concat([split_dict["train"], split_dict["valid"]]).sort_index()
     base_multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
     factor_candidate_list = [dict(factor_candidate_record_dict[candidate_label]) for candidate_label in input_candidate_label_list]
     factor_series_dict = {}
@@ -376,7 +415,7 @@ def run_strategy_backtest(config_override=None):
         candidate_weight_dict=dict(best_combination_selection_summary["candidate_weight_dict"]),
     )
     position_function_config_list = build_position_function_config_list(
-        score_series=score_series.reindex(split_dict["train"].index).dropna(),
+        score_series=score_series.reindex(dev_series.index).dropna(),
     )
     position_function_search_output = {}
     function_trial_summary_list = []
@@ -385,7 +424,7 @@ def run_strategy_backtest(config_override=None):
         function_search_output = run_position_function_search(
             position_function_config=position_function_config,
             score_series=score_series,
-            split_dict=split_dict,
+            fold_list=fold_list,
             init_cash=float(config["init_cash"]),
             fees=float(config["fees"]),
         )
@@ -404,6 +443,7 @@ def run_strategy_backtest(config_override=None):
         function_summary = dict(best_valid_trial_summary)
         function_summary["candidate_label_list"] = list(input_candidate_label_list)
         function_summary["candidate_weight_dict"] = dict(best_combination_selection_summary["candidate_weight_dict"])
+        function_summary["selected_by"] = "valid_wf"
         function_summary["test_result"] = build_serializable_backtest_result(test_result)
         function_trial_summary_list.append(function_summary)
         position_function_search_output[function_name] = {
@@ -415,24 +455,28 @@ def run_strategy_backtest(config_override=None):
         summary_list=function_trial_summary_list,
         segment_name="valid",
     )
-    best_strategy_test_summary = select_best_strategy_trial_summary(
-        summary_list=function_trial_summary_list,
-        segment_name="test",
+    best_strategy_test_summary = dict(best_strategy_valid_summary)
+    best_strategy_test_summary["selected_by"] = "valid_wf"
+    summary_path, plot_output_path, path_code = allocate_strategy_backtest_paths(
+        factor_combination_input=factor_combination_input,
+        factor_combination_path=resolved_factor_combination_path,
+        output_dir=config["output_dir"],
+        fund_code=fund_code,
     )
     final_plot_result = build_backtest_result(
         price_series=price_series,
         score_series=score_series,
         segment_series=price_series,
-        position_function_name=str(best_strategy_test_summary["position_function_name"]),
-        function_param_dict=dict(best_strategy_test_summary["position_function_params"]),
-        ema_span=int(best_strategy_test_summary["ema_span"]),
-        trade_gate=float(best_strategy_test_summary["trade_gate"]),
+        position_function_name=str(best_strategy_valid_summary["position_function_name"]),
+        function_param_dict=dict(best_strategy_valid_summary["position_function_params"]),
+        ema_span=int(best_strategy_valid_summary["ema_span"]),
+        trade_gate=float(best_strategy_valid_summary["trade_gate"]),
         init_cash=float(config["init_cash"]),
         fees=float(config["fees"]),
     )
     plot_path = save_equity_curve_plot(
         equity_curve=final_plot_result["equity_curve"],
-        output_path=config["output_dir"] / f"strategy_backtest_{fund_code}_{datetime.today().strftime('%Y-%m-%d')}.png",
+        output_path=plot_output_path,
         title=f"{fund_code} strategy_backtest",
         benchmark_curve=price_series,
     )
@@ -446,6 +490,13 @@ def run_strategy_backtest(config_override=None):
             "selected_method": str(best_combination_selection_summary["selected_method"]),
             "score_name": str(score_series.name),
         },
+        "dev_walk_forward_summary": {
+            "fold_count": int(len(fold_list)),
+            "dynamic_step_size": int(fold_list[0]["dynamic_step_size"]) if len(fold_list) > 0 and "dynamic_step_size" in fold_list[0] else None,
+            "dynamic_tail_size": int(fold_list[0]["dynamic_tail_size"]) if len(fold_list) > 0 and "dynamic_tail_size" in fold_list[0] else None,
+            "dynamic_step_select_mode": str(fold_list[0]["dynamic_step_select_mode"]) if len(fold_list) > 0 and "dynamic_step_select_mode" in fold_list[0] else None,
+        },
+        "selected_by": "valid_wf",
         "best_strategy_valid_summary": best_strategy_valid_summary,
         "best_strategy_test_summary": best_strategy_test_summary,
         "plot_path": str(plot_path),
@@ -455,6 +506,8 @@ def run_strategy_backtest(config_override=None):
         strategy_backtest_output=strategy_backtest_output,
         output_dir=config["output_dir"],
         fund_code=fund_code,
+        output_path=summary_path,
+        path_code=path_code,
     )
     result = {
         "fund_code": fund_code,

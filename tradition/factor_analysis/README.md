@@ -80,7 +80,7 @@ python -m tradition.runner research factor-select \
 
 ```bash
 python -m tradition.runner research stability \
-  --factor-selection-path /home/chi/snap/stock2/tradition/outputs/factor_selection_007301_2026-04-11_t0000.json  --ic-exp-weighted
+  --factor-selection-path /home/chi/snap/stock2/tradition/outputs/factor_selection_007301_2026-04-11_z0000.json  --ic-exp-weighted
 ```
 
 ## 流程 3：去冗余与组合选择
@@ -120,7 +120,7 @@ python -m tradition.runner research stability \
 
 ```bash
 python -m tradition.runner research dedup \
-  --stability-analysis-path /home/chi/snap/stock2/tradition/outputs/single_factor_stability_007301_2026-04-11_tJ000.json \
+  --stability-analysis-path /home/chi/snap/stock2/tradition/outputs/single_factor_stability_007301_2026-04-11_zl000.json \
   --dedup-root-topk 3  --ic-exp-weighted
 ```
 
@@ -160,7 +160,7 @@ python -m tradition.runner research dedup \
 
 ```bash
 python -m tradition.runner research combination \
-  --dedup-selection-path /home/chi/snap/stock2/tradition/outputs/single_factor_dedup_007301_2026-04-11_tJG00.json  --ic-exp-weighted
+  --dedup-selection-path /home/chi/snap/stock2/tradition/outputs/single_factor_dedup_007301_2026-04-11_zlX00.json  --ic-exp-weighted
 ```
 
 ## 流程 5：连续仓位策略回测
@@ -201,7 +201,7 @@ python -m tradition.runner research combination \
 
 ```bash
 python -m tradition.runner research strategy-backtest \
-  --factor-combination-path /home/chi/snap/stock2/tradition/outputs/factor_combination_007301_2026-04-11_tJGz0.json
+  --factor-combination-path /home/chi/snap/stock2/tradition/outputs/factor_combination_007301_2026-04-11_zlXL0.json
 ```
 
 - `2026-04-09` 对应流程 5 结果文件：
