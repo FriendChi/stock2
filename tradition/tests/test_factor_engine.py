@@ -132,7 +132,7 @@ def test_build_factor_table_contains_expected_columns():
 
 
 def test_factor_pool_contains_expected_grouping():
-    assert FACTOR_POOL_DICT["momentum"]["group"] == "趋势/动量"
+    assert FACTOR_POOL_DICT["momentum"]["group"] == "趋势强度"
     assert FACTOR_POOL_DICT["ma_trend_state"]["group"] == "均线趋势"
     assert FACTOR_POOL_DICT["trend_r2"]["group"] == "趋势强度"
     assert FACTOR_POOL_DICT["donchian_breakout"]["group"] == "突破"
@@ -141,7 +141,7 @@ def test_factor_pool_contains_expected_grouping():
 
 
 def test_resolve_factor_name_list_by_group_collects_and_deduplicates():
-    factor_name_list = resolve_factor_name_list_by_group(["趋势/动量", "突破", "趋势/动量"])
+    factor_name_list = resolve_factor_name_list_by_group(["趋势强度", "突破", "趋势强度"])
     assert factor_name_list[0] == "momentum"
     assert "donchian_breakout" in factor_name_list
     assert len(factor_name_list) == len(set(factor_name_list))
