@@ -454,7 +454,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
     )
     monkeypatch.setattr(
         factor_analysis.selection,
-        "build_walk_forward_fold_list",
+        "build_walk_forward_dev_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
                 "fold_id": 1,
@@ -616,7 +616,7 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
     )
     monkeypatch.setattr(
         factor_analysis.stability,
-        "build_walk_forward_fold_list",
+        "build_walk_forward_dev_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
                 "fold_id": 1,
@@ -768,7 +768,7 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
     )
     monkeypatch.setattr(
         factor_analysis.stability,
-        "build_walk_forward_fold_list",
+        "build_walk_forward_dev_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
                 "fold_id": 1,
@@ -913,7 +913,7 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     )
     monkeypatch.setattr(
         factor_analysis.dedup,
-        "build_walk_forward_fold_list",
+        "build_walk_forward_dev_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
                 "fold_id": 1,
@@ -1085,7 +1085,7 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         factor_analysis.combination,
-        "build_walk_forward_fold_list",
+        "build_walk_forward_dev_fold_list",
         lambda price_series, walk_forward_config, split_config: [
             {
                 "fold_id": 1,

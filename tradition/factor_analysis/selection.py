@@ -7,7 +7,7 @@ from tradition.data_adapter import adapt_to_price_series
 from tradition.data_fetcher import fetch_fund_data_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
 from tradition.factor_engine import build_single_factor_series, resolve_factor_name_list_by_group
-from tradition.splitter import build_walk_forward_fold_list
+from tradition.splitter import build_walk_forward_dev_fold_list
 
 from .common import (
     build_candidate_record_dict,
@@ -91,7 +91,7 @@ def run_factor_selection_single_fund(config_override=None):
     price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
 
     candidate_factor_name_list = resolve_factor_name_list_by_group(factor_group_list=factor_group_list)
-    fold_list = build_walk_forward_fold_list(
+    fold_list = build_walk_forward_dev_fold_list(
         price_series=price_series,
         walk_forward_config=dict(config["walk_forward_config"]),
         split_config=config["data_split_dict"],
