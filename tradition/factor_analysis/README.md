@@ -33,6 +33,18 @@
 - 该阶段只解决“哪些单因子值得进入下一步”
 - 不处理稳定性、不处理相关性冗余、不处理组合权重
 
+对应指令：
+
+- 从零开始执行流程 1：
+
+```bash
+python -m tradition.runner research factor-select \
+  --fund-code 007301 \
+  --factor-groups "均线趋势,趋势强度,波动调整趋势" \
+  --train-min-spearman-ic 0.0 \
+  --train-min-spearman-icir 0.0 --ic-exp-weighted
+```
+
 ## 流程 2：单因子稳定性分析
 
 入口函数：
@@ -61,6 +73,15 @@
 
 - 该阶段只解决“筛出来的单因子是否稳定”
 - 输出结果用于后续去冗余和组合搜索
+
+对应指令：
+
+- 基于流程 1 输出继续执行：
+
+```bash
+python -m tradition.runner research stability \
+  --factor-selection-path /home/chi/snap/stock2/tradition/outputs/factor_selection_007301_2026-04-11_t0000.json  --ic-exp-weighted
+```
 
 ## 流程 3：去冗余与组合选择
 
@@ -93,6 +114,16 @@
 - 该阶段输出的是“最终因子集合”
 - 但还没有确定组合权重，也没有进入最终策略回测
 
+对应指令：
+
+- 基于流程 2 输出继续执行：
+
+```bash
+python -m tradition.runner research dedup \
+  --stability-analysis-path /home/chi/snap/stock2/tradition/outputs/single_factor_stability_007301_2026-04-11_tJ000.json \
+  --dedup-root-topk 3  --ic-exp-weighted
+```
+
 ## 流程 4：因子组合与权重微调
 
 入口函数：
@@ -122,6 +153,15 @@
 
 - 该阶段固定因子集合，只优化组合权重
 - 输出结果是后续策略回测使用的最终因子权重配置
+
+对应指令：
+
+- 基于流程 3 输出继续执行：
+
+```bash
+python -m tradition.runner research combination \
+  --dedup-selection-path /home/chi/snap/stock2/tradition/outputs/single_factor_dedup_007301_2026-04-11_tJG00.json  --ic-exp-weighted
+```
 
 ## 流程 5：连续仓位策略回测
 
@@ -155,6 +195,21 @@
 - 该阶段是整条研究链路的最终落点
 - 输出的是最终连续仓位策略在 train / valid / test 上的回测结果
 
+对应指令：
+
+- 基于流程 4 输出继续执行：
+
+```bash
+python -m tradition.runner research strategy-backtest \
+  --factor-combination-path /home/chi/snap/stock2/tradition/outputs/factor_combination_007301_2026-04-11_tJGz0.json
+```
+
+- `2026-04-09` 对应流程 5 结果文件：
+
+```text
+/home/chi/snap/stock2/tradition/outputs/strategy_backtest_007301_2026-04-09.json
+```
+
 ## 流程关系
 
 五个流程的依赖顺序如下：
@@ -172,6 +227,14 @@
 3. `single_factor_dedup_*.json`
 4. `factor_combination_*.json`
 5. `strategy_backtest_*.json`
+
+按当前命令行入口，对应子命令如下：
+
+1. `python -m tradition.runner research factor-select`
+2. `python -m tradition.runner research stability`
+3. `python -m tradition.runner research dedup`
+4. `python -m tradition.runner research combination`
+5. `python -m tradition.runner research strategy-backtest`
 
 ## 使用建议
 

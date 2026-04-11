@@ -38,6 +38,17 @@ def test_build_metric_summary_returns_zero_icir_for_constant_metric_series():
     assert abs(summary["icir"] - 0.0) < 1e-12
 
 
+def test_build_spearman_metric_summary_supports_exp_weighted():
+    summary = factor_analysis.build_spearman_metric_summary(
+        [0.1, 0.2, 0.5],
+        ic_aggregation_config={"mode": "exp_weighted", "half_life": 1.0},
+    )
+    assert summary["count"] == 3
+    assert summary["mean"] > 0.2
+    assert summary["mean"] < 0.5
+    assert summary["icir"] > 0.0
+
+
 def test_build_positive_ic_ratio_uses_positive_valid_fold_ratio():
     assert abs(factor_analysis.build_positive_ic_ratio([0.1, -0.2, 0.0, 0.3, float("nan")]) - (2 / 4)) < 1e-12
     assert abs(factor_analysis.build_positive_ic_ratio([float("nan")]) - 0.0) < 1e-12
@@ -137,7 +148,14 @@ def test_run_train_forward_selection_builds_tree_path_from_topk_singleton_roots(
         },
     ]
 
-    def fake_evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, include_valid=True):
+    def fake_evaluate_factor_candidate_subset(
+        factor_candidate_list,
+        factor_series_dict,
+        forward_return_series,
+        fold_list,
+        include_valid=True,
+        ic_aggregation_config=None,
+    ):
         label_tuple = tuple(item["candidate_label"] for item in factor_candidate_list)
         metric_dict = {
             ("factor_a",): {"train_spearman_ic_mean": 0.1, "train_spearman_icir": 0.6},
@@ -273,7 +291,14 @@ def test_run_optuna_extension_search_uses_remaining_factor_square_trials_and_can
     )
     monkeypatch.setattr(factor_analysis.dedup, "load_optuna_module", lambda: fake_optuna_module)
 
-    def fake_evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, include_valid=True):
+    def fake_evaluate_factor_candidate_subset(
+        factor_candidate_list,
+        factor_series_dict,
+        forward_return_series,
+        fold_list,
+        include_valid=True,
+        ic_aggregation_config=None,
+    ):
         label_tuple = tuple(sorted(item["candidate_label"] for item in factor_candidate_list))
         metric_dict = {
             ("factor_a",): {"train_spearman_ic_mean": 0.10, "train_spearman_icir": 0.90, "valid_spearman_ic_mean": 0.08, "valid_spearman_icir": 0.50},
@@ -411,7 +436,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
                 "test_ratio": 0.25,
                 "min_segment_size": 5,
             },
-            "factor_group_list": ["趋势/动量", "均线趋势"],
+            "factor_group_list": ["趋势强度", "均线趋势"],
             "train_min_spearman_ic": 0.1,
             "train_min_spearman_icir": 0.0,
         },
@@ -500,6 +525,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert "factor_selection_output" in saved_payload
     assert saved_payload["factor_selection_output"]["fund_code"] == "007301"
+    assert saved_payload["factor_selection_output"]["ic_aggregation_config"]["mode"] == "classic"
     assert saved_payload["factor_selection_output"]["record_dict"]["momentum(window=10)"]["candidate_label"] == "momentum(window=10)"
     assert saved_payload["factor_selection_output"]["record_dict"]["momentum(window=10)"]["factor_param_dict"] == {"window": 10}
 
@@ -648,10 +674,15 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
     assert result["summary_path"].suffix == ".json"
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert saved_payload["input_ref"]["fund_code"] == "007301"
+    assert saved_payload["input_ref"]["factor_selection_path"] == str(factor_selection_path)
+    assert len(saved_payload["path_code"]) == 5
+    assert str(saved_payload["path_code"]).isalnum()
+    assert result["summary_path"].stem.split("_")[-1] == saved_payload["path_code"]
     assert "stability_analysis_output" in saved_payload
     assert saved_payload["stability_analysis_output"]["fund_code"] == "007301"
     assert saved_payload["stability_analysis_output"]["candidate_count"] == 1
     assert saved_payload["stability_analysis_output"]["selected_count"] == 1
+    assert saved_payload["stability_analysis_output"]["ic_aggregation_config"]["mode"] == "classic"
     assert saved_payload["stability_analysis_output"]["record_dict"]["momentum(window=10)"]["candidate_label"] == "momentum(window=10)"
 
 
@@ -950,10 +981,14 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     assert result["summary_path"].exists()
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert saved_payload["input_ref"]["fund_code"] == "007301"
+    assert len(saved_payload["path_code"]) == 5
+    assert str(saved_payload["path_code"]).isalnum()
+    assert result["summary_path"].stem.split("_")[-1] == saved_payload["path_code"]
     assert "dedup_selection_output" in saved_payload
     assert saved_payload["dedup_selection_output"]["train_path_count"] == 3
     assert saved_payload["dedup_selection_output"]["valid_eval_count"] == 1
     assert saved_payload["dedup_selection_output"]["valid_eval_ratio"] == 0.5
+    assert saved_payload["dedup_selection_output"]["ic_aggregation_config"]["mode"] == "classic"
     assert "train_forward_selection_path_summary" not in saved_payload["dedup_selection_output"]
     assert "forward_selection_path_summary" not in saved_payload["dedup_selection_output"]
     assert "optuna_extension_output" not in saved_payload["dedup_selection_output"]
@@ -1103,7 +1138,7 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
     monkeypatch.setattr(
         factor_analysis.combination,
         "run_factor_combination_weight_tuning",
-        lambda factor_candidate_list, factor_series_dict, forward_return_series, fold_list, selected_method_summary: {
+        lambda factor_candidate_list, factor_series_dict, forward_return_series, fold_list, selected_method_summary, ic_aggregation_config=None: {
             "enabled": True,
             "selected_method": selected_method_summary["method_name"],
             "n_trials": 100,
@@ -1133,7 +1168,11 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
     assert result["summary_path"].exists()
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert saved_payload["input_ref"]["fund_code"] == "007301"
+    assert len(saved_payload["path_code"]) == 5
+    assert str(saved_payload["path_code"]).isalnum()
+    assert result["summary_path"].stem.split("_")[-1] == saved_payload["path_code"]
     assert "factor_combination_output" in saved_payload
+    assert saved_payload["factor_combination_output"]["ic_aggregation_config"]["mode"] == "classic"
     assert saved_payload["factor_combination_output"]["combination_compare_output"]["selected_method"] == "equal_weight"
     assert saved_payload["factor_combination_output"]["weight_tuning_output"]["selected_method"] == "equal_weight"
     assert "train_top_trial_summary_list" not in saved_payload["factor_combination_output"]["weight_tuning_output"]
@@ -1144,6 +1183,7 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
 def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     factor_combination_path = tmp_path / "factor_combination_007301_2026-04-09.json"
     factor_combination_payload = {
+        "path_code": "abcd0",
         "factor_combination_output": {
             "fund_code": "007301",
             "factor_candidate_record_dict": {
@@ -1262,6 +1302,10 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     assert output_path.name.startswith("strategy_backtest_007301_")
     output_payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert output_payload["input_ref"]["fund_code"] == "007301"
+    assert len(output_payload["path_code"]) == 5
+    assert str(output_payload["path_code"]).isalnum()
+    assert output_path.stem.split("_")[-1] == output_payload["path_code"]
+    assert output_payload["path_code"].startswith("abcd")
     assert "strategy_backtest_output" in output_payload
     assert output_payload["strategy_backtest_output"]["best_strategy_valid_summary"]["position_function_name"] == "sigmoid"
     assert output_payload["strategy_backtest_output"]["best_strategy_test_summary"]["position_function_name"] == "sigmoid"

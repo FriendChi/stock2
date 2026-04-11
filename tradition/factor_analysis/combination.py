@@ -10,7 +10,9 @@ from tradition.splitter import build_walk_forward_fold_list
 
 from .common import (
     build_forward_return_series,
+    build_ic_aggregation_config,
     build_metric_summary,
+    build_spearman_metric_summary,
     build_weighted_instance_combination_score,
     compute_segment_correlation_metrics,
     evaluate_single_factor_train_icir,
@@ -33,7 +35,7 @@ def build_equal_weight_dict(factor_candidate_list):
     }
 
 
-def build_train_icir_weight_dict(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, candidate_train_icir_dict=None):
+def build_train_icir_weight_dict(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, candidate_train_icir_dict=None, ic_aggregation_config=None):
     resolved_train_icir_dict = {}
     for factor_candidate in factor_candidate_list:
         candidate_label = str(factor_candidate["candidate_label"])
@@ -44,6 +46,7 @@ def build_train_icir_weight_dict(factor_candidate_list, factor_series_dict, forw
             factor_series=factor_series_dict[candidate_label],
             forward_return_series=forward_return_series,
             fold_list=fold_list,
+            ic_aggregation_config=ic_aggregation_config,
         )
     nonnegative_weight_dict = {
         candidate_label: max(float(train_icir), 0.0)
@@ -67,6 +70,7 @@ def evaluate_combination_summary(
     candidate_train_icir_dict=None,
     include_valid=True,
     candidate_weight_dict_override=None,
+    ic_aggregation_config=None,
 ):
     if candidate_weight_dict_override is not None:
         candidate_weight_dict = {
@@ -82,6 +86,7 @@ def evaluate_combination_summary(
             forward_return_series=forward_return_series,
             fold_list=fold_list,
             candidate_train_icir_dict=candidate_train_icir_dict,
+            ic_aggregation_config=ic_aggregation_config,
         )
     else:
         raise ValueError(f"未定义的组合方式: {method_name}")
@@ -109,7 +114,9 @@ def evaluate_combination_summary(
                     segment_index=fold_dict["valid"].index,
                 )
             )
-    train_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list])
+    if ic_aggregation_config is None:
+        ic_aggregation_config = {"mode": "classic", "half_life": 3.0}
+    train_summary = build_spearman_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list], ic_aggregation_config=ic_aggregation_config)
     summary = {
         "method_name": str(method_name),
         "candidate_label_list": [str(item["candidate_label"]) for item in factor_candidate_list],
@@ -122,7 +129,7 @@ def evaluate_combination_summary(
         "train_spearman_icir": train_summary["icir"],
     }
     if include_valid:
-        valid_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in valid_metric_list])
+        valid_summary = build_spearman_metric_summary([metric_dict["spearman_ic"] for metric_dict in valid_metric_list], ic_aggregation_config=ic_aggregation_config)
         summary["valid_spearman_ic_mean"] = valid_summary["mean"]
         summary["valid_spearman_icir"] = valid_summary["icir"]
     return summary
@@ -197,6 +204,7 @@ def run_factor_combination_weight_tuning(
     forward_return_series,
     fold_list,
     selected_method_summary,
+    ic_aggregation_config,
 ):
     optuna_module = load_optuna_module()
     selected_method_summary = dict(selected_method_summary)
@@ -231,6 +239,7 @@ def run_factor_combination_weight_tuning(
             method_name=str(selected_method_summary["method_name"]),
             include_valid=False,
             candidate_weight_dict_override=normalized_weight_dict,
+            ic_aggregation_config=ic_aggregation_config,
         )
         summary["trial_number"] = int(trial.number)
         summary["candidate_weight_dict"] = dict(normalized_weight_dict)
@@ -261,6 +270,7 @@ def run_factor_combination_weight_tuning(
             method_name=str(selected_method_summary["method_name"]),
             include_valid=True,
             candidate_weight_dict_override=dict(train_summary["candidate_weight_dict"]),
+            ic_aggregation_config=ic_aggregation_config,
         )
         valid_summary["trial_number"] = int(train_summary["trial_number"])
         valid_summary["candidate_weight_dict"] = dict(train_summary["candidate_weight_dict"])
@@ -279,6 +289,7 @@ def run_factor_combination_weight_tuning(
 
 def run_factor_combination(config_override=None):
     config = build_tradition_config(config_override=config_override)
+    ic_aggregation_config = build_ic_aggregation_config(config)
     dedup_selection_path = config.get("dedup_selection_path")
     if dedup_selection_path is None:
         raise ValueError("factor_combination 模式必须提供 dedup_selection_path。")
@@ -336,6 +347,7 @@ def run_factor_combination(config_override=None):
             method_name="equal_weight",
             candidate_train_icir_dict=candidate_train_icir_dict,
             include_valid=True,
+            ic_aggregation_config=ic_aggregation_config,
         ),
         evaluate_combination_summary(
             factor_candidate_list=factor_candidate_list,
@@ -345,6 +357,7 @@ def run_factor_combination(config_override=None):
             method_name="train_icir_weighted",
             candidate_train_icir_dict=candidate_train_icir_dict,
             include_valid=True,
+            ic_aggregation_config=ic_aggregation_config,
         ),
     ]
     selected_method_summary = select_best_combination_method_summary(combination_summary_list)
@@ -360,6 +373,7 @@ def run_factor_combination(config_override=None):
         forward_return_series=forward_return_series,
         fold_list=fold_list,
         selected_method_summary=selected_method_summary,
+        ic_aggregation_config=ic_aggregation_config,
     )
     best_tuned_trial_summary = dict(weight_tuning_output["best_tuned_trial_summary"])
     best_combination_selection_summary = {
@@ -386,6 +400,7 @@ def run_factor_combination(config_override=None):
         "dedup_selection_path": str(resolved_dedup_selection_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
         "input_candidate_label_list": input_candidate_label_list,
+        "ic_aggregation_config": dict(ic_aggregation_config),
         "factor_candidate_record_dict": factor_candidate_record_dict,
         "combination_compare_output": combination_compare_output,
         "weight_tuning_output": weight_tuning_output,

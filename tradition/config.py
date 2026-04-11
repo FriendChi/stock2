@@ -114,6 +114,9 @@ DEFAULT_RF_CONFIG = {
     "cache_prefix": "tradition_rf_cn_bond_yield",
 }
 
+DEFAULT_IC_AGGREGATION_MODE = "classic"
+DEFAULT_IC_EXP_WEIGHT_HALF_LIFE = 3.0
+
 
 @dataclass
 class TraditionConfig:
@@ -131,6 +134,8 @@ class TraditionConfig:
     fees: float = 0.001
     force_refresh: bool = False
     cache_prefix: str = "tradition_fund"
+    ic_aggregation_mode: str = DEFAULT_IC_AGGREGATION_MODE
+    ic_exp_weight_half_life: float = DEFAULT_IC_EXP_WEIGHT_HALF_LIFE
 
     @property
     def data_dir(self) -> Path:

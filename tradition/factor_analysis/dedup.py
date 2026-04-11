@@ -14,8 +14,10 @@ from tradition.splitter import build_walk_forward_fold_list
 from .common import (
     build_candidate_record_dict,
     build_forward_return_series,
+    build_ic_aggregation_config,
     build_instance_combination_score,
     build_metric_summary,
+    build_spearman_metric_summary,
     compute_segment_correlation_metrics,
 )
 from .io import (
@@ -129,7 +131,7 @@ def build_corr_dedup_result(selected_summary_df, factor_series_dict, fold_list, 
     return summary_df, dropped_candidate_label_list
 
 
-def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, include_valid=True):
+def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, include_valid=True, ic_aggregation_config=None):
     _, score_series = build_instance_combination_score(
         factor_candidate_list=factor_candidate_list,
         factor_series_dict=factor_series_dict,
@@ -152,7 +154,9 @@ def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, 
                     segment_index=fold_dict["valid"].index,
                 )
             )
-    train_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list])
+    if ic_aggregation_config is None:
+        ic_aggregation_config = {"mode": "classic", "half_life": 3.0}
+    train_summary = build_spearman_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list], ic_aggregation_config=ic_aggregation_config)
     summary_dict = {
         "candidate_label_list": [str(item["candidate_label"]) for item in factor_candidate_list],
         "factor_count": int(len(factor_candidate_list)),
@@ -160,7 +164,7 @@ def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, 
         "train_spearman_icir": train_summary["icir"],
     }
     if include_valid:
-        valid_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in valid_metric_list])
+        valid_summary = build_spearman_metric_summary([metric_dict["spearman_ic"] for metric_dict in valid_metric_list], ic_aggregation_config=ic_aggregation_config)
         summary_dict["valid_spearman_ic_mean"] = valid_summary["mean"]
         summary_dict["valid_spearman_icir"] = valid_summary["icir"]
     return summary_dict
@@ -170,7 +174,7 @@ def build_candidate_label_signature(candidate_label_list):
     return tuple(sorted([str(candidate_label) for candidate_label in candidate_label_list]))
 
 
-def run_train_forward_selection(candidate_record_list, factor_series_dict, forward_return_series, fold_list, root_topk=3):
+def run_train_forward_selection(candidate_record_list, factor_series_dict, forward_return_series, fold_list, root_topk=3, ic_aggregation_config=None):
     candidate_record_list = list(candidate_record_list)
     if len(candidate_record_list) == 0:
         return []
@@ -197,6 +201,7 @@ def run_train_forward_selection(candidate_record_list, factor_series_dict, forwa
             forward_return_series=forward_return_series,
             fold_list=fold_list,
             include_valid=False,
+            ic_aggregation_config=ic_aggregation_config,
         )
         root_summary["step"] = 1
         root_signature = build_candidate_label_signature(root_summary["candidate_label_list"])
@@ -228,6 +233,7 @@ def run_train_forward_selection(candidate_record_list, factor_series_dict, forwa
                     forward_return_series=forward_return_series,
                     fold_list=fold_list,
                     include_valid=False,
+                    ic_aggregation_config=ic_aggregation_config,
                 )
                 child_summary["step"] = int(len(child_candidate_list))
                 if pd.isna(child_summary["train_spearman_icir"]) or pd.isna(parent_summary["train_spearman_icir"]):
@@ -272,7 +278,7 @@ def select_top_train_path_summary_list(train_path_summary_list, top_ratio=0.5):
     return [dict(summary) for summary in sorted_path_summary_list[:top_count]]
 
 
-def evaluate_valid_for_path_summary_list(path_summary_list, candidate_record_lookup, factor_series_dict, forward_return_series, fold_list):
+def evaluate_valid_for_path_summary_list(path_summary_list, candidate_record_lookup, factor_series_dict, forward_return_series, fold_list, ic_aggregation_config=None):
     evaluated_summary_list = []
     for path_summary in path_summary_list:
         factor_candidate_list = [dict(candidate_record_lookup[candidate_label]) for candidate_label in path_summary["candidate_label_list"]]
@@ -282,6 +288,7 @@ def evaluate_valid_for_path_summary_list(path_summary_list, candidate_record_loo
             forward_return_series=forward_return_series,
             fold_list=fold_list,
             include_valid=True,
+            ic_aggregation_config=ic_aggregation_config,
         )
         evaluated_summary["step"] = int(path_summary["step"])
         evaluated_summary_list.append(evaluated_summary)
@@ -311,6 +318,7 @@ def run_optuna_extension_search(
     factor_series_dict,
     forward_return_series,
     fold_list,
+    ic_aggregation_config=None,
 ):
     baseline_summary = dict(baseline_summary)
     baseline_candidate_label_list = [str(candidate_label) for candidate_label in baseline_summary["candidate_label_list"]]
@@ -359,6 +367,7 @@ def run_optuna_extension_search(
             forward_return_series=forward_return_series,
             fold_list=fold_list,
             include_valid=False,
+            ic_aggregation_config=ic_aggregation_config,
         )
         summary["step"] = int(len(summary["candidate_label_list"]))
         if float(summary["train_spearman_icir"]) > baseline_train_icir:
@@ -390,6 +399,7 @@ def run_optuna_extension_search(
         factor_series_dict=factor_series_dict,
         forward_return_series=forward_return_series,
         fold_list=fold_list,
+        ic_aggregation_config=ic_aggregation_config,
     )
     best_optuna_candidate_summary = select_best_forward_path_summary(valid_evaluated_summary_list)
     if best_optuna_candidate_summary is None:
@@ -432,6 +442,7 @@ def run_optuna_extension_search(
 
 def run_single_factor_dedup_selection(config_override=None):
     config = build_tradition_config(config_override=config_override)
+    ic_aggregation_config = build_ic_aggregation_config(config)
     stability_analysis_path = config.get("stability_analysis_path")
     if stability_analysis_path is None:
         raise ValueError("single_factor_dedup_selection 模式必须提供 stability_analysis_path。")
@@ -496,6 +507,7 @@ def run_single_factor_dedup_selection(config_override=None):
         forward_return_series=forward_return_series,
         fold_list=fold_list,
         root_topk=dedup_root_topk,
+        ic_aggregation_config=ic_aggregation_config,
     )
     candidate_record_lookup = {
         str(candidate_record["candidate_label"]): dict(candidate_record)
@@ -511,6 +523,7 @@ def run_single_factor_dedup_selection(config_override=None):
         factor_series_dict=factor_series_dict,
         forward_return_series=forward_return_series,
         fold_list=fold_list,
+        ic_aggregation_config=ic_aggregation_config,
     )
     best_forward_selection_summary = select_best_forward_path_summary(forward_selection_path_summary)
     if best_forward_selection_summary is None:
@@ -522,6 +535,7 @@ def run_single_factor_dedup_selection(config_override=None):
         factor_series_dict=factor_series_dict,
         forward_return_series=forward_return_series,
         fold_list=fold_list,
+        ic_aggregation_config=ic_aggregation_config,
     )
     best_final_selection_summary = dict(optuna_extension_output["best_final_selection_summary"])
 
@@ -542,6 +556,7 @@ def run_single_factor_dedup_selection(config_override=None):
         "train_path_count": int(len(train_forward_selection_path_summary)),
         "valid_eval_count": int(len(forward_selection_path_summary)),
         "valid_eval_ratio": 0.5,
+        "ic_aggregation_config": dict(ic_aggregation_config),
         "forward_selected_count": int(len(best_final_selection_summary["candidate_label_list"])),
         "corr_dedup_dropped_candidate_label_list": dropped_candidate_label_list,
         "corr_dedup_selected_candidate_label_list": corr_selected_summary_df["candidate_label"].tolist(),

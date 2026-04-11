@@ -64,6 +64,10 @@ def add_factor_selection_cli_arguments(parser):
     parser.add_argument("--train-min-spearman-icir", dest="train_min_spearman_icir", type=float, help="训练集 Spearman ICIR 最小阈值")
 
 
+def add_ic_aggregation_cli_arguments(parser):
+    parser.add_argument("--ic-exp-weighted", dest="ic_exp_weighted", action="store_true", help="启用 IC / ICIR 指数加权聚合模式（半衰期使用默认值）")
+
+
 def add_research_io_cli_arguments(parser):
     parser.add_argument("--factor-selection-path", dest="factor_selection_path", help="factor_select 流程输出的 JSON 文件路径")
     parser.add_argument("--stability-analysis-path", dest="stability_analysis_path", help="single_factor_stability_analysis 流程输出的 JSON 文件路径")
@@ -125,33 +129,35 @@ def add_research_subparsers(subparsers):
     add_common_cli_arguments(common_parent)
     factor_selection_parent = argparse.ArgumentParser(add_help=False)
     add_factor_selection_cli_arguments(factor_selection_parent)
+    ic_aggregation_parent = argparse.ArgumentParser(add_help=False)
+    add_ic_aggregation_cli_arguments(ic_aggregation_parent)
     io_parent = argparse.ArgumentParser(add_help=False)
     add_research_io_cli_arguments(io_parent)
 
     factor_select_parser = subparsers.add_parser(
         "factor-select",
-        parents=[common_parent, factor_selection_parent],
+        parents=[common_parent, factor_selection_parent, ic_aggregation_parent],
         help="流程 1 因子筛选",
     )
     factor_select_parser.set_defaults(command_group="research", command_name="factor-select")
 
     stability_parser = subparsers.add_parser(
         "stability",
-        parents=[io_parent],
+        parents=[io_parent, ic_aggregation_parent],
         help="流程 2 单因子稳定性分析",
     )
     stability_parser.set_defaults(command_group="research", command_name="stability")
 
     dedup_parser = subparsers.add_parser(
         "dedup",
-        parents=[io_parent],
+        parents=[io_parent, ic_aggregation_parent],
         help="流程 3 去冗余与组合选择",
     )
     dedup_parser.set_defaults(command_group="research", command_name="dedup")
 
     combination_parser = subparsers.add_parser(
         "combination",
-        parents=[io_parent],
+        parents=[io_parent, ic_aggregation_parent],
         help="流程 4 因子组合与权重微调",
     )
     combination_parser.set_defaults(command_group="research", command_name="combination")
@@ -271,6 +277,8 @@ def build_research_command_override(args, command_name):
         override["train_min_spearman_ic"] = float(args.train_min_spearman_ic)
     if args.train_min_spearman_icir is not None:
         override["train_min_spearman_icir"] = float(args.train_min_spearman_icir)
+    if bool(getattr(args, "ic_exp_weighted", False)):
+        override["ic_aggregation_mode"] = "exp_weighted"
     if args.factor_selection_path is not None:
         override["factor_selection_path"] = str(args.factor_selection_path)
     if args.stability_analysis_path is not None:
@@ -293,6 +301,7 @@ def build_arg_parser():
     add_optimization_cli_arguments(parser)
     add_walk_forward_cli_arguments(parser)
     add_factor_selection_cli_arguments(parser)
+    add_ic_aggregation_cli_arguments(parser)
     add_research_io_cli_arguments(parser)
     root_subparsers = parser.add_subparsers(dest="command_group")
     backtest_parser = root_subparsers.add_parser("backtest", help="回测与优化命令组")

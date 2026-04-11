@@ -1,13 +1,86 @@
 import json
+import random
+import string
 from datetime import datetime
 from pathlib import Path
+
+PATH_CODE_LENGTH = 5
+PATH_CODE_ALPHABET = string.digits + string.ascii_lowercase + string.ascii_uppercase
+DEFAULT_PATH_CODE = "0" * PATH_CODE_LENGTH
+
+
+def is_valid_path_code(path_code):
+    path_code = str(path_code)
+    if len(path_code) != PATH_CODE_LENGTH:
+        return False
+    return all(char in PATH_CODE_ALPHABET for char in path_code)
+
+
+def extract_path_code_from_path(path_value):
+    if path_value is None:
+        return None
+    path_obj = Path(path_value)
+    stem_part_list = path_obj.stem.split("_")
+    if len(stem_part_list) == 0:
+        return None
+    candidate_code = str(stem_part_list[-1]).strip()
+    if is_valid_path_code(candidate_code):
+        return candidate_code
+    return None
+
+
+def resolve_input_path_code(input_payload, input_path=None):
+    if isinstance(input_payload, dict):
+        payload_path_code = input_payload.get("path_code")
+        if is_valid_path_code(payload_path_code):
+            return str(payload_path_code)
+    extracted_from_input_path = extract_path_code_from_path(input_path)
+    if extracted_from_input_path is not None:
+        return extracted_from_input_path
+    return DEFAULT_PATH_CODE
+
+
+def build_stage_output_path(output_dir, output_prefix, fund_code, date_str, path_code):
+    return output_dir / f"{output_prefix}_{str(fund_code).zfill(6)}_{date_str}_{path_code}.json"
+
+
+def allocate_stage_output_path(output_dir, output_prefix, fund_code, stage_index, inherited_path_code):
+    if stage_index < 0 or stage_index >= PATH_CODE_LENGTH:
+        raise ValueError(f"stage_index 超出范围: {stage_index}")
+    if not is_valid_path_code(inherited_path_code):
+        inherited_path_code = DEFAULT_PATH_CODE
+    base_char_list = list(str(inherited_path_code))
+    # 保持上游流程编码并清空下游编码，确保同一阶段重跑只改当前位。
+    for idx in range(stage_index + 1, PATH_CODE_LENGTH):
+        base_char_list[idx] = "0"
+    date_str = datetime.today().strftime("%Y-%m-%d")
+    max_attempt = max(256, len(PATH_CODE_ALPHABET) * 4)
+    for _ in range(max_attempt):
+        base_char_list[stage_index] = random.choice(PATH_CODE_ALPHABET)
+        path_code = "".join(base_char_list)
+        output_path = build_stage_output_path(
+            output_dir=output_dir,
+            output_prefix=output_prefix,
+            fund_code=fund_code,
+            date_str=date_str,
+            path_code=path_code,
+        )
+        if not output_path.exists():
+            return output_path, path_code
+    raise RuntimeError(f"{output_prefix} 无法分配不重复的 path_code。")
 
 
 def save_factor_selection_table(factor_selection_output, output_dir, fund_code):
     output_dir.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.today().strftime("%Y-%m-%d")
-    output_path = output_dir / f"factor_selection_{str(fund_code).zfill(6)}_{date_str}.json"
+    output_path, path_code = allocate_stage_output_path(
+        output_dir=output_dir,
+        output_prefix="factor_selection",
+        fund_code=fund_code,
+        stage_index=0,
+        inherited_path_code=DEFAULT_PATH_CODE,
+    )
     payload = {
+        "path_code": path_code,
         "factor_selection_output": factor_selection_output,
     }
     with output_path.open("w", encoding="utf-8") as output_file:
@@ -79,14 +152,24 @@ def resolve_fund_code_from_factor_selection_input(factor_selection_input, factor
     return resolve_fund_code_from_factor_selection_path(factor_selection_path)
 
 
-def save_single_factor_stability_analysis_output(factor_selection_input, stability_analysis_output, output_dir, fund_code):
+def save_single_factor_stability_analysis_output(factor_selection_input, resolved_factor_selection_path, stability_analysis_output, output_dir, fund_code):
     output_dir.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.today().strftime("%Y-%m-%d")
-    output_path = output_dir / f"single_factor_stability_{str(fund_code).zfill(6)}_{date_str}.json"
+    inherited_path_code = resolve_input_path_code(
+        input_payload=factor_selection_input,
+        input_path=resolved_factor_selection_path,
+    )
+    output_path, path_code = allocate_stage_output_path(
+        output_dir=output_dir,
+        output_prefix="single_factor_stability",
+        fund_code=fund_code,
+        stage_index=1,
+        inherited_path_code=inherited_path_code,
+    )
     factor_selection_output = dict(factor_selection_input.get("factor_selection_output", {}))
     payload = {
+        "path_code": path_code,
         "input_ref": {
-            "factor_selection_path": str(output_dir / f"factor_selection_{str(fund_code).zfill(6)}_{date_str}.json"),
+            "factor_selection_path": str(resolved_factor_selection_path),
             "fund_code": str(factor_selection_output.get("fund_code", str(fund_code).zfill(6))),
         },
         "stability_analysis_output": stability_analysis_output,
@@ -128,9 +211,19 @@ def resolve_fund_code_from_stability_analysis_input(stability_analysis_input, st
 
 def save_factor_combination_output(dedup_selection_input, factor_combination_output, output_dir, fund_code):
     output_dir.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.today().strftime("%Y-%m-%d")
-    output_path = output_dir / f"factor_combination_{str(fund_code).zfill(6)}_{date_str}.json"
+    inherited_path_code = resolve_input_path_code(
+        input_payload=dedup_selection_input,
+        input_path=factor_combination_output.get("dedup_selection_path"),
+    )
+    output_path, path_code = allocate_stage_output_path(
+        output_dir=output_dir,
+        output_prefix="factor_combination",
+        fund_code=fund_code,
+        stage_index=3,
+        inherited_path_code=inherited_path_code,
+    )
     payload = {
+        "path_code": path_code,
         "input_ref": {
             "dedup_selection_path": str(factor_combination_output.get("dedup_selection_path", "")),
             "fund_code": str(factor_combination_output.get("fund_code", str(fund_code).zfill(6))),
@@ -186,9 +279,19 @@ def resolve_fund_code_from_factor_combination_input(factor_combination_input, fa
 
 def save_strategy_backtest_output(factor_combination_input, strategy_backtest_output, output_dir, fund_code):
     output_dir.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.today().strftime("%Y-%m-%d")
-    output_path = output_dir / f"strategy_backtest_{str(fund_code).zfill(6)}_{date_str}.json"
+    inherited_path_code = resolve_input_path_code(
+        input_payload=factor_combination_input,
+        input_path=strategy_backtest_output.get("factor_combination_path"),
+    )
+    output_path, path_code = allocate_stage_output_path(
+        output_dir=output_dir,
+        output_prefix="strategy_backtest",
+        fund_code=fund_code,
+        stage_index=4,
+        inherited_path_code=inherited_path_code,
+    )
     payload = {
+        "path_code": path_code,
         "input_ref": {
             "factor_combination_path": str(strategy_backtest_output.get("factor_combination_path", "")),
             "fund_code": str(strategy_backtest_output.get("fund_code", str(fund_code).zfill(6))),
@@ -214,10 +317,20 @@ def print_strategy_backtest_summary(result):
 
 def save_single_factor_dedup_selection_output(stability_analysis_input, dedup_selection_output, output_dir, fund_code):
     output_dir.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.today().strftime("%Y-%m-%d")
-    output_path = output_dir / f"single_factor_dedup_{str(fund_code).zfill(6)}_{date_str}.json"
+    inherited_path_code = resolve_input_path_code(
+        input_payload=stability_analysis_input,
+        input_path=dedup_selection_output.get("stability_analysis_path"),
+    )
+    output_path, path_code = allocate_stage_output_path(
+        output_dir=output_dir,
+        output_prefix="single_factor_dedup",
+        fund_code=fund_code,
+        stage_index=2,
+        inherited_path_code=inherited_path_code,
+    )
     stability_analysis_output = dict(stability_analysis_input.get("stability_analysis_output", {}))
     payload = {
+        "path_code": path_code,
         "input_ref": {
             "stability_analysis_path": str(dedup_selection_output.get("stability_analysis_path", "")),
             "fund_code": str(stability_analysis_output.get("fund_code", str(fund_code).zfill(6))),

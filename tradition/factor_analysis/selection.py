@@ -13,17 +13,19 @@ from .common import (
     build_candidate_record_dict,
     build_factor_candidate_list,
     build_forward_return_series,
+    build_ic_aggregation_config,
     compute_segment_correlation_metrics,
     build_metric_summary,
     build_positive_ic_ratio,
+    build_spearman_metric_summary,
 )
 from .io import print_factor_selection_summary, save_factor_selection_table
 
 
-def build_factor_selection_record(factor_candidate, train_metric_list, valid_metric_list, threshold_config):
-    train_spearman_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list])
+def build_factor_selection_record(factor_candidate, train_metric_list, valid_metric_list, threshold_config, ic_aggregation_config):
+    train_spearman_summary = build_spearman_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list], ic_aggregation_config=ic_aggregation_config)
     train_pearson_summary = build_metric_summary([metric_dict["pearson_ic"] for metric_dict in train_metric_list])
-    valid_spearman_summary = build_metric_summary([metric_dict["spearman_ic"] for metric_dict in valid_metric_list])
+    valid_spearman_summary = build_spearman_metric_summary([metric_dict["spearman_ic"] for metric_dict in valid_metric_list], ic_aggregation_config=ic_aggregation_config)
     valid_pearson_summary = build_metric_summary([metric_dict["pearson_ic"] for metric_dict in valid_metric_list])
     train_spearman_positive_ic_ratio = build_positive_ic_ratio([metric_dict["spearman_ic"] for metric_dict in train_metric_list])
     valid_spearman_positive_ic_ratio = build_positive_ic_ratio([metric_dict["spearman_ic"] for metric_dict in valid_metric_list])
@@ -75,6 +77,7 @@ def run_factor_selection_single_fund(config_override=None):
         "train_min_spearman_ic": float(config.get("train_min_spearman_ic", 0.0)),
         "train_min_spearman_icir": float(config.get("train_min_spearman_icir", 0.0)),
     }
+    ic_aggregation_config = build_ic_aggregation_config(config)
 
     raw_data = fetch_fund_data_with_cache(
         code_dict=config["code_dict"],
@@ -133,6 +136,7 @@ def run_factor_selection_single_fund(config_override=None):
                 train_metric_list=train_metric_list,
                 valid_metric_list=valid_metric_list,
                 threshold_config=threshold_config,
+                ic_aggregation_config=ic_aggregation_config,
             )
         )
 
@@ -157,6 +161,7 @@ def run_factor_selection_single_fund(config_override=None):
         "selected_factor_name_list": selected_summary_df["factor_name"].tolist(),
         "selected_candidate_label_list": selected_summary_df["candidate_label"].tolist(),
         "threshold_config": threshold_config,
+        "ic_aggregation_config": dict(ic_aggregation_config),
         "candidate_count": int(len(summary_df)),
         "selected_count": int(selected_mask.sum()),
         "record_dict": build_candidate_record_dict(

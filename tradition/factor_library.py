@@ -201,7 +201,7 @@ def build_factor_pool_dict():
     # 轻量因子库集中定义分类、参数和搜索范围，策略层只决定启用哪些因子。
     return {
         "momentum": {
-            "group": "趋势/动量",
+            "group": "趋势强度",
             "param_spec": {
                 "window": {"default": 40, "search_space": (10, 120, 5)},
             },

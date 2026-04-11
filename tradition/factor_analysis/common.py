@@ -56,6 +56,63 @@ def build_metric_summary(metric_value_list):
     }
 
 
+def build_ic_aggregation_config(config):
+    aggregation_mode = str(config.get("ic_aggregation_mode", "classic")).strip().lower()
+    if aggregation_mode not in {"classic", "exp_weighted"}:
+        raise ValueError(f"未支持的 ic_aggregation_mode: {aggregation_mode}")
+    half_life = float(config.get("ic_exp_weight_half_life", 3.0))
+    if aggregation_mode == "exp_weighted" and half_life <= 0.0:
+        raise ValueError(f"ic_exp_weight_half_life 必须大于 0，当前值为 {half_life}")
+    if half_life <= 0.0:
+        half_life = 3.0
+    return {
+        "mode": aggregation_mode,
+        "half_life": half_life,
+    }
+
+
+def build_exp_weighted_metric_summary(metric_value_list, half_life):
+    metric_series = pd.Series(metric_value_list, dtype=float).dropna()
+    if len(metric_series) == 0:
+        return {
+            "count": 0,
+            "mean": float("nan"),
+            "std": float("nan"),
+            "icir": 0.0,
+        }
+    half_life = float(half_life)
+    if half_life <= 0.0:
+        raise ValueError(f"half_life 必须大于 0，当前值为 {half_life}")
+    reverse_distance_array = np.arange(len(metric_series) - 1, -1, -1, dtype=float)
+    weight_array = np.power(0.5, reverse_distance_array / half_life)
+    weight_array = weight_array / weight_array.sum()
+    metric_value_array = metric_series.to_numpy(dtype=float)
+    metric_mean = float(np.sum(weight_array * metric_value_array))
+    metric_std = float(np.sqrt(np.sum(weight_array * np.square(metric_value_array - metric_mean))))
+    metric_icir = 0.0
+    if abs(metric_std) > 1e-12:
+        metric_icir = float(metric_mean / metric_std)
+    return {
+        "count": int(len(metric_series)),
+        "mean": metric_mean,
+        "std": metric_std,
+        "icir": metric_icir,
+    }
+
+
+def build_spearman_metric_summary(metric_value_list, ic_aggregation_config):
+    ic_aggregation_config = dict(ic_aggregation_config)
+    aggregation_mode = str(ic_aggregation_config["mode"])
+    if aggregation_mode == "classic":
+        return build_metric_summary(metric_value_list)
+    if aggregation_mode == "exp_weighted":
+        return build_exp_weighted_metric_summary(
+            metric_value_list=metric_value_list,
+            half_life=float(ic_aggregation_config["half_life"]),
+        )
+    raise ValueError(f"未支持的 Spearman 聚合模式: {aggregation_mode}")
+
+
 def build_positive_ic_ratio(metric_value_list):
     metric_series = pd.Series(metric_value_list, dtype=float).dropna()
     if len(metric_series) == 0:
@@ -260,7 +317,7 @@ def build_weighted_instance_combination_score(factor_candidate_list, factor_seri
     return factor_table, score_series
 
 
-def evaluate_single_factor_train_icir(factor_series, forward_return_series, fold_list):
+def evaluate_single_factor_train_icir(factor_series, forward_return_series, fold_list, ic_aggregation_config=None):
     train_metric_list = []
     for fold_dict in fold_list:
         train_metric_list.append(
@@ -270,4 +327,11 @@ def evaluate_single_factor_train_icir(factor_series, forward_return_series, fold
                 segment_index=fold_dict["train"].index,
             )
         )
-    return float(build_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list])["icir"])
+    if ic_aggregation_config is None:
+        ic_aggregation_config = {"mode": "classic", "half_life": 3.0}
+    return float(
+        build_spearman_metric_summary(
+            [metric_dict["spearman_ic"] for metric_dict in train_metric_list],
+            ic_aggregation_config=ic_aggregation_config,
+        )["icir"]
+    )

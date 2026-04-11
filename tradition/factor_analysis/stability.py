@@ -12,9 +12,11 @@ from tradition.splitter import build_walk_forward_fold_list
 from .common import (
     build_candidate_record_dict,
     build_forward_return_series,
+    build_ic_aggregation_config,
     build_ic_flip_count,
     build_metric_summary,
     build_positive_ic_ratio,
+    build_spearman_metric_summary,
     build_tail_reject_mask,
     build_trimmed_ic_mean,
     compute_segment_correlation_metrics,
@@ -27,11 +29,11 @@ from .io import (
 )
 
 
-def build_single_factor_stability_record(factor_candidate, train_metric_list, valid_metric_list):
+def build_single_factor_stability_record(factor_candidate, train_metric_list, valid_metric_list, ic_aggregation_config):
     train_spearman_value_list = [metric_dict["spearman_ic"] for metric_dict in train_metric_list]
     valid_spearman_value_list = [metric_dict["spearman_ic"] for metric_dict in valid_metric_list]
-    train_spearman_summary = build_metric_summary(train_spearman_value_list)
-    valid_spearman_summary = build_metric_summary(valid_spearman_value_list)
+    train_spearman_summary = build_spearman_metric_summary(train_spearman_value_list, ic_aggregation_config=ic_aggregation_config)
+    valid_spearman_summary = build_spearman_metric_summary(valid_spearman_value_list, ic_aggregation_config=ic_aggregation_config)
     train_trimmed_ic_mean = build_trimmed_ic_mean(train_spearman_value_list, trim_ratio=0.1)
     valid_trimmed_ic_mean = build_trimmed_ic_mean(valid_spearman_value_list, trim_ratio=0.1)
     return {
@@ -61,6 +63,7 @@ def build_single_factor_stability_record(factor_candidate, train_metric_list, va
 
 def run_single_factor_stability_analysis(config_override=None):
     config = build_tradition_config(config_override=config_override)
+    ic_aggregation_config = build_ic_aggregation_config(config)
     factor_selection_path = config.get("factor_selection_path")
     if factor_selection_path is None:
         raise ValueError("single_factor_stability_analysis 模式必须提供 factor_selection_path。")
@@ -125,6 +128,7 @@ def run_single_factor_stability_analysis(config_override=None):
                 factor_candidate=factor_candidate,
                 train_metric_list=train_metric_list,
                 valid_metric_list=valid_metric_list,
+                ic_aggregation_config=ic_aggregation_config,
             )
         )
 
@@ -160,6 +164,7 @@ def run_single_factor_stability_analysis(config_override=None):
         "selected_count": int(selected_mask.sum()),
         "tail_reject_candidate_label_list": summary_df.loc[~selected_mask, "candidate_label"].tolist(),
         "selected_candidate_label_list": selected_summary_df["candidate_label"].tolist(),
+        "ic_aggregation_config": dict(ic_aggregation_config),
         "record_dict": build_candidate_record_dict(
             summary_df=selected_summary_df,
             keep_field_list=[
@@ -176,6 +181,7 @@ def run_single_factor_stability_analysis(config_override=None):
     }
     summary_path = save_single_factor_stability_analysis_output(
         factor_selection_input=factor_selection_input,
+        resolved_factor_selection_path=resolved_factor_selection_path,
         stability_analysis_output=stability_analysis_output,
         output_dir=config["output_dir"],
         fund_code=fund_code,

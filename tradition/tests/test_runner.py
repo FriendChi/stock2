@@ -115,6 +115,19 @@ def test_build_cli_override_collects_factor_selection_args():
     assert override["train_min_spearman_icir"] == 0.2
 
 
+def test_build_cli_override_collects_ic_aggregation_args():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "research",
+            "factor-select",
+            "--ic-exp-weighted",
+        ]
+    )
+    override = runner.build_cli_override(args)
+    assert override["ic_aggregation_mode"] == "exp_weighted"
+
+
 def test_build_cli_override_collects_single_factor_stability_analysis_args():
     parser = runner.build_arg_parser()
     args = parser.parse_args(
