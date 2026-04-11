@@ -37,6 +37,8 @@ class FakeVectorbt:
 def test_build_cli_override_collects_strategy_params():
     parser = runner.build_arg_parser()
     args = parser.parse_args([
+        "backtest",
+        "single",
         "--fund-code",
         "123",
         "--strategy-name",
@@ -58,7 +60,7 @@ def test_build_cli_override_collects_strategy_params():
 
 def test_build_cli_override_collects_batch_codes():
     parser = runner.build_arg_parser()
-    args = parser.parse_args(["--batch-run", "--fund-codes", "7301,12832"])
+    args = parser.parse_args(["backtest", "batch", "--fund-codes", "7301,12832"])
     override = runner.build_cli_override(args)
     assert override["batch_run"] is True
     assert override["fund_code_list"] == ["007301", "012832"]
@@ -74,7 +76,7 @@ def test_build_cli_override_collects_compare_all_flag():
 
 def test_build_cli_override_collects_optimize_flag_and_trials():
     parser = runner.build_arg_parser()
-    args = parser.parse_args(["--optimize", "--n-trials", "12", "--fund-code", "7301"])
+    args = parser.parse_args(["backtest", "optimize", "--n-trials", "12", "--fund-code", "7301"])
     override = runner.build_cli_override(args)
     assert override["optimize"] is True
     assert override["optimization_config"]["n_trials"] == 12
@@ -83,7 +85,7 @@ def test_build_cli_override_collects_optimize_flag_and_trials():
 
 def test_build_cli_override_collects_walk_forward_config():
     parser = runner.build_arg_parser()
-    args = parser.parse_args(["--walk-forward", "--wf-window-size", "600", "--wf-step-size", "50"])
+    args = parser.parse_args(["backtest", "walk-forward", "--wf-window-size", "600", "--wf-step-size", "50"])
     override = runner.build_cli_override(args)
     assert override["walk_forward"] is True
     assert override["walk_forward_config"] == {"window_size": 600, "step_size": 50}
@@ -93,7 +95,8 @@ def test_build_cli_override_collects_factor_selection_args():
     parser = runner.build_arg_parser()
     args = parser.parse_args(
         [
-            "--factor-select",
+            "research",
+            "factor-select",
             "--fund-code",
             "7301",
             "--factor-groups",
@@ -116,7 +119,8 @@ def test_build_cli_override_collects_single_factor_stability_analysis_args():
     parser = runner.build_arg_parser()
     args = parser.parse_args(
         [
-            "--single-factor-stability-analysis",
+            "research",
+            "stability",
             "--factor-selection-path",
             "/tmp/factor_selection_007301_2026-04-05.json",
         ]
@@ -130,7 +134,8 @@ def test_build_cli_override_collects_single_factor_dedup_selection_args():
     parser = runner.build_arg_parser()
     args = parser.parse_args(
         [
-            "--single-factor-dedup-selection",
+            "research",
+            "dedup",
             "--stability-analysis-path",
             "/tmp/single_factor_stability_007301_2026-04-05.json",
             "--dedup-root-topk",
@@ -147,7 +152,8 @@ def test_build_cli_override_collects_factor_combination_args():
     parser = runner.build_arg_parser()
     args = parser.parse_args(
         [
-            "--factor-combination",
+            "research",
+            "combination",
             "--dedup-selection-path",
             "/tmp/single_factor_dedup_007301_2026-04-09.json",
         ]
@@ -161,7 +167,8 @@ def test_build_cli_override_collects_strategy_backtest_args():
     parser = runner.build_arg_parser()
     args = parser.parse_args(
         [
-            "--strategy-backtest",
+            "research",
+            "strategy-backtest",
             "--factor-combination-path",
             "/tmp/factor_combination_007301_2026-04-09.json",
         ]
@@ -169,6 +176,18 @@ def test_build_cli_override_collects_strategy_backtest_args():
     override = runner.build_cli_override(args)
     assert override["strategy_backtest"] is True
     assert override["factor_combination_path"] == "/tmp/factor_combination_007301_2026-04-09.json"
+
+
+def test_resolve_runner_command_supports_legacy_flags():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(["--single-factor-dedup-selection"])
+    assert runner.resolve_runner_command(args) == "research.dedup"
+
+
+def test_resolve_runner_command_supports_subcommands():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(["research", "combination"])
+    assert runner.resolve_runner_command(args) == "research.combination"
 
 
 def test_merge_strategy_params_overrides_single_strategy():

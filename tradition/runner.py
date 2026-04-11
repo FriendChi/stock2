@@ -30,39 +30,202 @@ def load_vectorbt_module():
     return vbt
 
 
-def build_cli_override(args):
-    # 命令行覆盖项只收敛到当前入门版需要的参数，避免入口层一次性暴露过多实验开关。
+def add_common_cli_arguments(parser):
+    parser.add_argument("--fund-code", dest="fund_code", help="目标基金代码，例如 007301")
+    parser.add_argument("--force-refresh", action="store_true", help="忽略当天缓存并重新拉取 AkShare 数据")
+    parser.add_argument("--init-cash", dest="init_cash", type=float, help="初始资金")
+    parser.add_argument("--fees", dest="fees", type=float, help="手续费率")
+
+
+def add_strategy_cli_arguments(parser):
+    parser.add_argument(
+        "--strategy-name",
+        dest="strategy_name",
+        choices=ALL_STRATEGY_NAME_LIST,
+        help="策略名称",
+    )
+    parser.add_argument("--ma-fast", dest="ma_fast", type=int, help="ma_cross 策略短均线窗口")
+    parser.add_argument("--ma-slow", dest="ma_slow", type=int, help="ma_cross 策略长均线窗口")
+    parser.add_argument("--momentum-window", dest="momentum_window", type=int, help="momentum 策略动量窗口")
+
+
+def add_optimization_cli_arguments(parser):
+    parser.add_argument("--n-trials", dest="n_trials", type=int, help="Optuna trial 数量")
+
+
+def add_walk_forward_cli_arguments(parser):
+    parser.add_argument("--wf-window-size", dest="wf_window_size", type=int, help="walk-forward 总窗口长度")
+    parser.add_argument("--wf-step-size", dest="wf_step_size", type=int, help="walk-forward 滚动步长")
+
+
+def add_factor_selection_cli_arguments(parser):
+    parser.add_argument("--factor-groups", dest="factor_groups", help="因子族名称列表，按因子库分组名输入，逗号分隔")
+    parser.add_argument("--train-min-spearman-ic", dest="train_min_spearman_ic", type=float, help="训练集 Spearman IC 最小阈值")
+    parser.add_argument("--train-min-spearman-icir", dest="train_min_spearman_icir", type=float, help="训练集 Spearman ICIR 最小阈值")
+
+
+def add_research_io_cli_arguments(parser):
+    parser.add_argument("--factor-selection-path", dest="factor_selection_path", help="factor_select 流程输出的 JSON 文件路径")
+    parser.add_argument("--stability-analysis-path", dest="stability_analysis_path", help="single_factor_stability_analysis 流程输出的 JSON 文件路径")
+    parser.add_argument("--dedup-root-topk", dest="dedup_root_topk", type=int, help="single_factor_dedup_selection 树形搜索使用的根节点数量，默认 3")
+    parser.add_argument("--dedup-selection-path", dest="dedup_selection_path", help="single_factor_dedup_selection 流程输出的 JSON 文件路径")
+    parser.add_argument("--factor-combination-path", dest="factor_combination_path", help="factor_combination 流程输出的 JSON 文件路径")
+
+
+def add_legacy_mode_arguments(parser):
+    parser.add_argument("--fund-codes", dest="fund_codes", help="批量模式下使用的基金代码列表，逗号分隔")
+    parser.add_argument("--batch-run", action="store_true", help="按基金池批量运行当前策略并输出汇总表")
+    parser.add_argument("--compare-all", action="store_true", help="对单只基金运行全部策略并输出对比表")
+    parser.add_argument("--optimize", action="store_true", help="对单只基金执行训练/验证/测试切分后的 Optuna 参数优化")
+    parser.add_argument("--walk-forward", action="store_true", help="对单只基金执行固定窗口 walk-forward 参数优化")
+    parser.add_argument("--factor-select", action="store_true", help="对单只基金执行基于 walk-forward 的因子筛选与评估")
+    parser.add_argument("--single-factor-stability-analysis", action="store_true", help="读取 factor_select 结果并执行单因子稳定性分析")
+    parser.add_argument("--single-factor-dedup-selection", action="store_true", help="读取稳定性分析结果并执行去冗余与正向选择")
+    parser.add_argument("--factor-combination", action="store_true", help="读取 dedup 结果并执行因子组合方式对比与参数微调")
+    parser.add_argument("--strategy-backtest", action="store_true", help="读取 factor_combination 结果并执行连续仓位策略回测")
+
+
+def add_backtest_subparsers(subparsers):
+    common_parent = argparse.ArgumentParser(add_help=False)
+    add_common_cli_arguments(common_parent)
+    strategy_parent = argparse.ArgumentParser(add_help=False)
+    add_strategy_cli_arguments(strategy_parent)
+    optimization_parent = argparse.ArgumentParser(add_help=False)
+    add_optimization_cli_arguments(optimization_parent)
+    walk_forward_parent = argparse.ArgumentParser(add_help=False)
+    add_walk_forward_cli_arguments(walk_forward_parent)
+
+    single_parser = subparsers.add_parser("single", parents=[common_parent, strategy_parent], help="单基金回测")
+    single_parser.set_defaults(command_group="backtest", command_name="single")
+
+    batch_parser = subparsers.add_parser("batch", parents=[common_parent, strategy_parent], help="批量基金回测")
+    batch_parser.add_argument("--fund-codes", dest="fund_codes", help="批量模式下使用的基金代码列表，逗号分隔")
+    batch_parser.set_defaults(command_group="backtest", command_name="batch")
+
+    compare_parser = subparsers.add_parser("compare", parents=[common_parent], help="单基金多策略对比")
+    compare_parser.set_defaults(command_group="backtest", command_name="compare")
+
+    optimize_parser = subparsers.add_parser(
+        "optimize",
+        parents=[common_parent, strategy_parent, optimization_parent],
+        help="单基金参数优化",
+    )
+    optimize_parser.set_defaults(command_group="backtest", command_name="optimize")
+
+    walk_forward_parser = subparsers.add_parser(
+        "walk-forward",
+        parents=[common_parent, strategy_parent, optimization_parent, walk_forward_parent],
+        help="单基金 walk-forward 优化",
+    )
+    walk_forward_parser.set_defaults(command_group="backtest", command_name="walk-forward")
+
+
+def add_research_subparsers(subparsers):
+    common_parent = argparse.ArgumentParser(add_help=False)
+    add_common_cli_arguments(common_parent)
+    factor_selection_parent = argparse.ArgumentParser(add_help=False)
+    add_factor_selection_cli_arguments(factor_selection_parent)
+    io_parent = argparse.ArgumentParser(add_help=False)
+    add_research_io_cli_arguments(io_parent)
+
+    factor_select_parser = subparsers.add_parser(
+        "factor-select",
+        parents=[common_parent, factor_selection_parent],
+        help="流程 1 因子筛选",
+    )
+    factor_select_parser.set_defaults(command_group="research", command_name="factor-select")
+
+    stability_parser = subparsers.add_parser(
+        "stability",
+        parents=[io_parent],
+        help="流程 2 单因子稳定性分析",
+    )
+    stability_parser.set_defaults(command_group="research", command_name="stability")
+
+    dedup_parser = subparsers.add_parser(
+        "dedup",
+        parents=[io_parent],
+        help="流程 3 去冗余与组合选择",
+    )
+    dedup_parser.set_defaults(command_group="research", command_name="dedup")
+
+    combination_parser = subparsers.add_parser(
+        "combination",
+        parents=[io_parent],
+        help="流程 4 因子组合与权重微调",
+    )
+    combination_parser.set_defaults(command_group="research", command_name="combination")
+
+    strategy_backtest_parser = subparsers.add_parser(
+        "strategy-backtest",
+        parents=[io_parent],
+        help="流程 5 连续仓位策略回测",
+    )
+    strategy_backtest_parser.set_defaults(command_group="research", command_name="strategy-backtest")
+
+
+def resolve_legacy_cli_command(args):
+    if bool(getattr(args, "strategy_backtest", False)):
+        return "research.strategy-backtest"
+    if bool(getattr(args, "factor_combination", False)):
+        return "research.combination"
+    if bool(getattr(args, "single_factor_dedup_selection", False)):
+        return "research.dedup"
+    if bool(getattr(args, "single_factor_stability_analysis", False)):
+        return "research.stability"
+    if bool(getattr(args, "factor_select", False)):
+        return "research.factor-select"
+    if bool(getattr(args, "walk_forward", False)):
+        return "backtest.walk-forward"
+    if bool(getattr(args, "optimize", False)):
+        return "backtest.optimize"
+    if bool(getattr(args, "compare_all", False)):
+        return "backtest.compare"
+    if bool(getattr(args, "batch_run", False)):
+        return "backtest.batch"
+    return None
+
+
+def resolve_runner_command(args):
+    command_group = getattr(args, "command_group", None)
+    command_name = getattr(args, "command_name", None)
+    if command_group and command_name:
+        return f"{command_group}.{command_name}"
+    legacy_command_name = resolve_legacy_cli_command(args)
+    if legacy_command_name is not None:
+        return legacy_command_name
+    return "backtest.single"
+
+
+def build_common_cli_override(args):
     override = {}
     if args.fund_code is not None:
         override["default_fund_code"] = str(args.fund_code).zfill(6)
-    if args.fund_codes is not None:
+    if getattr(args, "fund_codes", None) is not None:
         override["fund_code_list"] = [str(code).strip().zfill(6) for code in str(args.fund_codes).split(",") if str(code).strip()]
-    if args.strategy_name is not None:
-        override["default_strategy_name"] = str(args.strategy_name).lower()
     if args.force_refresh:
         override["force_refresh"] = True
     if args.init_cash is not None:
         override["init_cash"] = float(args.init_cash)
     if args.fees is not None:
         override["fees"] = float(args.fees)
-    if args.batch_run:
+    return override
+
+
+def build_backtest_command_override(args, command_name):
+    override = {}
+    if args.fund_codes is not None:
+        override["fund_code_list"] = [str(code).strip().zfill(6) for code in str(args.fund_codes).split(",") if str(code).strip()]
+    if args.strategy_name is not None:
+        override["default_strategy_name"] = str(args.strategy_name).lower()
+    if command_name == "batch":
         override["batch_run"] = True
-    if args.compare_all:
+    if command_name == "compare":
         override["compare_all"] = True
-    if args.optimize:
+    if command_name == "optimize":
         override["optimize"] = True
-    if args.walk_forward:
+    if command_name == "walk-forward":
         override["walk_forward"] = True
-    if args.factor_select:
-        override["factor_select"] = True
-    if args.single_factor_stability_analysis:
-        override["single_factor_stability_analysis"] = True
-    if args.single_factor_dedup_selection:
-        override["single_factor_dedup_selection"] = True
-    if args.factor_combination:
-        override["factor_combination"] = True
-    if args.strategy_backtest:
-        override["strategy_backtest"] = True
 
     strategy_param_override = {}
     if args.ma_fast is not None:
@@ -86,6 +249,22 @@ def build_cli_override(args):
         walk_forward_override["step_size"] = int(args.wf_step_size)
     if len(walk_forward_override) > 0:
         override["walk_forward_config"] = walk_forward_override
+    return override
+
+
+def build_research_command_override(args, command_name):
+    override = {}
+    if command_name == "factor-select":
+        override["factor_select"] = True
+    elif command_name == "stability":
+        override["single_factor_stability_analysis"] = True
+    elif command_name == "dedup":
+        override["single_factor_dedup_selection"] = True
+    elif command_name == "combination":
+        override["factor_combination"] = True
+    elif command_name == "strategy-backtest":
+        override["strategy_backtest"] = True
+
     if args.factor_groups is not None:
         override["factor_group_list"] = [group_name.strip() for group_name in str(args.factor_groups).split(",") if group_name.strip()]
     if args.train_min_spearman_ic is not None:
@@ -106,43 +285,33 @@ def build_cli_override(args):
 
 
 def build_arg_parser():
-    # 第一阶段只开放单基金回测最需要的命令行参数，保持入口简单且可直接试验。
-    parser = argparse.ArgumentParser(description="运行 tradition 时序择时入门版单基金或批量回测")
-    parser.add_argument("--fund-code", dest="fund_code", help="目标基金代码，例如 007301")
-    parser.add_argument("--fund-codes", dest="fund_codes", help="批量模式下使用的基金代码列表，逗号分隔")
-    parser.add_argument(
-        "--strategy-name",
-        dest="strategy_name",
-        choices=ALL_STRATEGY_NAME_LIST,
-        help="策略名称",
-    )
-    parser.add_argument("--batch-run", action="store_true", help="按基金池批量运行当前策略并输出汇总表")
-    parser.add_argument("--compare-all", action="store_true", help="对单只基金运行全部策略并输出对比表")
-    parser.add_argument("--optimize", action="store_true", help="对单只基金执行训练/验证/测试切分后的 Optuna 参数优化")
-    parser.add_argument("--walk-forward", action="store_true", help="对单只基金执行固定窗口 walk-forward 参数优化")
-    parser.add_argument("--factor-select", action="store_true", help="对单只基金执行基于 walk-forward 的因子筛选与评估")
-    parser.add_argument("--single-factor-stability-analysis", action="store_true", help="读取 factor_select 结果并执行单因子稳定性分析")
-    parser.add_argument("--single-factor-dedup-selection", action="store_true", help="读取稳定性分析结果并执行去冗余与正向选择")
-    parser.add_argument("--factor-combination", action="store_true", help="读取 dedup 结果并执行因子组合方式对比与参数微调")
-    parser.add_argument("--strategy-backtest", action="store_true", help="读取 factor_combination 结果并执行连续仓位策略回测")
-    parser.add_argument("--force-refresh", action="store_true", help="忽略当天缓存并重新拉取 AkShare 数据")
-    parser.add_argument("--init-cash", dest="init_cash", type=float, help="初始资金")
-    parser.add_argument("--fees", dest="fees", type=float, help="手续费率")
-    parser.add_argument("--ma-fast", dest="ma_fast", type=int, help="ma_cross 策略短均线窗口")
-    parser.add_argument("--ma-slow", dest="ma_slow", type=int, help="ma_cross 策略长均线窗口")
-    parser.add_argument("--momentum-window", dest="momentum_window", type=int, help="momentum 策略动量窗口")
-    parser.add_argument("--n-trials", dest="n_trials", type=int, help="Optuna trial 数量")
-    parser.add_argument("--wf-window-size", dest="wf_window_size", type=int, help="walk-forward 总窗口长度")
-    parser.add_argument("--wf-step-size", dest="wf_step_size", type=int, help="walk-forward 滚动步长")
-    parser.add_argument("--factor-groups", dest="factor_groups", help="因子族名称列表，按因子库分组名输入，逗号分隔")
-    parser.add_argument("--train-min-spearman-ic", dest="train_min_spearman_ic", type=float, help="训练集 Spearman IC 最小阈值")
-    parser.add_argument("--train-min-spearman-icir", dest="train_min_spearman_icir", type=float, help="训练集 Spearman ICIR 最小阈值")
-    parser.add_argument("--factor-selection-path", dest="factor_selection_path", help="factor_select 流程输出的 JSON 文件路径")
-    parser.add_argument("--stability-analysis-path", dest="stability_analysis_path", help="single_factor_stability_analysis 流程输出的 JSON 文件路径")
-    parser.add_argument("--dedup-root-topk", dest="dedup_root_topk", type=int, help="single_factor_dedup_selection 树形搜索使用的根节点数量，默认 3")
-    parser.add_argument("--dedup-selection-path", dest="dedup_selection_path", help="single_factor_dedup_selection 流程输出的 JSON 文件路径")
-    parser.add_argument("--factor-combination-path", dest="factor_combination_path", help="factor_combination 流程输出的 JSON 文件路径")
+    # 命令行入口改为单入口加子命令分组，旧布尔参数仅保留兼容翻译层。
+    parser = argparse.ArgumentParser(description="运行 tradition 时序择时回测与研究流程")
+    add_legacy_mode_arguments(parser)
+    add_common_cli_arguments(parser)
+    add_strategy_cli_arguments(parser)
+    add_optimization_cli_arguments(parser)
+    add_walk_forward_cli_arguments(parser)
+    add_factor_selection_cli_arguments(parser)
+    add_research_io_cli_arguments(parser)
+    root_subparsers = parser.add_subparsers(dest="command_group")
+    backtest_parser = root_subparsers.add_parser("backtest", help="回测与优化命令组")
+    add_backtest_subparsers(backtest_parser.add_subparsers(dest="command_name"))
+    research_parser = root_subparsers.add_parser("research", help="研究流程命令组")
+    add_research_subparsers(research_parser.add_subparsers(dest="command_name"))
     return parser
+
+
+def build_cli_override(args):
+    # 命令行覆盖项按命令组拆分构造，减少入口层继续膨胀。
+    command_name = resolve_runner_command(args)
+    override = build_common_cli_override(args)
+    command_group, command_leaf = command_name.split(".", 1)
+    if command_group == "backtest":
+        override.update(build_backtest_command_override(args, command_leaf))
+    else:
+        override.update(build_research_command_override(args, command_leaf))
+    return override
 
 
 def merge_strategy_params(default_param_dict, override_param_dict=None):
@@ -903,10 +1072,29 @@ def print_run_summary(result):
     print("图像输出:", result["output_path"])
 
 
+def dispatch_runner_command(command_name, config_override):
+    dispatch_dict = {
+        "backtest.single": run_single_fund_strategy,
+        "backtest.batch": run_multi_fund_strategy,
+        "backtest.compare": run_compare_all_strategies,
+        "backtest.optimize": run_optimize_single_fund_strategy,
+        "backtest.walk-forward": run_walk_forward_single_fund_strategy,
+        "research.factor-select": run_factor_selection_single_fund,
+        "research.stability": run_single_factor_stability_analysis,
+        "research.dedup": run_single_factor_dedup_selection,
+        "research.combination": run_factor_combination,
+        "research.strategy-backtest": run_strategy_backtest,
+    }
+    if command_name not in dispatch_dict:
+        raise ValueError(f"未知命令: {command_name}")
+    return dispatch_dict[command_name](config_override=config_override)
+
+
 def main(argv=None):
-    # 命令行入口统一支持普通回测、优化、walk-forward、因子筛选、稳定性分析、去冗余选择、因子组合和独立策略回测模式。
+    # 命令行入口统一解析命令组、构造覆盖配置并通过分发表路由到对应流程。
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    command_name = resolve_runner_command(args)
     cli_override = build_cli_override(args)
     config_override = None
     if len(cli_override) > 0:
@@ -930,35 +1118,7 @@ def main(argv=None):
                 override_walk_forward_config=walk_forward_override,
             )
         config_override = base_config
-    mode_config = config_override or {}
-    if bool(mode_config.get("strategy_backtest", False)):
-        run_strategy_backtest(config_override=config_override)
-        return
-    if bool(mode_config.get("factor_combination", False)):
-        run_factor_combination(config_override=config_override)
-        return
-    if bool(mode_config.get("single_factor_dedup_selection", False)):
-        run_single_factor_dedup_selection(config_override=config_override)
-        return
-    if bool(mode_config.get("single_factor_stability_analysis", False)):
-        run_single_factor_stability_analysis(config_override=config_override)
-        return
-    if bool(mode_config.get("factor_select", False)):
-        run_factor_selection_single_fund(config_override=config_override)
-        return
-    if bool(mode_config.get("walk_forward", False)):
-        run_walk_forward_single_fund_strategy(config_override=config_override)
-        return
-    if bool(mode_config.get("optimize", False)):
-        run_optimize_single_fund_strategy(config_override=config_override)
-        return
-    if bool(mode_config.get("compare_all", False)):
-        run_compare_all_strategies(config_override=config_override)
-        return
-    if bool(mode_config.get("batch_run", False)):
-        run_multi_fund_strategy(config_override=config_override)
-        return
-    run_single_fund_strategy(config_override=config_override)
+    dispatch_runner_command(command_name=command_name, config_override=config_override)
 
 
 if __name__ == "__main__":
