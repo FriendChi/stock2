@@ -1,0 +1,200 @@
+# factor_analysis 流程说明
+
+`tradition/factor_analysis/` 目录承载一条按阶段推进的研究流水线。当前共包含 5 个主流程，前一阶段的输出作为后一阶段的输入，目标是从单因子筛选逐步收敛到最终可执行的连续仓位策略回测结果。
+
+## 流程 1：因子筛选
+
+入口函数：
+
+- `run_factor_selection_single_fund`
+
+所属模块：
+
+- `selection.py`
+
+作用：
+
+- 针对单只基金和给定因子族，生成参数化因子候选集合
+- 在训练集和验证集上做单因子 IC / ICIR 评估
+- 依据阈值规则筛出首轮可用因子
+
+输入：
+
+- 基金代码
+- 因子族列表
+- 单因子筛选阈值
+
+输出：
+
+- `factor_selection_*.json`
+
+说明：
+
+- 该阶段只解决“哪些单因子值得进入下一步”
+- 不处理稳定性、不处理相关性冗余、不处理组合权重
+
+## 流程 2：单因子稳定性分析
+
+入口函数：
+
+- `run_single_factor_stability_analysis`
+
+所属模块：
+
+- `stability.py`
+
+作用：
+
+- 读取流程 1 的筛选结果
+- 对入选单因子做稳定性评估
+- 根据训练/验证一致性、翻转情况、尾部剔除规则，进一步过滤不稳定因子
+
+输入：
+
+- `factor_selection_*.json`
+
+输出：
+
+- `single_factor_stability_*.json`
+
+说明：
+
+- 该阶段只解决“筛出来的单因子是否稳定”
+- 输出结果用于后续去冗余和组合搜索
+
+## 流程 3：去冗余与组合选择
+
+入口函数：
+
+- `run_single_factor_dedup_selection`
+
+所属模块：
+
+- `dedup.py`
+
+作用：
+
+- 读取流程 2 的稳定性分析结果
+- 对高相关因子做去冗余处理
+- 在训练集上执行树形前向搜索
+- 对前向选择结果做 Optuna 扩展搜索
+- 在验证集上确定最终组合来源和最终因子集合
+
+输入：
+
+- `single_factor_stability_*.json`
+
+输出：
+
+- `single_factor_dedup_*.json`
+
+说明：
+
+- 该阶段输出的是“最终因子集合”
+- 但还没有确定组合权重，也没有进入最终策略回测
+
+## 流程 4：因子组合与权重微调
+
+入口函数：
+
+- `run_factor_combination`
+
+所属模块：
+
+- `combination.py`
+
+作用：
+
+- 读取流程 3 的最终因子集合
+- 比较不同组合方式
+- 在选定方法基础上对组合权重做 Optuna 微调
+- 在验证集上选出最终权重方案
+
+输入：
+
+- `single_factor_dedup_*.json`
+
+输出：
+
+- `factor_combination_*.json`
+
+说明：
+
+- 该阶段固定因子集合，只优化组合权重
+- 输出结果是后续策略回测使用的最终因子权重配置
+
+## 流程 5：连续仓位策略回测
+
+入口函数：
+
+- `run_strategy_backtest`
+
+所属模块：
+
+- `backtest.py`
+
+作用：
+
+- 读取流程 4 的最终因子权重方案
+- 构建组合得分序列
+- 针对多个连续仓位函数分别进行参数搜索
+- 在训练集搜索、验证集定型、测试集比较
+- 输出最终策略回测结果和权益曲线图
+
+输入：
+
+- `factor_combination_*.json`
+
+输出：
+
+- `strategy_backtest_*.json`
+- `strategy_backtest_*.png`
+
+说明：
+
+- 该阶段是整条研究链路的最终落点
+- 输出的是最终连续仓位策略在 train / valid / test 上的回测结果
+
+## 流程关系
+
+五个流程的依赖顺序如下：
+
+1. 因子筛选
+2. 单因子稳定性分析
+3. 去冗余与组合选择
+4. 因子组合与权重微调
+5. 连续仓位策略回测
+
+对应的输入输出链路如下：
+
+1. `factor_selection_*.json`
+2. `single_factor_stability_*.json`
+3. `single_factor_dedup_*.json`
+4. `factor_combination_*.json`
+5. `strategy_backtest_*.json`
+
+## 使用建议
+
+- 若只想研究单因子质量，运行到流程 1 或流程 2 即可
+- 若想得到最终因子集合，运行到流程 3
+- 若想得到最终权重方案，运行到流程 4
+- 若想得到最终策略结果，运行到流程 5
+
+## 模块划分
+
+当前目录中的模块职责如下：
+
+- `common.py`
+  - 跨流程复用的公共工具函数
+- `selection.py`
+  - 流程 1
+- `stability.py`
+  - 流程 2
+- `dedup.py`
+  - 流程 3
+- `combination.py`
+  - 流程 4
+- `backtest.py`
+  - 流程 5
+- `io.py`
+  - 各流程的输入输出与摘要打印
