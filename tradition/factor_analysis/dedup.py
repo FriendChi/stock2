@@ -3,10 +3,7 @@ from itertools import combinations
 
 import pandas as pd
 
-from tradition.config import build_tradition_config, resolve_effective_code_dict
-from tradition.data_adapter import adapt_to_price_series
-from tradition.data_fetcher import fetch_fund_data_with_cache
-from tradition.data_loader import filter_single_fund, normalize_fund_data
+from tradition.config import build_tradition_config
 from tradition.factor_engine import build_single_factor_series
 from tradition.optimizer import load_optuna_module
 from tradition.splitter import build_walk_forward_dev_fold_list
@@ -16,6 +13,7 @@ from .common import (
     build_forward_return_series,
     build_ic_aggregation_config,
     build_instance_combination_score,
+    load_preprocess_price_series,
     build_metric_summary,
     build_spearman_metric_summary,
     compute_segment_correlation_metrics,
@@ -442,6 +440,8 @@ def run_optuna_extension_search(
 
 def run_single_factor_dedup_selection(config_override=None):
     config = build_tradition_config(config_override=config_override)
+    if bool(config.get("force_refresh", False)):
+        raise ValueError("dedup 流程禁止 --force-refresh，请先运行流程0 data-preprocess。")
     ic_aggregation_config = build_ic_aggregation_config(config)
     stability_analysis_path = config.get("stability_analysis_path")
     if stability_analysis_path is None:
@@ -462,16 +462,13 @@ def run_single_factor_dedup_selection(config_override=None):
         stability_analysis_input=stability_analysis_input,
         stability_analysis_path=resolved_stability_analysis_path,
     )
-
-    raw_data = fetch_fund_data_with_cache(
-        code_dict=resolve_effective_code_dict(config),
-        cache_dir=config["data_dir"],
-        force_refresh=bool(config["force_refresh"]),
-        cache_prefix=config["cache_prefix"],
+    preprocess_path = stability_analysis_output.get("preprocess_path")
+    if preprocess_path is None:
+        raise ValueError("stability 结果缺少 preprocess_path，请重新执行流程2。")
+    price_series, data_mode, _, resolved_preprocess_path = load_preprocess_price_series(
+        preprocess_path=preprocess_path,
+        expected_fund_code=fund_code,
     )
-    normalized_data = normalize_fund_data(raw_data)
-    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
-    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
     fold_list = build_walk_forward_dev_fold_list(
         price_series=price_series,
         walk_forward_config=dict(config["walk_forward_config"]),
@@ -547,6 +544,7 @@ def run_single_factor_dedup_selection(config_override=None):
 
     dedup_selection_output = {
         "fund_code": fund_code,
+        "preprocess_path": str(resolved_preprocess_path),
         "stability_analysis_path": str(resolved_stability_analysis_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
         "dedup_root_topk": dedup_root_topk,

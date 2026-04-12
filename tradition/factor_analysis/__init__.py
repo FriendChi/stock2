@@ -1,4 +1,4 @@
-from . import backtest, combination, common, dedup, io, selection, stability
+from . import backtest, combination, common, dedup, feature_preprocess, io, selection, stability
 from .backtest import (
     build_backtest_result,
     build_position_function_config_list,
@@ -55,14 +55,18 @@ from .dedup import (
     select_best_forward_path_summary,
     select_top_train_path_summary_list,
 )
+from .feature_preprocess import run_feature_preprocess_single_fund
 from .selection import build_factor_selection_record, run_factor_selection_single_fund
 from .stability import build_single_factor_stability_record, run_single_factor_stability_analysis
+
+run_data_preprocess_single_fund = run_feature_preprocess_single_fund
 
 __all__ = [
     "backtest",
     "combination",
     "common",
     "dedup",
+    "feature_preprocess",
     "io",
     "selection",
     "stability",
@@ -109,6 +113,8 @@ __all__ = [
     "resolve_factor_group_name",
     "run_factor_combination",
     "run_factor_combination_weight_tuning",
+    "run_data_preprocess_single_fund",
+    "run_feature_preprocess_single_fund",
     "run_factor_selection_single_fund",
     "run_optuna_extension_search",
     "run_position_function_search",

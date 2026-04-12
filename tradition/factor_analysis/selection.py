@@ -6,20 +6,20 @@ from tradition.config import build_tradition_config, resolve_effective_code_dict
 from tradition.data_adapter import adapt_to_price_series
 from tradition.data_fetcher import fetch_fund_data_with_cache
 from tradition.data_loader import filter_single_fund, normalize_fund_data
-from tradition.factor_engine import build_single_factor_series, resolve_factor_name_list_by_group
 from tradition.splitter import build_walk_forward_dev_fold_list
 
 from .common import (
     build_candidate_record_dict,
-    build_factor_candidate_list,
     build_forward_return_series,
     build_ic_aggregation_config,
+    load_feature_preprocess_bundle,
+    load_preprocess_price_series,
     compute_segment_correlation_metrics,
     build_metric_summary,
     build_positive_ic_ratio,
     build_spearman_metric_summary,
 )
-from .io import print_factor_selection_summary, save_factor_selection_table
+from .io import allocate_stage_csv_output_path, print_factor_selection_summary, save_factor_selection_table
 
 
 def build_factor_selection_record(factor_candidate, train_metric_list, valid_metric_list, threshold_config, ic_aggregation_config):
@@ -68,17 +68,9 @@ def build_factor_selection_record(factor_candidate, train_metric_list, valid_met
     }
 
 
-def run_factor_selection_single_fund(config_override=None):
+def run_data_preprocess_single_fund(config_override=None):
     config = build_tradition_config(config_override=config_override)
-    factor_group_list = list(config.get("factor_group_list", []))
-    if len(factor_group_list) == 0:
-        raise ValueError("factor_select 模式必须提供 factor_group_list。")
-    threshold_config = {
-        "train_min_spearman_ic": float(config.get("train_min_spearman_ic", 0.0)),
-        "train_min_spearman_icir": float(config.get("train_min_spearman_icir", 0.0)),
-    }
-    ic_aggregation_config = build_ic_aggregation_config(config)
-
+    fund_code = str(config["default_fund_code"]).zfill(6)
     raw_data = fetch_fund_data_with_cache(
         code_dict=resolve_effective_code_dict(config),
         cache_dir=config["data_dir"],
@@ -86,31 +78,88 @@ def run_factor_selection_single_fund(config_override=None):
         cache_prefix=config["cache_prefix"],
     )
     normalized_data = normalize_fund_data(raw_data)
-    fund_code = str(config["default_fund_code"]).zfill(6)
     fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
     price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
+    output_path, _ = allocate_stage_csv_output_path(
+        output_dir=config["output_dir"],
+        output_prefix="data_preprocess",
+        fund_code=fund_code,
+    )
+    preprocess_df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(price_series.index).strftime("%Y-%m-%d"),
+            "price": price_series.to_numpy(dtype=float),
+            "fund_code": fund_code,
+            "data_mode": str(data_mode),
+        }
+    )
+    preprocess_df.to_csv(output_path, index=False)
+    result = {
+        "fund_code": fund_code,
+        "data_mode": data_mode,
+        "record_count": int(len(preprocess_df)),
+        "summary_path": output_path,
+    }
+    print("数据预处理结果:")
+    print("基金代码:", result["fund_code"])
+    print("数据模式:", result["data_mode"])
+    print("记录数:", result["record_count"])
+    print("输出:", result["summary_path"])
+    return result
 
-    candidate_factor_name_list = resolve_factor_name_list_by_group(factor_group_list=factor_group_list)
+
+def run_factor_selection_single_fund(config_override=None):
+    config = build_tradition_config(config_override=config_override)
+    if bool(config.get("force_refresh", False)):
+        raise ValueError("factor_select 流程禁止 --force-refresh，请先运行流程0 data-preprocess。")
+    preprocess_path = config.get("preprocess_path")
+    if preprocess_path is None:
+        raise ValueError("factor_select 模式必须提供 preprocess_path（流程0输出）。")
+    preprocess_metadata_path = config.get("preprocess_metadata_path")
+    if preprocess_metadata_path is None:
+        raise ValueError("factor_select 模式必须提供 preprocess_metadata_path（流程0元信息输出）。")
+    threshold_config = {
+        "train_min_spearman_ic": float(config.get("train_min_spearman_ic", 0.0)),
+        "train_min_spearman_icir": float(config.get("train_min_spearman_icir", 0.0)),
+    }
+    ic_aggregation_config = build_ic_aggregation_config(config)
+
+    fund_code = str(config["default_fund_code"]).zfill(6)
+    feature_df, feature_preprocess_output, resolved_fund_code, resolved_preprocess_path, resolved_preprocess_metadata_path = load_feature_preprocess_bundle(
+        preprocess_path=preprocess_path,
+        preprocess_metadata_path=preprocess_metadata_path,
+        expected_fund_code=fund_code,
+    )
+    fund_code = resolved_fund_code
+    data_mode = str(feature_preprocess_output.get("data_mode", "feature_matrix"))
+    target_nav_column = str(feature_preprocess_output["target_nav_column"])
+    candidate_factor_name_list = [str(column) for column in list(feature_preprocess_output.get("factor_feature_column_list", []))]
+    if len(candidate_factor_name_list) == 0:
+        raise ValueError("流程0输出中不存在可用因子特征列。")
+    feature_df = feature_df.copy()
+    feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
+    feature_df = feature_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    feature_df = feature_df.set_index("date")
+    target_nav_series = pd.Series(feature_df[target_nav_column], copy=True).astype(float)
     fold_list = build_walk_forward_dev_fold_list(
-        price_series=price_series,
+        price_series=target_nav_series,
         walk_forward_config=dict(config["walk_forward_config"]),
         split_config=config["data_split_dict"],
     )
-    multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
-    candidate_factor_list = build_factor_candidate_list(
-        candidate_factor_name_list=candidate_factor_name_list,
-        strategy_params=multi_factor_params,
-    )
-    forward_return_series = build_forward_return_series(price_series=price_series, forward_window=5)
+    candidate_factor_list = [
+        {
+            "factor_name": str(candidate_label),
+            "factor_group": "factor_feature_zscore",
+            "param_dict": {},
+            "candidate_label": str(candidate_label),
+        }
+        for candidate_label in candidate_factor_name_list
+    ]
+    forward_return_series = build_forward_return_series(price_series=target_nav_series, forward_window=5)
 
     factor_record_list = []
     for factor_candidate in candidate_factor_list:
-        factor_series = build_single_factor_series(
-            price_series=price_series,
-            factor_name=factor_candidate["factor_name"],
-            strategy_params=multi_factor_params,
-            factor_param_override=factor_candidate["param_dict"],
-        )
+        factor_series = pd.Series(feature_df[str(factor_candidate["candidate_label"])], copy=True).astype(float)
 
         train_metric_list = []
         valid_metric_list = []
@@ -155,8 +204,11 @@ def run_factor_selection_single_fund(config_override=None):
     factor_selection_output = {
         "fund_code": fund_code,
         "data_mode": data_mode,
+        "preprocess_path": str(resolved_preprocess_path),
+        "preprocess_metadata_path": str(resolved_preprocess_metadata_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
-        "factor_group_list": factor_group_list,
+        "target_nav_column": target_nav_column,
+        "factor_group_list": [],
         "candidate_factor_name_list": candidate_factor_name_list,
         "selected_factor_name_list": selected_summary_df["factor_name"].tolist(),
         "selected_candidate_label_list": selected_summary_df["candidate_label"].tolist(),
@@ -179,11 +231,13 @@ def run_factor_selection_single_fund(config_override=None):
         factor_selection_output=factor_selection_output,
         output_dir=config["output_dir"],
         fund_code=fund_code,
+        inherited_path_code=feature_preprocess_output.get("path_code"),
+        stage_index=1,
     )
     result = {
         "fund_code": fund_code,
         "data_mode": data_mode,
-        "factor_group_list": factor_group_list,
+        "factor_group_list": [],
         "candidate_factor_name_list": candidate_factor_name_list,
         "candidate_factor_list": candidate_factor_list,
         "selected_factor_name_list": selected_summary_df["factor_name"].tolist(),

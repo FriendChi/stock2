@@ -3,16 +3,13 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from tradition.config import build_tradition_config, resolve_effective_code_dict
-from tradition.data_adapter import adapt_to_price_series
-from tradition.data_fetcher import fetch_fund_data_with_cache
-from tradition.data_loader import filter_single_fund, normalize_fund_data
+from tradition.config import build_tradition_config
 from tradition.factor_engine import build_single_factor_series
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.optimizer import load_optuna_module
 from tradition.splitter import build_walk_forward_dev_fold_list, split_time_series_by_ratio
 
-from .common import build_weighted_instance_combination_score
+from .common import build_weighted_instance_combination_score, load_preprocess_price_series
 from .io import (
     allocate_strategy_backtest_paths,
     load_factor_combination_input,
@@ -361,6 +358,8 @@ def run_position_function_search(position_function_config, score_series, fold_li
 
 def run_strategy_backtest(config_override=None):
     config = build_tradition_config(config_override=config_override)
+    if bool(config.get("force_refresh", False)):
+        raise ValueError("strategy-backtest 流程禁止 --force-refresh，请先运行流程0 data-preprocess。")
     factor_combination_path = config.get("factor_combination_path")
     if factor_combination_path is None:
         raise ValueError("strategy_backtest 模式必须提供 factor_combination_path。")
@@ -378,16 +377,13 @@ def run_strategy_backtest(config_override=None):
         factor_combination_input=factor_combination_input,
         factor_combination_path=resolved_factor_combination_path,
     )
-
-    raw_data = fetch_fund_data_with_cache(
-        code_dict=resolve_effective_code_dict(config),
-        cache_dir=config["data_dir"],
-        force_refresh=bool(config["force_refresh"]),
-        cache_prefix=config["cache_prefix"],
+    preprocess_path = factor_combination_output.get("preprocess_path")
+    if preprocess_path is None:
+        raise ValueError("factor_combination 结果缺少 preprocess_path，请重新执行流程4。")
+    price_series, data_mode, _, resolved_preprocess_path = load_preprocess_price_series(
+        preprocess_path=preprocess_path,
+        expected_fund_code=fund_code,
     )
-    normalized_data = normalize_fund_data(raw_data)
-    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
-    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
     split_dict = split_time_series_by_ratio(
         price_series=price_series,
         split_config=config["data_split_dict"],
@@ -482,6 +478,7 @@ def run_strategy_backtest(config_override=None):
     )
     strategy_backtest_output = {
         "fund_code": fund_code,
+        "preprocess_path": str(resolved_preprocess_path),
         "factor_combination_path": str(resolved_factor_combination_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
         "candidate_label_list": input_candidate_label_list,

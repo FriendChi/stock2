@@ -1,9 +1,6 @@
 from datetime import datetime
 
-from tradition.config import build_tradition_config, resolve_effective_code_dict
-from tradition.data_adapter import adapt_to_price_series
-from tradition.data_fetcher import fetch_fund_data_with_cache
-from tradition.data_loader import filter_single_fund, normalize_fund_data
+from tradition.config import build_tradition_config
 from tradition.factor_engine import build_single_factor_series
 from tradition.optimizer import load_optuna_module
 from tradition.splitter import build_walk_forward_dev_fold_list
@@ -11,6 +8,7 @@ from tradition.splitter import build_walk_forward_dev_fold_list
 from .common import (
     build_forward_return_series,
     build_ic_aggregation_config,
+    load_preprocess_price_series,
     build_metric_summary,
     build_spearman_metric_summary,
     build_weighted_instance_combination_score,
@@ -289,6 +287,8 @@ def run_factor_combination_weight_tuning(
 
 def run_factor_combination(config_override=None):
     config = build_tradition_config(config_override=config_override)
+    if bool(config.get("force_refresh", False)):
+        raise ValueError("combination 流程禁止 --force-refresh，请先运行流程0 data-preprocess。")
     ic_aggregation_config = build_ic_aggregation_config(config)
     dedup_selection_path = config.get("dedup_selection_path")
     if dedup_selection_path is None:
@@ -303,16 +303,13 @@ def run_factor_combination(config_override=None):
         dedup_selection_input=dedup_selection_input,
         dedup_selection_path=resolved_dedup_selection_path,
     )
-
-    raw_data = fetch_fund_data_with_cache(
-        code_dict=resolve_effective_code_dict(config),
-        cache_dir=config["data_dir"],
-        force_refresh=bool(config["force_refresh"]),
-        cache_prefix=config["cache_prefix"],
+    preprocess_path = dedup_selection_output.get("preprocess_path")
+    if preprocess_path is None:
+        raise ValueError("dedup 结果缺少 preprocess_path，请重新执行流程3。")
+    price_series, data_mode, _, resolved_preprocess_path = load_preprocess_price_series(
+        preprocess_path=preprocess_path,
+        expected_fund_code=fund_code,
     )
-    normalized_data = normalize_fund_data(raw_data)
-    fund_df = filter_single_fund(normalized_data, fund_code=fund_code)
-    price_series, data_mode = adapt_to_price_series(fund_df=fund_df)
     fold_list = build_walk_forward_dev_fold_list(
         price_series=price_series,
         walk_forward_config=dict(config["walk_forward_config"]),
@@ -397,6 +394,7 @@ def run_factor_combination(config_override=None):
     }
     factor_combination_output = {
         "fund_code": fund_code,
+        "preprocess_path": str(resolved_preprocess_path),
         "dedup_selection_path": str(resolved_dedup_selection_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
         "input_candidate_label_list": input_candidate_label_list,

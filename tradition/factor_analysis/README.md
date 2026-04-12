@@ -1,6 +1,43 @@
 # factor_analysis 流程说明
 
-`tradition/factor_analysis/` 目录承载一条按阶段推进的研究流水线。当前共包含 5 个主流程，前一阶段的输出作为后一阶段的输入，目标是从单因子筛选逐步收敛到最终可执行的连续仓位策略回测结果。
+`tradition/factor_analysis/` 目录承载一条按阶段推进的研究流水线。当前共包含 6 个主流程，前一阶段的输出作为后一阶段的输入，目标是从数据预处理与单因子筛选逐步收敛到最终可执行的连续仓位策略回测结果。
+
+## 流程 0：数据预处理
+
+入口函数：
+
+- `run_data_preprocess_single_fund`
+
+所属模块：
+
+- `selection.py`
+
+作用：
+
+- 下载或读取缓存基金数据
+- 执行标准化、单基金过滤和价格序列适配
+- 输出后续流程统一消费的预处理结果文件
+
+输入：
+
+- 基金代码
+- 是否强制刷新下载（`--force-refresh`）
+
+输出：
+
+- `data_preprocess_*.csv`
+
+说明：
+
+- 流程 1-5 强制依赖该输出
+- 只有流程 0 允许使用 `--force-refresh`
+
+对应指令：
+
+```bash
+python -m tradition.runner research data-preprocess \
+  --fund-code 007301 --force-refresh
+```
 
 ## 流程 1：因子筛选
 
@@ -20,7 +57,7 @@
 
 输入：
 
-- 基金代码
+- 流程 0 输出路径（`--preprocess-path`）
 - 因子族列表
 - 单因子筛选阈值
 
@@ -32,14 +69,15 @@
 
 - 该阶段只解决“哪些单因子值得进入下一步”
 - 不处理稳定性、不处理相关性冗余、不处理组合权重
+- 禁止 `--force-refresh`，数据来源必须是流程 0
 
 对应指令：
 
-- 从零开始执行流程 1：
+- 基于流程 0 输出执行：
 
 ```bash
 python -m tradition.runner research factor-select \
-  --fund-code 007301 \
+  --preprocess-path /home/chi/snap/stock2/tradition/outputs/data_preprocess_007301_2026-04-12_abc12.csv \
   --factor-groups "均线趋势,趋势强度,波动调整趋势" \
   --train-min-spearman-ic 0.0 \
   --train-min-spearman-icir 0.0 --ic-exp-weighted
@@ -212,36 +250,40 @@ python -m tradition.runner research strategy-backtest \
 
 ## 流程关系
 
-五个流程的依赖顺序如下：
+六个流程的依赖顺序如下：
 
-1. 因子筛选
-2. 单因子稳定性分析
-3. 去冗余与组合选择
-4. 因子组合与权重微调
-5. 连续仓位策略回测
+1. 数据预处理
+2. 因子筛选
+3. 单因子稳定性分析
+4. 去冗余与组合选择
+5. 因子组合与权重微调
+6. 连续仓位策略回测
 
 对应的输入输出链路如下：
 
-1. `factor_selection_*.json`
-2. `single_factor_stability_*.json`
-3. `single_factor_dedup_*.json`
-4. `factor_combination_*.json`
-5. `strategy_backtest_*.json`
+1. `data_preprocess_*.csv`
+2. `factor_selection_*.json`
+3. `single_factor_stability_*.json`
+4. `single_factor_dedup_*.json`
+5. `factor_combination_*.json`
+6. `strategy_backtest_*.json`
 
 按当前命令行入口，对应子命令如下：
 
-1. `python -m tradition.runner research factor-select`
-2. `python -m tradition.runner research stability`
-3. `python -m tradition.runner research dedup`
-4. `python -m tradition.runner research combination`
-5. `python -m tradition.runner research strategy-backtest`
+1. `python -m tradition.runner research data-preprocess`
+2. `python -m tradition.runner research factor-select`
+3. `python -m tradition.runner research stability`
+4. `python -m tradition.runner research dedup`
+5. `python -m tradition.runner research combination`
+6. `python -m tradition.runner research strategy-backtest`
 
 ## 使用建议
 
-- 若只想研究单因子质量，运行到流程 1 或流程 2 即可
-- 若想得到最终因子集合，运行到流程 3
-- 若想得到最终权重方案，运行到流程 4
-- 若想得到最终策略结果，运行到流程 5
+- 若只想完成数据准备，运行到流程 0
+- 若只想研究单因子质量，运行到流程 2 或流程 3 即可
+- 若想得到最终因子集合，运行到流程 4
+- 若想得到最终权重方案，运行到流程 5
+- 若想得到最终策略结果，运行到流程 6
 
 ## 模块划分
 

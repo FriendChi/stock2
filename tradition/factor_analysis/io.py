@@ -4,7 +4,7 @@ import string
 from datetime import datetime
 from pathlib import Path
 
-PATH_CODE_LENGTH = 5
+PATH_CODE_LENGTH = 6
 PATH_CODE_ALPHABET = string.digits + string.ascii_lowercase + string.ascii_uppercase
 DEFAULT_PATH_CODE = "0" * PATH_CODE_LENGTH
 
@@ -44,6 +44,29 @@ def build_stage_output_path(output_dir, output_prefix, fund_code, date_str, path
     return output_dir / f"{output_prefix}_{str(fund_code).zfill(6)}_{date_str}_{path_code}.json"
 
 
+def build_stage_csv_output_path(output_dir, output_prefix, fund_code, date_str, path_code):
+    return output_dir / f"{output_prefix}_{str(fund_code).zfill(6)}_{date_str}_{path_code}.csv"
+
+
+def build_stage_dual_output_paths(output_dir, output_prefix, fund_code, date_str, path_code):
+    return (
+        build_stage_csv_output_path(
+            output_dir=output_dir,
+            output_prefix=output_prefix,
+            fund_code=fund_code,
+            date_str=date_str,
+            path_code=path_code,
+        ),
+        build_stage_output_path(
+            output_dir=output_dir,
+            output_prefix=output_prefix,
+            fund_code=fund_code,
+            date_str=date_str,
+            path_code=path_code,
+        ),
+    )
+
+
 def allocate_stage_output_path(output_dir, output_prefix, fund_code, stage_index, inherited_path_code):
     if stage_index < 0 or stage_index >= PATH_CODE_LENGTH:
         raise ValueError(f"stage_index 超出范围: {stage_index}")
@@ -70,14 +93,52 @@ def allocate_stage_output_path(output_dir, output_prefix, fund_code, stage_index
     raise RuntimeError(f"{output_prefix} 无法分配不重复的 path_code。")
 
 
-def save_factor_selection_table(factor_selection_output, output_dir, fund_code):
+def allocate_stage_csv_output_path(output_dir, output_prefix, fund_code):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.today().strftime("%Y-%m-%d")
+    max_attempt = max(256, len(PATH_CODE_ALPHABET) * 4)
+    for _ in range(max_attempt):
+        path_code = "".join(random.choice(PATH_CODE_ALPHABET) for _ in range(PATH_CODE_LENGTH))
+        output_path = build_stage_csv_output_path(
+            output_dir=output_dir,
+            output_prefix=output_prefix,
+            fund_code=fund_code,
+            date_str=date_str,
+            path_code=path_code,
+        )
+        if not output_path.exists():
+            return output_path, path_code
+    raise RuntimeError(f"{output_prefix} 无法分配不重复的 path_code。")
+
+
+def allocate_stage_csv_json_output_path(output_dir, output_prefix, fund_code):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.today().strftime("%Y-%m-%d")
+    max_attempt = max(256, len(PATH_CODE_ALPHABET) * 4)
+    for _ in range(max_attempt):
+        path_code = "".join(random.choice(PATH_CODE_ALPHABET) for _ in range(PATH_CODE_LENGTH))
+        csv_path, json_path = build_stage_dual_output_paths(
+            output_dir=output_dir,
+            output_prefix=output_prefix,
+            fund_code=fund_code,
+            date_str=date_str,
+            path_code=path_code,
+        )
+        if not csv_path.exists() and not json_path.exists():
+            return csv_path, json_path, path_code
+    raise RuntimeError(f"{output_prefix} 无法分配不重复的 CSV/JSON path_code。")
+
+
+def save_factor_selection_table(factor_selection_output, output_dir, fund_code, inherited_path_code=None, stage_index=1):
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path, path_code = allocate_stage_output_path(
         output_dir=output_dir,
         output_prefix="factor_selection",
         fund_code=fund_code,
-        stage_index=0,
-        inherited_path_code=DEFAULT_PATH_CODE,
+        stage_index=int(stage_index),
+        inherited_path_code=inherited_path_code if inherited_path_code is not None else DEFAULT_PATH_CODE,
     )
     payload = {
         "path_code": path_code,

@@ -9,6 +9,7 @@ from tradition.data_fetcher import fetch_fund_data_with_cache, fetch_treasury_yi
 from tradition.data_loader import filter_single_fund, normalize_fund_data
 from tradition.factor_analysis import (
     run_factor_combination,
+    run_feature_preprocess_single_fund,
     run_factor_selection_single_fund,
     run_single_factor_dedup_selection,
     run_single_factor_stability_analysis,
@@ -59,6 +60,8 @@ def add_walk_forward_cli_arguments(parser):
 
 
 def add_factor_selection_cli_arguments(parser):
+    parser.add_argument("--preprocess-path", dest="preprocess_path", help="feature_preprocess 流程输出的 CSV 文件路径")
+    parser.add_argument("--preprocess-metadata-path", dest="preprocess_metadata_path", help="feature_preprocess 流程输出的 JSON 元信息路径")
     parser.add_argument("--factor-groups", dest="factor_groups", help="因子族名称列表，按因子库分组名输入，逗号分隔")
     parser.add_argument("--train-min-spearman-ic", dest="train_min_spearman_ic", type=float, help="训练集 Spearman IC 最小阈值")
     parser.add_argument("--train-min-spearman-icir", dest="train_min_spearman_icir", type=float, help="训练集 Spearman ICIR 最小阈值")
@@ -133,6 +136,13 @@ def add_research_subparsers(subparsers):
     add_ic_aggregation_cli_arguments(ic_aggregation_parent)
     io_parent = argparse.ArgumentParser(add_help=False)
     add_research_io_cli_arguments(io_parent)
+
+    data_preprocess_parser = subparsers.add_parser(
+        "data-preprocess",
+        parents=[common_parent],
+        help="流程 0 数据预处理",
+    )
+    data_preprocess_parser.set_defaults(command_group="research", command_name="data-preprocess")
 
     factor_select_parser = subparsers.add_parser(
         "factor-select",
@@ -260,7 +270,9 @@ def build_backtest_command_override(args, command_name):
 
 def build_research_command_override(args, command_name):
     override = {}
-    if command_name == "factor-select":
+    if command_name == "data-preprocess":
+        override["data_preprocess"] = True
+    elif command_name == "factor-select":
         override["factor_select"] = True
     elif command_name == "stability":
         override["single_factor_stability_analysis"] = True
@@ -277,6 +289,10 @@ def build_research_command_override(args, command_name):
         override["train_min_spearman_ic"] = float(args.train_min_spearman_ic)
     if args.train_min_spearman_icir is not None:
         override["train_min_spearman_icir"] = float(args.train_min_spearman_icir)
+    if args.preprocess_path is not None:
+        override["preprocess_path"] = str(args.preprocess_path)
+    if getattr(args, "preprocess_metadata_path", None) is not None:
+        override["preprocess_metadata_path"] = str(args.preprocess_metadata_path)
     if bool(getattr(args, "ic_exp_weighted", False)):
         override["ic_aggregation_mode"] = "exp_weighted"
     if args.factor_selection_path is not None:
@@ -1088,6 +1104,7 @@ def dispatch_runner_command(command_name, config_override):
         "backtest.compare": run_compare_all_strategies,
         "backtest.optimize": run_optimize_single_fund_strategy,
         "backtest.walk-forward": run_walk_forward_single_fund_strategy,
+        "research.data-preprocess": run_feature_preprocess_single_fund,
         "research.factor-select": run_factor_selection_single_fund,
         "research.stability": run_single_factor_stability_analysis,
         "research.dedup": run_single_factor_dedup_selection,

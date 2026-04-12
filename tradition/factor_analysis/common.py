@@ -1,7 +1,98 @@
+from pathlib import Path
+import json
+
 import numpy as np
 import pandas as pd
 
 from tradition.factor_engine import FACTOR_POOL_DICT, build_raw_factor_series, resolve_factor_name_list_by_group
+
+
+def load_preprocess_price_series(preprocess_path, expected_fund_code=None):
+    # 统一校验流程0输出结构并恢复价格序列，确保后续流程只消费预处理产物。
+    if preprocess_path is None:
+        raise ValueError("必须提供 preprocess_path。")
+    preprocess_path = Path(preprocess_path)
+    if not preprocess_path.exists():
+        raise FileNotFoundError(f"流程0数据预处理文件不存在: {preprocess_path}")
+    preprocess_df = pd.read_csv(preprocess_path, dtype={"fund_code": str})
+    required_column_list = ["date", "price", "fund_code", "data_mode"]
+    missing_column_list = [column for column in required_column_list if column not in preprocess_df.columns]
+    if len(missing_column_list) > 0:
+        raise ValueError(f"流程0数据预处理文件缺少字段: {missing_column_list}")
+    preprocess_df = preprocess_df[required_column_list].copy()
+    preprocess_df["date"] = pd.to_datetime(preprocess_df["date"], errors="coerce")
+    preprocess_df["price"] = pd.to_numeric(preprocess_df["price"], errors="coerce")
+    preprocess_df["fund_code"] = preprocess_df["fund_code"].astype(str).str.zfill(6)
+    preprocess_df["data_mode"] = preprocess_df["data_mode"].astype(str).str.strip()
+    preprocess_df = preprocess_df.dropna(subset=["date", "price"])
+    if len(preprocess_df) == 0:
+        raise ValueError(f"流程0数据预处理文件为空或无有效价格记录: {preprocess_path}")
+    fund_code_list = sorted(preprocess_df["fund_code"].dropna().unique().tolist())
+    if len(fund_code_list) != 1:
+        raise ValueError(f"流程0数据预处理文件基金代码不唯一: {preprocess_path}")
+    fund_code = str(fund_code_list[0]).zfill(6)
+    if expected_fund_code is not None and fund_code != str(expected_fund_code).zfill(6):
+        raise ValueError(f"流程0数据预处理文件基金代码不匹配: expected={str(expected_fund_code).zfill(6)} actual={fund_code}")
+    data_mode_list = [value for value in preprocess_df["data_mode"].dropna().unique().tolist() if len(str(value).strip()) > 0]
+    if len(data_mode_list) != 1:
+        raise ValueError(f"流程0数据预处理文件 data_mode 不唯一: {preprocess_path}")
+    data_mode = str(data_mode_list[0])
+    price_series = pd.Series(preprocess_df["price"].to_numpy(dtype=float), index=preprocess_df["date"], name="price")
+    price_series = price_series.sort_index()
+    price_series = price_series[~price_series.index.duplicated(keep="last")]
+    return price_series, data_mode, fund_code, preprocess_path
+
+
+def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, expected_fund_code=None):
+    # 新流程0输出必须同时提供 CSV 和元信息 JSON，流程1只消费这两者而不再重算因子。
+    if preprocess_path is None:
+        raise ValueError("必须提供 preprocess_path。")
+    if preprocess_metadata_path is None:
+        raise ValueError("必须提供 preprocess_metadata_path。")
+    preprocess_path = Path(preprocess_path)
+    preprocess_metadata_path = Path(preprocess_metadata_path)
+    if not preprocess_path.exists():
+        raise FileNotFoundError(f"流程0特征 CSV 不存在: {preprocess_path}")
+    if not preprocess_metadata_path.exists():
+        raise FileNotFoundError(f"流程0元信息 JSON 不存在: {preprocess_metadata_path}")
+    feature_df = pd.read_csv(preprocess_path)
+    with preprocess_metadata_path.open("r", encoding="utf-8") as input_file:
+        metadata_input = json.load(input_file)
+    if not isinstance(metadata_input, dict):
+        raise ValueError("流程0元信息 JSON 必须是顶层字典。")
+    feature_preprocess_output = metadata_input.get("feature_preprocess_output")
+    if not isinstance(feature_preprocess_output, dict):
+        raise ValueError("流程0元信息 JSON 缺少 feature_preprocess_output 子字典。")
+    fund_code = str(feature_preprocess_output.get("fund_code", "")).zfill(6)
+    if expected_fund_code is not None and fund_code != str(expected_fund_code).zfill(6):
+        raise ValueError(f"流程0元信息基金代码不匹配: expected={str(expected_fund_code).zfill(6)} actual={fund_code}")
+    csv_path_in_metadata = str(feature_preprocess_output.get("csv_path", "")).strip()
+    if len(csv_path_in_metadata) == 0:
+        raise ValueError("流程0元信息缺少 csv_path。")
+    if Path(csv_path_in_metadata).resolve() != preprocess_path.resolve():
+        raise ValueError("流程0元信息中的 csv_path 与传入 preprocess_path 不一致。")
+    required_column_list = ["date"]
+    missing_column_list = [column for column in required_column_list if column not in feature_df.columns]
+    if len(missing_column_list) > 0:
+        raise ValueError(f"流程0特征 CSV 缺少字段: {missing_column_list}")
+    target_nav_column = str(feature_preprocess_output.get("target_nav_column", "")).strip()
+    target_price_column = str(feature_preprocess_output.get("target_price_column", "")).strip()
+    factor_feature_column_list = [str(column) for column in list(feature_preprocess_output.get("factor_feature_column_list", []))]
+    if len(target_nav_column) == 0:
+        raise ValueError("流程0元信息缺少 target_nav_column。")
+    if target_nav_column not in feature_df.columns:
+        raise ValueError(f"target_nav_column 不存在于流程0特征 CSV: {target_nav_column}")
+    if len(target_price_column) == 0:
+        raise ValueError("流程0元信息缺少 target_price_column。")
+    if target_price_column not in feature_df.columns:
+        raise ValueError(f"target_price_column 不存在于流程0特征 CSV: {target_price_column}")
+    missing_factor_column_list = [column for column in factor_feature_column_list if column not in feature_df.columns]
+    if len(missing_factor_column_list) > 0:
+        raise ValueError(f"流程0元信息中的因子列不存在于 CSV: {missing_factor_column_list[:10]}")
+    feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
+    feature_df = feature_df.dropna(subset=["date"]).copy()
+    feature_df = feature_df.sort_values("date").reset_index(drop=True)
+    return feature_df, feature_preprocess_output, fund_code, preprocess_path, preprocess_metadata_path
 
 
 def build_forward_return_series(price_series, forward_window=5):
