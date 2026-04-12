@@ -2,3 +2,4 @@ tradition/outputs/
 data/
 __pycache__/
 *.pyc
+*.codex
