@@ -199,17 +199,19 @@ def test_build_corr_dedup_result_drops_global_worst_ten_percent_with_min_two_and
             for idx in range(20)
         ]
     )
-    monkeypatch.setattr(
-        factor_analysis.dedup,
-        "compute_pair_train_corr",
-        lambda left_factor_series, right_factor_series, fold_list: 0.95
-        if {str(left_factor_series.name), str(right_factor_series.name)} in [{"factor_19", "factor_18"}, {"factor_17", "factor_16"}]
-        else float("nan"),
-    )
     factor_series_dict = {
         f"factor_{idx:02d}": pd.Series([idx, idx + 1], name=f"factor_{idx:02d}", dtype=float)
         for idx in range(20)
     }
+    corr_matrix = np.full((20, 20), float("nan"), dtype=float)
+    np.fill_diagonal(corr_matrix, 1.0)
+    corr_matrix[19, 18] = corr_matrix[18, 19] = 0.95
+    corr_matrix[17, 16] = corr_matrix[16, 17] = 0.95
+    monkeypatch.setattr(
+        factor_analysis.dedup,
+        "_build_mean_train_corr_matrix",
+        lambda candidate_label_list, factor_series_dict, fold_list: corr_matrix,
+    )
     summary_df, dropped_candidate_label_list = factor_analysis.build_corr_dedup_result(
         selected_summary_df=selected_summary_df,
         factor_series_dict=factor_series_dict,
@@ -222,6 +224,43 @@ def test_build_corr_dedup_result_drops_global_worst_ten_percent_with_min_two_and
     assert bool(summary_df.loc[summary_df["candidate_label"] == "factor_19", "corr_dedup_selected"].iloc[0]) is False
     assert bool(summary_df.loc[summary_df["candidate_label"] == "factor_18", "corr_dedup_selected"].iloc[0]) is True
     assert bool(summary_df.loc[summary_df["candidate_label"] == "factor_17", "corr_dedup_selected"].iloc[0]) is False
+
+
+def test_build_mean_train_corr_matrix_matches_pairwise_fold_mean_with_pairwise_dropna():
+    sample_index = pd.date_range("2024-01-01", periods=6, freq="D")
+    factor_series_dict = {
+        "factor_a": pd.Series([1.0, 2.0, np.nan, 4.0, 5.0, 6.0], index=sample_index, dtype=float),
+        "factor_b": pd.Series([2.0, 4.0, 6.0, 8.0, np.nan, 12.0], index=sample_index, dtype=float),
+        "factor_c": pd.Series([1.0, np.nan, 1.5, 2.0, 2.5, 3.0], index=sample_index, dtype=float),
+    }
+    fold_list = [
+        {
+            "train": pd.Series([0, 1, 2, 3], index=sample_index[:4], dtype=float),
+        },
+        {
+            "train": pd.Series([0, 1, 2, 3], index=sample_index[2:], dtype=float),
+        },
+    ]
+
+    mean_train_corr_matrix = factor_analysis.dedup._build_mean_train_corr_matrix(
+        candidate_label_list=["factor_a", "factor_b", "factor_c"],
+        factor_series_dict=factor_series_dict,
+        fold_list=fold_list,
+    )
+    expected_ab = factor_analysis.compute_pair_train_corr(
+        left_factor_series=factor_series_dict["factor_a"],
+        right_factor_series=factor_series_dict["factor_b"],
+        fold_list=fold_list,
+    )
+    expected_ac = factor_analysis.compute_pair_train_corr(
+        left_factor_series=factor_series_dict["factor_a"],
+        right_factor_series=factor_series_dict["factor_c"],
+        fold_list=fold_list,
+    )
+
+    assert abs(float(mean_train_corr_matrix[0, 1]) - float(expected_ab)) < 1e-12
+    assert abs(float(mean_train_corr_matrix[0, 2]) - float(expected_ac)) < 1e-12
+    assert abs(float(mean_train_corr_matrix[1, 0]) - float(expected_ab)) < 1e-12
 
 
 def test_run_train_forward_selection_builds_tree_path_from_topk_singleton_roots(monkeypatch):
@@ -1065,7 +1104,17 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
         "build_forward_return_series",
         lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
     )
-    monkeypatch.setattr(factor_analysis.dedup, "compute_pair_train_corr", lambda left_factor_series, right_factor_series, fold_list: 0.2)
+    monkeypatch.setattr(
+        factor_analysis.dedup,
+        "_build_mean_train_corr_matrix",
+        lambda candidate_label_list, factor_series_dict, fold_list: np.array(
+            [
+                [1.0, 0.2],
+                [0.2, 1.0],
+            ],
+            dtype=float,
+        ),
+    )
 
     def fake_compute_segment_correlation_metrics(factor_series, forward_return_series, segment_index):
         segment_start = pd.Index(segment_index).min()

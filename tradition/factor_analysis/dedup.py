@@ -1,8 +1,11 @@
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path
+import sys
 
+import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from tradition.config import build_tradition_config
 from tradition.optimizer import load_optuna_module
@@ -67,6 +70,40 @@ def compute_pair_train_corr(left_factor_series, right_factor_series, fold_list):
     return float(pd.Series(corr_value_list, dtype=float).mean())
 
 
+def _build_mean_train_corr_matrix(candidate_label_list, factor_series_dict, fold_list):
+    factor_matrix_df = pd.concat(
+        [
+            pd.Series(factor_series_dict[str(candidate_label)], copy=True).rename(str(candidate_label))
+            for candidate_label in candidate_label_list
+        ],
+        axis=1,
+    )
+    factor_matrix_df = factor_matrix_df.reindex(columns=list(candidate_label_list))
+    pairwise_corr_sum_matrix = np.zeros((len(candidate_label_list), len(candidate_label_list)), dtype=float)
+    pairwise_corr_count_matrix = np.zeros((len(candidate_label_list), len(candidate_label_list)), dtype=int)
+
+    # 按 train fold 分别计算整张相关矩阵，再按当前流程3口径对各 fold 结果做简单均值。
+    for fold_dict in fold_list:
+        train_factor_df = factor_matrix_df.reindex(fold_dict["train"].index)
+        if len(train_factor_df) < 2:
+            continue
+        corr_df = train_factor_df.corr(method="pearson", min_periods=2).reindex(
+            index=list(candidate_label_list),
+            columns=list(candidate_label_list),
+        )
+        corr_matrix = corr_df.to_numpy(dtype=float, copy=False)
+        valid_mask = ~np.isnan(corr_matrix)
+        pairwise_corr_sum_matrix[valid_mask] += corr_matrix[valid_mask]
+        pairwise_corr_count_matrix[valid_mask] += 1
+
+    mean_train_corr_matrix = np.full((len(candidate_label_list), len(candidate_label_list)), float("nan"), dtype=float)
+    valid_pair_mask = pairwise_corr_count_matrix > 0
+    mean_train_corr_matrix[valid_pair_mask] = (
+        pairwise_corr_sum_matrix[valid_pair_mask] / pairwise_corr_count_matrix[valid_pair_mask]
+    )
+    return mean_train_corr_matrix
+
+
 def build_corr_dedup_result(selected_summary_df, factor_series_dict, fold_list, corr_threshold=0.90, drop_ratio=0.10, min_drop_count=2):
     summary_df = pd.DataFrame(selected_summary_df, copy=True).reset_index(drop=True)
     if len(summary_df) == 0:
@@ -80,27 +117,42 @@ def build_corr_dedup_result(selected_summary_df, factor_series_dict, fold_list, 
         str(record["candidate_label"]): record
         for record in summary_df.to_dict(orient="records")
     }
-
-    for left_label, right_label in combinations(summary_df["candidate_label"].tolist(), 2):
-        mean_train_corr = compute_pair_train_corr(
-            left_factor_series=factor_series_dict[str(left_label)],
-            right_factor_series=factor_series_dict[str(right_label)],
-            fold_list=fold_list,
-        )
-        if pd.isna(mean_train_corr):
-            continue
-        abs_mean_train_corr = abs(float(mean_train_corr))
-        for candidate_label in [str(left_label), str(right_label)]:
-            current_max_corr = mean_train_corr_max_dict[candidate_label]
-            if pd.isna(current_max_corr) or abs_mean_train_corr > float(current_max_corr):
-                mean_train_corr_max_dict[candidate_label] = abs_mean_train_corr
-        if abs_mean_train_corr < corr_threshold:
-            continue
-        weaker_candidate_label = choose_weaker_candidate(
-            left_record=record_by_label[str(left_label)],
-            right_record=record_by_label[str(right_label)],
-        )
-        loss_count_dict[weaker_candidate_label] += 1
+    candidate_label_list = [str(candidate_label) for candidate_label in summary_df["candidate_label"].tolist()]
+    mean_train_corr_matrix = _build_mean_train_corr_matrix(
+        candidate_label_list=candidate_label_list,
+        factor_series_dict=factor_series_dict,
+        fold_list=fold_list,
+    )
+    total_pair_count = int(len(candidate_label_list) * (len(candidate_label_list) - 1) // 2)
+    # 相关值已按 fold 聚合完毕，这里只做现有去冗余规则扫描，并增加终端进度条反馈。
+    progress_bar = tqdm(
+        total=total_pair_count,
+        desc="corr dedup",
+        unit="pair",
+        disable=not sys.stderr.isatty(),
+    )
+    try:
+        for left_index, right_index in combinations(range(len(candidate_label_list)), 2):
+            progress_bar.update(1)
+            left_label = candidate_label_list[left_index]
+            right_label = candidate_label_list[right_index]
+            mean_train_corr = mean_train_corr_matrix[left_index, right_index]
+            if pd.isna(mean_train_corr):
+                continue
+            abs_mean_train_corr = abs(float(mean_train_corr))
+            for candidate_label in [left_label, right_label]:
+                current_max_corr = mean_train_corr_max_dict[candidate_label]
+                if pd.isna(current_max_corr) or abs_mean_train_corr > float(current_max_corr):
+                    mean_train_corr_max_dict[candidate_label] = abs_mean_train_corr
+            if abs_mean_train_corr < corr_threshold:
+                continue
+            weaker_candidate_label = choose_weaker_candidate(
+                left_record=record_by_label[left_label],
+                right_record=record_by_label[right_label],
+            )
+            loss_count_dict[weaker_candidate_label] += 1
+    finally:
+        progress_bar.close()
 
     summary_df["corr_loss_count"] = summary_df["candidate_label"].map(loss_count_dict).astype(int)
     summary_df["mean_train_corr_max"] = summary_df["candidate_label"].map(mean_train_corr_max_dict)
@@ -234,41 +286,54 @@ def run_train_forward_selection(candidate_record_list, factor_series_dict, forwa
             }
         )
 
-    while len(frontier_node_list) > 0:
-        next_frontier_node_list = []
-        for frontier_node in frontier_node_list:
-            parent_candidate_list = list(frontier_node["candidate_record_list"])
-            parent_summary = dict(frontier_node["summary"])
-            parent_candidate_label_set = set(parent_summary["candidate_label_list"])
-            for candidate_record in sorted_candidate_record_list:
-                candidate_label = str(candidate_record["candidate_label"])
-                if candidate_label in parent_candidate_label_set:
-                    continue
-                child_candidate_list = parent_candidate_list + [dict(candidate_record)]
-                child_signature = build_candidate_label_signature([item["candidate_label"] for item in child_candidate_list])
-                if child_signature in path_summary_dict:
-                    continue
-                child_summary = evaluate_factor_candidate_subset(
-                    factor_candidate_list=child_candidate_list,
-                    factor_series_dict=factor_series_dict,
-                    forward_return_series=forward_return_series,
-                    fold_list=fold_list,
-                    include_valid=False,
-                    ic_aggregation_config=ic_aggregation_config,
-                )
-                child_summary["step"] = int(len(child_candidate_list))
-                if pd.isna(child_summary["train_spearman_icir"]) or pd.isna(parent_summary["train_spearman_icir"]):
-                    continue
-                if float(child_summary["train_spearman_icir"]) < float(parent_summary["train_spearman_icir"]):
-                    continue
-                path_summary_dict[child_signature] = child_summary
-                next_frontier_node_list.append(
-                    {
-                        "candidate_record_list": child_candidate_list,
-                        "summary": child_summary,
-                    }
-                )
-        frontier_node_list = next_frontier_node_list
+    progress_bar = tqdm(
+        total=0,
+        desc="forward search",
+        unit="candidate",
+        disable=not sys.stderr.isatty(),
+    )
+    try:
+        while len(frontier_node_list) > 0:
+            # 每一层都要拿 frontier 中每条路径去尝试全量候选扩展，因此总量按层动态补齐。
+            progress_bar.total += int(len(frontier_node_list) * len(sorted_candidate_record_list))
+            progress_bar.refresh()
+            next_frontier_node_list = []
+            for frontier_node in frontier_node_list:
+                parent_candidate_list = list(frontier_node["candidate_record_list"])
+                parent_summary = dict(frontier_node["summary"])
+                parent_candidate_label_set = set(parent_summary["candidate_label_list"])
+                for candidate_record in sorted_candidate_record_list:
+                    progress_bar.update(1)
+                    candidate_label = str(candidate_record["candidate_label"])
+                    if candidate_label in parent_candidate_label_set:
+                        continue
+                    child_candidate_list = parent_candidate_list + [dict(candidate_record)]
+                    child_signature = build_candidate_label_signature([item["candidate_label"] for item in child_candidate_list])
+                    if child_signature in path_summary_dict:
+                        continue
+                    child_summary = evaluate_factor_candidate_subset(
+                        factor_candidate_list=child_candidate_list,
+                        factor_series_dict=factor_series_dict,
+                        forward_return_series=forward_return_series,
+                        fold_list=fold_list,
+                        include_valid=False,
+                        ic_aggregation_config=ic_aggregation_config,
+                    )
+                    child_summary["step"] = int(len(child_candidate_list))
+                    if pd.isna(child_summary["train_spearman_icir"]) or pd.isna(parent_summary["train_spearman_icir"]):
+                        continue
+                    if float(child_summary["train_spearman_icir"]) < float(parent_summary["train_spearman_icir"]):
+                        continue
+                    path_summary_dict[child_signature] = child_summary
+                    next_frontier_node_list.append(
+                        {
+                            "candidate_record_list": child_candidate_list,
+                            "summary": child_summary,
+                        }
+                    )
+            frontier_node_list = next_frontier_node_list
+    finally:
+        progress_bar.close()
 
     path_summary_list = list(path_summary_dict.values())
     path_summary_list = sorted(
@@ -299,20 +364,34 @@ def select_top_train_path_summary_list(train_path_summary_list, top_ratio=0.5):
     return [dict(summary) for summary in sorted_path_summary_list[:top_count]]
 
 
-def evaluate_valid_for_path_summary_list(path_summary_list, candidate_record_lookup, factor_series_dict, forward_return_series, fold_list, ic_aggregation_config=None):
+def evaluate_valid_for_path_summary_list(path_summary_list, candidate_record_lookup, factor_series_dict, forward_return_series, fold_list, ic_aggregation_config=None, progress_desc=None):
     evaluated_summary_list = []
-    for path_summary in path_summary_list:
-        factor_candidate_list = [dict(candidate_record_lookup[candidate_label]) for candidate_label in path_summary["candidate_label_list"]]
-        evaluated_summary = evaluate_factor_candidate_subset(
-            factor_candidate_list=factor_candidate_list,
-            factor_series_dict=factor_series_dict,
-            forward_return_series=forward_return_series,
-            fold_list=fold_list,
-            include_valid=True,
-            ic_aggregation_config=ic_aggregation_config,
+    progress_bar = None
+    if progress_desc is not None:
+        progress_bar = tqdm(
+            total=len(path_summary_list),
+            desc=str(progress_desc),
+            unit="path",
+            disable=not sys.stderr.isatty(),
         )
-        evaluated_summary["step"] = int(path_summary["step"])
-        evaluated_summary_list.append(evaluated_summary)
+    try:
+        for path_summary in path_summary_list:
+            factor_candidate_list = [dict(candidate_record_lookup[candidate_label]) for candidate_label in path_summary["candidate_label_list"]]
+            evaluated_summary = evaluate_factor_candidate_subset(
+                factor_candidate_list=factor_candidate_list,
+                factor_series_dict=factor_series_dict,
+                forward_return_series=forward_return_series,
+                fold_list=fold_list,
+                include_valid=True,
+                ic_aggregation_config=ic_aggregation_config,
+            )
+            evaluated_summary["step"] = int(path_summary["step"])
+            evaluated_summary_list.append(evaluated_summary)
+            if progress_bar is not None:
+                progress_bar.update(1)
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
     return evaluated_summary_list
 
 
@@ -403,7 +482,19 @@ def run_optuna_extension_search(
         direction="maximize",
         sampler=optuna_module.samplers.TPESampler(seed=42),
     )
-    study.optimize(objective, n_trials=n_trials)
+    progress_bar = tqdm(
+        total=n_trials,
+        desc="optuna extension",
+        unit="trial",
+        disable=not sys.stderr.isatty(),
+    )
+    try:
+        def update_progress_bar(study, trial):
+            progress_bar.update(1)
+
+        study.optimize(objective, n_trials=n_trials, callbacks=[update_progress_bar])
+    finally:
+        progress_bar.close()
 
     train_improved_path_summary_list = sorted(
         train_improved_summary_dict.values(),
@@ -421,6 +512,7 @@ def run_optuna_extension_search(
         forward_return_series=forward_return_series,
         fold_list=fold_list,
         ic_aggregation_config=ic_aggregation_config,
+        progress_desc="optuna valid",
     )
     best_optuna_candidate_summary = select_best_forward_path_summary(valid_evaluated_summary_list)
     if best_optuna_candidate_summary is None:
@@ -541,6 +633,7 @@ def run_single_factor_dedup_selection(config_override=None):
         forward_return_series=forward_return_series,
         fold_list=fold_list,
         ic_aggregation_config=ic_aggregation_config,
+        progress_desc="forward valid",
     )
     best_forward_selection_summary = select_best_forward_path_summary(forward_selection_path_summary)
     if best_forward_selection_summary is None:
