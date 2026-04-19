@@ -6,6 +6,8 @@ import pandas as pd
 import pytest
 
 from tradition import factor_analysis
+from tradition.factor_analysis import feature_preprocess as factor_analysis_feature_preprocess
+from tradition.factor_analysis import io as factor_analysis_io
 
 
 def test_build_forward_return_series_uses_future_simple_return():
@@ -13,6 +15,107 @@ def test_build_forward_return_series_uses_future_simple_return():
     forward_return_series = factor_analysis.build_forward_return_series(price_series=price_series, forward_window=5)
     assert abs(float(forward_return_series.iloc[0]) - 0.61051) < 1e-12
     assert pd.isna(forward_return_series.iloc[-1])
+
+
+def test_allocate_stage_csv_json_output_path_only_uses_stage_zero_slot(tmp_path):
+    csv_path, json_path, path_code = factor_analysis_io.allocate_stage_csv_json_output_path(
+        output_dir=tmp_path,
+        output_prefix="feature_preprocess",
+        fund_code="007301",
+    )
+    assert csv_path.stem.split("_")[-1] == path_code
+    assert json_path.stem.split("_")[-1] == path_code
+    assert len(path_code) == factor_analysis_io.PATH_CODE_LENGTH
+    assert path_code[0] in factor_analysis_io.PATH_CODE_ALPHABET
+    assert path_code[1:] == "0" * (factor_analysis_io.PATH_CODE_LENGTH - 1)
+
+
+def test_append_flipped_factor_feature_columns_uses_train_metrics_and_writes_negative_series(monkeypatch, tmp_path):
+    checked_output_path = tmp_path / "feature_preprocess_checked.csv"
+    sample_index = pd.date_range("2024-01-01", periods=8, freq="D")
+    checked_feature_df = pd.DataFrame(
+        {
+            "date": sample_index,
+            "007301__price": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "007301__cumulative_nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "512480__price": [2.0 + idx * 0.02 for idx in range(len(sample_index))],
+            "512480__price__momentum(window=10)__zscore": [0.2, 0.1, -0.3, -0.2, 0.4, 0.1, -0.2, 0.3],
+            "512480__price__ma_slope(window=20,lookback=5)__zscore": [-0.1, 0.2, 0.4, 0.3, -0.2, 0.5, 0.6, -0.1],
+        }
+    )
+    checked_feature_df.to_csv(checked_output_path, index=False)
+    monkeypatch.setattr(
+        factor_analysis_feature_preprocess,
+        "build_walk_forward_dev_fold_list",
+        lambda price_series, walk_forward_config, split_config: [
+            {
+                "fold_id": 1,
+                "train": price_series.iloc[:4],
+                "valid": price_series.iloc[4:6],
+                "test": price_series.iloc[6:8],
+            },
+            {
+                "fold_id": 2,
+                "train": price_series.iloc[2:6],
+                "valid": price_series.iloc[6:7],
+                "test": price_series.iloc[7:8],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        factor_analysis_feature_preprocess,
+        "build_forward_return_series",
+        lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
+    )
+
+    def fake_compute_segment_correlation_metrics(factor_series, forward_return_series, segment_index):
+        if factor_series.name == "512480__price__momentum(window=10)__zscore":
+            return {"sample_size": len(segment_index), "spearman_ic": -0.4, "pearson_ic": -0.3}
+        return {"sample_size": len(segment_index), "spearman_ic": 0.2, "pearson_ic": 0.1}
+
+    monkeypatch.setattr(
+        factor_analysis_feature_preprocess,
+        "compute_segment_correlation_metrics",
+        fake_compute_segment_correlation_metrics,
+    )
+    updated_checked_df, _, flipped_factor_report_list = factor_analysis_feature_preprocess._append_flipped_factor_feature_columns(
+        checked_feature_df=checked_feature_df,
+        checked_output_path=checked_output_path,
+        source_column_list=["007301__price", "007301__cumulative_nav", "512480__price"],
+        fund_code="007301",
+        config={
+            "walk_forward_config": {
+                "window_size": 20,
+                "step_size": 5,
+                "min_fold_count": 2,
+            },
+            "data_split_dict": {
+                "train_ratio": 0.5,
+                "valid_ratio": 0.25,
+                "test_ratio": 0.25,
+                "min_segment_size": 2,
+            },
+            "ic_aggregation_mode": "classic",
+            "ic_exp_weight_half_life": 3.0,
+        },
+    )
+
+    flipped_column = "512480__price__-momentum(window=10)__zscore"
+    assert flipped_column in updated_checked_df.columns
+    assert "512480__price__-ma_slope(window=20,lookback=5)__zscore" not in updated_checked_df.columns
+    assert updated_checked_df[flipped_column].tolist() == (-checked_feature_df["512480__price__momentum(window=10)__zscore"]).tolist()
+    assert flipped_factor_report_list == [
+        {
+            "original_column": "512480__price__momentum(window=10)__zscore",
+            "flipped_column": flipped_column,
+            "train_spearman_ic_mean": -0.4,
+            "train_sample_fold_count": 2,
+            "positive_ic_count": 0,
+            "negative_ic_count": 2,
+        }
+    ]
+    saved_df = pd.read_csv(checked_output_path)
+    assert flipped_column in saved_df.columns
 
 
 def test_build_factor_candidate_list_expands_multi_param_combinations():
@@ -484,7 +587,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
         ),
     )
     monkeypatch.setattr(
-        factor_analysis,
+        factor_analysis.selection,
         "build_forward_return_series",
         lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
     )
@@ -531,22 +634,126 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
     assert saved_payload["factor_selection_output"]["record_dict"]["momentum(window=10)"]["factor_param_dict"] == {"window": 10}
 
 
-def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, tmp_path):
+def test_run_factor_selection_single_fund_supports_csv_path_from_metadata(monkeypatch, tmp_path):
+    feature_csv_path = tmp_path / "feature_preprocess_007301_2026-04-12_abcd0.csv"
+    metadata_json_path = tmp_path / "feature_preprocess_007301_2026-04-12_abcd0.json"
     sample_index = pd.date_range("2024-01-01", periods=30, freq="D")
-    sample_df = pd.DataFrame(
+    feature_df = pd.DataFrame(
         {
             "date": sample_index,
-            "code": ["007301"] * len(sample_index),
-            "fund": ["半导体"] * len(sample_index),
-            "nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "007301__price": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "007301__cumulative_nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "momentum(window=10)": list(range(len(sample_index))),
+            "momentum(window=15)": list(reversed(range(len(sample_index)))),
         }
     )
+    feature_df.to_csv(feature_csv_path, index=False)
+    metadata_json_path.write_text(
+        json.dumps(
+            {
+                "path_code": "abcd0",
+                "feature_preprocess_output": {
+                    "fund_code": "007301",
+                    "data_mode": "feature_matrix",
+                    "csv_path": str(feature_csv_path.resolve()),
+                    "target_nav_column": "007301__cumulative_nav",
+                    "target_price_column": "007301__price",
+                    "factor_feature_column_list": ["momentum(window=10)", "momentum(window=15)"],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        factor_analysis.selection,
+        "build_tradition_config",
+        lambda config_override=None: {
+            "default_fund_code": "007301",
+            "output_dir": tmp_path,
+            "force_refresh": False,
+            "strategy_param_dict": {
+                "multi_factor_score": {},
+            },
+            "walk_forward_config": {
+                "window_size": 20,
+                "step_size": 5,
+                "min_fold_count": 2,
+            },
+            "data_split_dict": {
+                "train_ratio": 0.5,
+                "valid_ratio": 0.25,
+                "test_ratio": 0.25,
+                "min_segment_size": 5,
+            },
+            "train_min_spearman_ic": 0.1,
+            "train_min_spearman_icir": 0.0,
+            "preprocess_metadata_path": str(metadata_json_path),
+            "preprocess_path": None,
+        },
+    )
+    monkeypatch.setattr(
+        factor_analysis.selection,
+        "build_walk_forward_dev_fold_list",
+        lambda price_series, walk_forward_config, split_config: [
+            {
+                "fold_id": 1,
+                "train": price_series.iloc[:10],
+                "valid": price_series.iloc[10:15],
+                "test": price_series.iloc[15:20],
+            },
+            {
+                "fold_id": 2,
+                "train": price_series.iloc[5:15],
+                "valid": price_series.iloc[15:20],
+                "test": price_series.iloc[20:25],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        factor_analysis.selection,
+        "build_forward_return_series",
+        lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
+    )
+
+    def fake_compute_segment_correlation_metrics(factor_series, forward_return_series, segment_index):
+        if factor_series.name == "momentum(window=10)":
+            return {"sample_size": len(segment_index), "spearman_ic": 0.4, "pearson_ic": 0.3}
+        return {"sample_size": len(segment_index), "spearman_ic": -0.1, "pearson_ic": -0.1}
+
+    monkeypatch.setattr(factor_analysis.selection, "compute_segment_correlation_metrics", fake_compute_segment_correlation_metrics)
+
+    result = factor_analysis.run_factor_selection_single_fund()
+
+    assert result["fund_code"] == "007301"
+    assert result["summary_path"].suffix == ".json"
+    saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
+    assert saved_payload["factor_selection_output"]["preprocess_path"] == str(feature_csv_path.resolve())
+    assert saved_payload["factor_selection_output"]["preprocess_metadata_path"] == str(metadata_json_path)
+
+
+def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, tmp_path):
+    sample_index = pd.date_range("2024-01-01", periods=30, freq="D")
+    feature_csv_path = tmp_path / "feature_preprocess_007301_2026-04-05_a00000_checked.csv"
+    pd.DataFrame(
+        {
+            "date": sample_index,
+            "007301__cumulative_nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "momentum(window=10)": [0.1 * idx for idx in range(len(sample_index))],
+            "momentum(window=15)": [0.2 * idx for idx in range(len(sample_index))],
+        }
+    ).to_csv(feature_csv_path, index=False)
     factor_selection_path = tmp_path / "factor_selection_007301_2026-04-05.json"
     factor_selection_path.write_text(
         json.dumps(
             {
+                "path_code": "a10000",
                 "factor_selection_output": {
                     "fund_code": "007301",
+                    "data_mode": "feature_matrix",
+                    "preprocess_path": str(feature_csv_path),
+                    "preprocess_metadata_path": str(tmp_path / "feature_preprocess_007301_2026-04-05_a00000.json"),
+                    "target_nav_column": "007301__cumulative_nav",
                     "record_dict": {
                         "momentum(window=10)": {
                             "factor_name": "momentum",
@@ -578,18 +785,6 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
             "output_dir": tmp_path,
             "force_refresh": False,
             "cache_prefix": "tradition_fund",
-            "strategy_param_dict": {
-                "multi_factor_score": {
-                    "enabled_factor_list": ["momentum"],
-                    "factor_param_dict": {
-                        "momentum": {"window": 20},
-                    },
-                    "score_window": 60,
-                    "factor_weight_dict": {
-                        "momentum": 1.0,
-                    },
-                }
-            },
             "walk_forward_config": {
                 "window_size": 20,
                 "step_size": 5,
@@ -603,17 +798,6 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
             },
             "factor_selection_path": str(factor_selection_path),
         },
-    )
-    monkeypatch.setattr(factor_analysis.stability, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis.stability, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis.stability, "filter_single_fund", lambda data, fund_code: data)
-    monkeypatch.setattr(
-        factor_analysis.stability,
-        "adapt_to_price_series",
-        lambda fund_df: (
-            pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
-            "nav_price_series",
-        ),
     )
     monkeypatch.setattr(
         factor_analysis.stability,
@@ -635,16 +819,6 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
     )
     monkeypatch.setattr(
         factor_analysis.stability,
-        "build_single_factor_series",
-        lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
-            range(len(price_series)),
-            index=price_series.index,
-            dtype=float,
-            name=factor_analysis.build_factor_candidate_label(factor_name=factor_name, factor_param_dict=factor_param_override or {}),
-        ),
-    )
-    monkeypatch.setattr(
-        factor_analysis,
         "build_forward_return_series",
         lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
     )
@@ -676,11 +850,16 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert saved_payload["input_ref"]["fund_code"] == "007301"
     assert saved_payload["input_ref"]["factor_selection_path"] == str(factor_selection_path)
-    assert len(saved_payload["path_code"]) == 5
-    assert str(saved_payload["path_code"]).isalnum()
+    assert len(saved_payload["path_code"]) == 6
+    assert saved_payload["path_code"][:2] == "a1"
+    assert saved_payload["path_code"][2] in factor_analysis_io.PATH_CODE_ALPHABET
+    assert saved_payload["path_code"][3:] == "000"
     assert result["summary_path"].stem.split("_")[-1] == saved_payload["path_code"]
     assert "stability_analysis_output" in saved_payload
     assert saved_payload["stability_analysis_output"]["fund_code"] == "007301"
+    assert saved_payload["stability_analysis_output"]["preprocess_path"] == str(feature_csv_path)
+    assert saved_payload["stability_analysis_output"]["preprocess_metadata_path"] == str(tmp_path / "feature_preprocess_007301_2026-04-05_a00000.json")
+    assert saved_payload["stability_analysis_output"]["target_nav_column"] == "007301__cumulative_nav"
     assert saved_payload["stability_analysis_output"]["candidate_count"] == 1
     assert saved_payload["stability_analysis_output"]["selected_count"] == 1
     assert saved_payload["stability_analysis_output"]["ic_aggregation_config"]["mode"] == "classic"
@@ -689,20 +868,25 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
 
 def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolute_gap_sort(monkeypatch, tmp_path):
     sample_index = pd.date_range("2024-01-01", periods=30, freq="D")
-    sample_df = pd.DataFrame(
+    feature_csv_path = tmp_path / "feature_preprocess_007301_2026-04-05_b00000_checked.csv"
+    pd.DataFrame(
         {
             "date": sample_index,
-            "code": ["007301"] * len(sample_index),
-            "fund": ["半导体"] * len(sample_index),
-            "nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "007301__cumulative_nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "momentum(window=10)": [0.1 * idx for idx in range(len(sample_index))],
+            "momentum(window=15)": [0.2 * idx for idx in range(len(sample_index))],
         }
-    )
+    ).to_csv(feature_csv_path, index=False)
     factor_selection_path = tmp_path / "renamed_selection_payload.json"
     factor_selection_path.write_text(
         json.dumps(
             {
+                "path_code": "b10000",
                 "factor_selection_output": {
                     "fund_code": "007301",
+                    "data_mode": "feature_matrix",
+                    "preprocess_path": str(feature_csv_path),
+                    "target_nav_column": "007301__cumulative_nav",
                     "record_dict": {
                         "momentum(window=10)": {
                             "factor_name": "momentum",
@@ -734,14 +918,6 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
             "output_dir": tmp_path,
             "force_refresh": False,
             "cache_prefix": "tradition_fund",
-            "strategy_param_dict": {
-                "multi_factor_score": {
-                    "enabled_factor_list": ["momentum"],
-                    "factor_param_dict": {"momentum": {"window": 20}},
-                    "score_window": 60,
-                    "factor_weight_dict": {"momentum": 1.0},
-                }
-            },
             "walk_forward_config": {
                 "window_size": 20,
                 "step_size": 5,
@@ -755,17 +931,6 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
             },
             "factor_selection_path": str(factor_selection_path),
         },
-    )
-    monkeypatch.setattr(factor_analysis.stability, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis.stability, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis.stability, "filter_single_fund", lambda data, fund_code: data)
-    monkeypatch.setattr(
-        factor_analysis.stability,
-        "adapt_to_price_series",
-        lambda fund_df: (
-            pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
-            "nav_price_series",
-        ),
     )
     monkeypatch.setattr(
         factor_analysis.stability,
@@ -787,19 +952,6 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
     )
     monkeypatch.setattr(
         factor_analysis.stability,
-        "build_single_factor_series",
-        lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
-            range(len(price_series)),
-            index=price_series.index,
-            dtype=float,
-            name=factor_analysis.build_factor_candidate_label(
-                factor_name=factor_name,
-                factor_param_dict=factor_param_override or {},
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        factor_analysis,
         "build_forward_return_series",
         lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
     )
@@ -825,25 +977,28 @@ def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolut
 
 def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_path):
     sample_index = pd.date_range("2024-01-01", periods=30, freq="D")
-    sample_df = pd.DataFrame(
+    feature_csv_path = tmp_path / "feature_preprocess_007301_2026-04-05_c00000_checked.csv"
+    pd.DataFrame(
         {
             "date": sample_index,
-            "code": ["007301"] * len(sample_index),
-            "fund": ["半导体"] * len(sample_index),
-            "nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "007301__cumulative_nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "momentum(window=10)": list(range(len(sample_index))),
+            "ma_slope(lookback=5, window=20)": list(reversed(range(len(sample_index)))),
         }
-    )
+    ).to_csv(feature_csv_path, index=False)
     stability_analysis_path = tmp_path / "single_factor_stability_007301_2026-04-05.json"
     stability_analysis_path.write_text(
         json.dumps(
             {
+                "path_code": "aB2000",
                 "stability_analysis_output": {
                     "fund_code": "007301",
+                    "data_mode": "feature_matrix",
+                    "preprocess_path": str(feature_csv_path),
+                    "preprocess_metadata_path": str(tmp_path / "feature_preprocess_007301_2026-04-05_c00000.json"),
+                    "target_nav_column": "007301__cumulative_nav",
                     "record_dict": {
                         "momentum(window=10)": {
-                            "factor_name": "momentum",
-                            "factor_group": "趋势/动量",
-                            "factor_param_dict": {"window": 10},
                             "candidate_label": "momentum(window=10)",
                             "train_spearman_icir": 0.8,
                             "valid_spearman_icir": 0.6,
@@ -851,9 +1006,6 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
                             "selected": True,
                         },
                         "ma_slope(lookback=5, window=20)": {
-                            "factor_name": "ma_slope",
-                            "factor_group": "均线趋势",
-                            "factor_param_dict": {"window": 20, "lookback": 5},
                             "candidate_label": "ma_slope(lookback=5, window=20)",
                             "train_spearman_icir": 0.7,
                             "valid_spearman_icir": 0.5,
@@ -876,17 +1028,6 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
             "output_dir": tmp_path,
             "force_refresh": False,
             "cache_prefix": "tradition_fund",
-            "strategy_param_dict": {
-                "multi_factor_score": {
-                    "enabled_factor_list": ["momentum", "ma_slope"],
-                    "factor_param_dict": {
-                        "momentum": {"window": 20},
-                        "ma_slope": {"window": 20, "lookback": 5},
-                    },
-                    "score_window": 60,
-                    "factor_weight_dict": {"momentum": 1.0, "ma_slope": 1.0},
-                }
-            },
             "walk_forward_config": {
                 "window_size": 20,
                 "step_size": 5,
@@ -900,17 +1041,6 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
             },
             "stability_analysis_path": str(stability_analysis_path),
         },
-    )
-    monkeypatch.setattr(factor_analysis.dedup, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis.dedup, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis.dedup, "filter_single_fund", lambda data, fund_code: data)
-    monkeypatch.setattr(
-        factor_analysis.dedup,
-        "adapt_to_price_series",
-        lambda fund_df: (
-            pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
-            "nav_price_series",
-        ),
     )
     monkeypatch.setattr(
         factor_analysis.dedup,
@@ -932,19 +1062,6 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     )
     monkeypatch.setattr(
         factor_analysis.dedup,
-        "build_single_factor_series",
-        lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
-            range(len(price_series)),
-            index=price_series.index,
-            dtype=float,
-            name=factor_analysis.build_factor_candidate_label(
-                factor_name=factor_name,
-                factor_param_dict=factor_param_override or {},
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        factor_analysis,
         "build_forward_return_series",
         lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
     )
@@ -982,10 +1099,15 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     assert result["summary_path"].exists()
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert saved_payload["input_ref"]["fund_code"] == "007301"
-    assert len(saved_payload["path_code"]) == 5
-    assert str(saved_payload["path_code"]).isalnum()
+    assert len(saved_payload["path_code"]) == 6
+    assert saved_payload["path_code"][:3] == "aB2"
+    assert saved_payload["path_code"][3] in factor_analysis_io.PATH_CODE_ALPHABET
+    assert saved_payload["path_code"][4:] == "00"
     assert result["summary_path"].stem.split("_")[-1] == saved_payload["path_code"]
     assert "dedup_selection_output" in saved_payload
+    assert saved_payload["dedup_selection_output"]["preprocess_path"] == str(feature_csv_path)
+    assert saved_payload["dedup_selection_output"]["preprocess_metadata_path"] == str(tmp_path / "feature_preprocess_007301_2026-04-05_c00000.json")
+    assert saved_payload["dedup_selection_output"]["target_nav_column"] == "007301__cumulative_nav"
     assert saved_payload["dedup_selection_output"]["train_path_count"] == 3
     assert saved_payload["dedup_selection_output"]["valid_eval_count"] == 1
     assert saved_payload["dedup_selection_output"]["valid_eval_ratio"] == 0.5
@@ -996,6 +1118,10 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     assert saved_payload["dedup_selection_output"]["final_selected_source"] == "forward_selection"
     assert saved_payload["dedup_selection_output"]["forward_selected_candidate_label_list"] == ["ma_slope(lookback=5, window=20)"]
     assert saved_payload["dedup_selection_output"]["best_final_selection_summary"]["candidate_label_list"] == ["ma_slope(lookback=5, window=20)"]
+    selected_record = saved_payload["dedup_selection_output"]["record_dict"]["ma_slope(lookback=5, window=20)"]
+    assert "factor_name" not in selected_record
+    assert "factor_param_dict" not in selected_record
+    assert "factor_group" not in selected_record
 
 
 def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):

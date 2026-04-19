@@ -1,10 +1,10 @@
 from datetime import datetime
 from itertools import combinations
+from pathlib import Path
 
 import pandas as pd
 
 from tradition.config import build_tradition_config
-from tradition.factor_engine import build_single_factor_series
 from tradition.optimizer import load_optuna_module
 from tradition.splitter import build_walk_forward_dev_fold_list
 
@@ -13,7 +13,6 @@ from .common import (
     build_forward_return_series,
     build_ic_aggregation_config,
     build_instance_combination_score,
-    load_preprocess_price_series,
     build_metric_summary,
     build_spearman_metric_summary,
     compute_segment_correlation_metrics,
@@ -170,6 +169,30 @@ def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, 
 
 def build_candidate_label_signature(candidate_label_list):
     return tuple(sorted([str(candidate_label) for candidate_label in candidate_label_list]))
+
+
+def load_selected_feature_matrix(stability_analysis_output, selected_stability_candidate_list):
+    preprocess_path = stability_analysis_output.get("preprocess_path")
+    if preprocess_path is None:
+        raise ValueError("stability 结果缺少 preprocess_path，请重新执行流程2。")
+    resolved_preprocess_path = Path(preprocess_path)
+    if not resolved_preprocess_path.exists():
+        raise FileNotFoundError(f"流程0特征 CSV 不存在: {resolved_preprocess_path}")
+    target_nav_column = str(stability_analysis_output.get("target_nav_column", "")).strip()
+    if len(target_nav_column) == 0:
+        raise ValueError("stability 结果缺少 target_nav_column，请重新执行流程2。")
+    selected_candidate_label_list = [str(record["candidate_label"]) for record in selected_stability_candidate_list]
+    feature_df = pd.read_csv(resolved_preprocess_path)
+    required_column_list = ["date", target_nav_column] + selected_candidate_label_list
+    missing_column_list = [column for column in required_column_list if column not in feature_df.columns]
+    if len(missing_column_list) > 0:
+        raise ValueError(f"流程0特征 CSV 缺少流程3必需列: {missing_column_list[:10]}")
+    # 流程3直接消费流程2筛出的特征列，不再按旧式因子定义重建时序。
+    feature_df = feature_df.copy()
+    feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
+    feature_df = feature_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    feature_df = feature_df.set_index("date")
+    return feature_df, target_nav_column, resolved_preprocess_path
 
 
 def run_train_forward_selection(candidate_record_list, factor_series_dict, forward_return_series, fold_list, root_topk=3, ic_aggregation_config=None):
@@ -462,29 +485,26 @@ def run_single_factor_dedup_selection(config_override=None):
         stability_analysis_input=stability_analysis_input,
         stability_analysis_path=resolved_stability_analysis_path,
     )
-    preprocess_path = stability_analysis_output.get("preprocess_path")
-    if preprocess_path is None:
-        raise ValueError("stability 结果缺少 preprocess_path，请重新执行流程2。")
-    price_series, data_mode, _, resolved_preprocess_path = load_preprocess_price_series(
-        preprocess_path=preprocess_path,
-        expected_fund_code=fund_code,
+    data_mode = str(stability_analysis_output.get("data_mode", "feature_matrix"))
+    feature_df, target_nav_column, resolved_preprocess_path = load_selected_feature_matrix(
+        stability_analysis_output=stability_analysis_output,
+        selected_stability_candidate_list=selected_stability_candidate_list,
     )
+    target_nav_series = pd.Series(feature_df[target_nav_column], copy=True).astype(float)
     fold_list = build_walk_forward_dev_fold_list(
-        price_series=price_series,
+        price_series=target_nav_series,
         walk_forward_config=dict(config["walk_forward_config"]),
         split_config=config["data_split_dict"],
     )
-    base_multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
-    forward_return_series = build_forward_return_series(price_series=price_series, forward_window=5)
+    forward_return_series = build_forward_return_series(price_series=target_nav_series, forward_window=5)
 
     factor_series_dict = {}
     for factor_candidate in selected_stability_candidate_list:
-        factor_series_dict[str(factor_candidate["candidate_label"])] = build_single_factor_series(
-            price_series=price_series,
-            factor_name=factor_candidate["factor_name"],
-            strategy_params=base_multi_factor_params,
-            factor_param_override=dict(factor_candidate["factor_param_dict"]),
-        )
+        # 候选因子已经在流程0中固化为特征列，这里直接按 candidate_label 读取对应列。
+        factor_series_dict[str(factor_candidate["candidate_label"])] = pd.Series(
+            feature_df[str(factor_candidate["candidate_label"])],
+            copy=True,
+        ).astype(float)
 
     corr_summary_df, dropped_candidate_label_list = build_corr_dedup_result(
         selected_summary_df=pd.DataFrame(selected_stability_candidate_list),
@@ -542,11 +562,23 @@ def run_single_factor_dedup_selection(config_override=None):
     for step_idx, candidate_label in enumerate(best_final_selection_summary["candidate_label_list"], start=1):
         corr_summary_df.loc[corr_summary_df["candidate_label"] == candidate_label, "forward_selection_step"] = step_idx
 
+    dedup_record_dict = {}
+    for candidate_label in best_final_selection_summary["candidate_label_list"]:
+        selected_record = build_candidate_record_dict(
+            summary_df=corr_summary_df[corr_summary_df["candidate_label"] == candidate_label]
+        )[candidate_label]
+        selected_record.pop("factor_name", None)
+        selected_record.pop("factor_param_dict", None)
+        selected_record.pop("factor_group", None)
+        dedup_record_dict[candidate_label] = selected_record
+
     dedup_selection_output = {
         "fund_code": fund_code,
         "preprocess_path": str(resolved_preprocess_path),
+        "preprocess_metadata_path": stability_analysis_output.get("preprocess_metadata_path"),
         "stability_analysis_path": str(resolved_stability_analysis_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
+        "target_nav_column": target_nav_column,
         "dedup_root_topk": dedup_root_topk,
         "input_candidate_count": int(len(selected_stability_candidate_list)),
         "corr_dedup_drop_count": int(len(dropped_candidate_label_list)),
@@ -559,12 +591,7 @@ def run_single_factor_dedup_selection(config_override=None):
         "corr_dedup_dropped_candidate_label_list": dropped_candidate_label_list,
         "corr_dedup_selected_candidate_label_list": corr_selected_summary_df["candidate_label"].tolist(),
         "forward_selected_candidate_label_list": list(best_final_selection_summary["candidate_label_list"]),
-        "record_dict": {
-            candidate_label: build_candidate_record_dict(
-                summary_df=corr_summary_df[corr_summary_df["candidate_label"] == candidate_label]
-            )[candidate_label]
-            for candidate_label in best_final_selection_summary["candidate_label_list"]
-        },
+        "record_dict": dedup_record_dict,
         "best_forward_selection_summary": best_forward_selection_summary,
         "final_selected_source": str(optuna_extension_output["final_selected_source"]),
         "best_final_selection_summary": best_final_selection_summary,

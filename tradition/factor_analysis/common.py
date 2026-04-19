@@ -44,18 +44,12 @@ def load_preprocess_price_series(preprocess_path, expected_fund_code=None):
 
 
 def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, expected_fund_code=None):
-    # 新流程0输出必须同时提供 CSV 和元信息 JSON，流程1只消费这两者而不再重算因子。
-    if preprocess_path is None:
-        raise ValueError("必须提供 preprocess_path。")
+    # 新流程0输出必须提供元信息 JSON；若未显式传 CSV，则从 JSON 中回填 csv_path。
     if preprocess_metadata_path is None:
         raise ValueError("必须提供 preprocess_metadata_path。")
-    preprocess_path = Path(preprocess_path)
     preprocess_metadata_path = Path(preprocess_metadata_path)
-    if not preprocess_path.exists():
-        raise FileNotFoundError(f"流程0特征 CSV 不存在: {preprocess_path}")
     if not preprocess_metadata_path.exists():
         raise FileNotFoundError(f"流程0元信息 JSON 不存在: {preprocess_metadata_path}")
-    feature_df = pd.read_csv(preprocess_path)
     with preprocess_metadata_path.open("r", encoding="utf-8") as input_file:
         metadata_input = json.load(input_file)
     if not isinstance(metadata_input, dict):
@@ -69,8 +63,15 @@ def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, ex
     csv_path_in_metadata = str(feature_preprocess_output.get("csv_path", "")).strip()
     if len(csv_path_in_metadata) == 0:
         raise ValueError("流程0元信息缺少 csv_path。")
+    # 仅提供元信息路径时，优先复用流程0固化下来的特征 CSV 绝对路径。
+    if preprocess_path is None:
+        preprocess_path = csv_path_in_metadata
+    preprocess_path = Path(preprocess_path)
     if Path(csv_path_in_metadata).resolve() != preprocess_path.resolve():
         raise ValueError("流程0元信息中的 csv_path 与传入 preprocess_path 不一致。")
+    if not preprocess_path.exists():
+        raise FileNotFoundError(f"流程0特征 CSV 不存在: {preprocess_path}")
+    feature_df = pd.read_csv(preprocess_path)
     required_column_list = ["date"]
     missing_column_list = [column for column in required_column_list if column not in feature_df.columns]
     if len(missing_column_list) > 0:

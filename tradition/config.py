@@ -22,6 +22,12 @@ DEFAULT_LINKED_CODE_DICT = {
     "007301": ["512480", "000510"],
 }
 
+DEFAULT_CODE_TYPE_DICT = {
+    "007301": "fund",
+    "512480": "fund",
+    "000510": "index",
+}
+
 DEFAULT_STRATEGY_PARAM_DICT = {
     "buy_and_hold": {},
     "ma_cross": {
@@ -128,6 +134,7 @@ class TraditionConfig:
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1])
     code_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_CODE_DICT))
     linked_code_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_LINKED_CODE_DICT))
+    code_type_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_CODE_TYPE_DICT))
     strategy_param_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_STRATEGY_PARAM_DICT))
     data_split_dict: dict = field(default_factory=lambda: deepcopy(DEFAULT_DATA_SPLIT_DICT))
     optimization_config: dict = field(default_factory=lambda: deepcopy(DEFAULT_OPTIMIZATION_CONFIG))

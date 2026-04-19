@@ -113,8 +113,6 @@ def run_factor_selection_single_fund(config_override=None):
     if bool(config.get("force_refresh", False)):
         raise ValueError("factor_select 流程禁止 --force-refresh，请先运行流程0 data-preprocess。")
     preprocess_path = config.get("preprocess_path")
-    if preprocess_path is None:
-        raise ValueError("factor_select 模式必须提供 preprocess_path（流程0输出）。")
     preprocess_metadata_path = config.get("preprocess_metadata_path")
     if preprocess_metadata_path is None:
         raise ValueError("factor_select 模式必须提供 preprocess_metadata_path（流程0元信息输出）。")

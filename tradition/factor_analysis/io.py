@@ -118,7 +118,10 @@ def allocate_stage_csv_json_output_path(output_dir, output_prefix, fund_code):
     date_str = datetime.today().strftime("%Y-%m-%d")
     max_attempt = max(256, len(PATH_CODE_ALPHABET) * 4)
     for _ in range(max_attempt):
-        path_code = "".join(random.choice(PATH_CODE_ALPHABET) for _ in range(PATH_CODE_LENGTH))
+        # 流程0只负责生成首位编码，后续阶段编码保持为 0，避免初始产物看起来像已占满整条链路。
+        base_char_list = list(DEFAULT_PATH_CODE)
+        base_char_list[0] = random.choice(PATH_CODE_ALPHABET)
+        path_code = "".join(base_char_list)
         csv_path, json_path = build_stage_dual_output_paths(
             output_dir=output_dir,
             output_prefix=output_prefix,
@@ -223,7 +226,7 @@ def save_single_factor_stability_analysis_output(factor_selection_input, resolve
         output_dir=output_dir,
         output_prefix="single_factor_stability",
         fund_code=fund_code,
-        stage_index=1,
+        stage_index=2,
         inherited_path_code=inherited_path_code,
     )
     factor_selection_output = dict(factor_selection_input.get("factor_selection_output", {}))
@@ -280,7 +283,7 @@ def save_factor_combination_output(dedup_selection_input, factor_combination_out
         output_dir=output_dir,
         output_prefix="factor_combination",
         fund_code=fund_code,
-        stage_index=3,
+        stage_index=4,
         inherited_path_code=inherited_path_code,
     )
     payload = {
@@ -348,7 +351,7 @@ def allocate_strategy_backtest_paths(factor_combination_input, factor_combinatio
         output_dir=output_dir,
         output_prefix="strategy_backtest",
         fund_code=fund_code,
-        stage_index=4,
+        stage_index=5,
         inherited_path_code=inherited_path_code,
     )
     plot_path = output_dir / f"strategy_backtest_{str(fund_code).zfill(6)}_{datetime.today().strftime('%Y-%m-%d')}_{path_code}.png"
@@ -402,7 +405,7 @@ def save_single_factor_dedup_selection_output(stability_analysis_input, dedup_se
         output_dir=output_dir,
         output_prefix="single_factor_dedup",
         fund_code=fund_code,
-        stage_index=2,
+        stage_index=3,
         inherited_path_code=inherited_path_code,
     )
     stability_analysis_output = dict(stability_analysis_input.get("stability_analysis_output", {}))

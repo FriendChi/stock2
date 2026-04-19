@@ -1,9 +1,9 @@
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 
 from tradition.config import build_tradition_config
-from tradition.factor_engine import build_single_factor_series
 from tradition.splitter import build_walk_forward_dev_fold_list
 
 from .common import (
@@ -11,13 +11,11 @@ from .common import (
     build_forward_return_series,
     build_ic_aggregation_config,
     build_ic_flip_count,
-    build_metric_summary,
     build_positive_ic_ratio,
     build_spearman_metric_summary,
     build_tail_reject_mask,
     build_trimmed_ic_mean,
     compute_segment_correlation_metrics,
-    load_preprocess_price_series,
 )
 from .io import (
     load_factor_selection_input,
@@ -59,6 +57,30 @@ def build_single_factor_stability_record(factor_candidate, train_metric_list, va
     }
 
 
+def load_selected_feature_matrix(factor_selection_output, selected_factor_input_list):
+    preprocess_path = factor_selection_output.get("preprocess_path")
+    if preprocess_path is None:
+        raise ValueError("factor_select 结果缺少 preprocess_path，请重新执行流程1并提供流程0输出。")
+    resolved_preprocess_path = Path(preprocess_path)
+    if not resolved_preprocess_path.exists():
+        raise FileNotFoundError(f"流程0特征 CSV 不存在: {resolved_preprocess_path}")
+    target_nav_column = str(factor_selection_output.get("target_nav_column", "")).strip()
+    if len(target_nav_column) == 0:
+        raise ValueError("factor_select 结果缺少 target_nav_column，请重新执行流程1。")
+    selected_candidate_label_list = [str(record["candidate_label"]) for record in selected_factor_input_list]
+    feature_df = pd.read_csv(resolved_preprocess_path)
+    required_column_list = ["date", target_nav_column] + selected_candidate_label_list
+    missing_column_list = [column for column in required_column_list if column not in feature_df.columns]
+    if len(missing_column_list) > 0:
+        raise ValueError(f"流程0特征 CSV 缺少流程2必需列: {missing_column_list[:10]}")
+    # 流程2直接消费流程1筛出的候选列，不再按旧式因子定义重建时序。
+    feature_df = feature_df.copy()
+    feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
+    feature_df = feature_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    feature_df = feature_df.set_index("date")
+    return feature_df, target_nav_column, resolved_preprocess_path
+
+
 def run_single_factor_stability_analysis(config_override=None):
     config = build_tradition_config(config_override=config_override)
     if bool(config.get("force_refresh", False)):
@@ -80,29 +102,23 @@ def run_single_factor_stability_analysis(config_override=None):
         factor_selection_input=factor_selection_input,
         factor_selection_path=resolved_factor_selection_path,
     )
-    preprocess_path = factor_selection_output.get("preprocess_path")
-    if preprocess_path is None:
-        raise ValueError("factor_select 结果缺少 preprocess_path，请重新执行流程1并提供流程0输出。")
-    price_series, data_mode, _, resolved_preprocess_path = load_preprocess_price_series(
-        preprocess_path=preprocess_path,
-        expected_fund_code=fund_code,
+    data_mode = str(factor_selection_output.get("data_mode", "feature_matrix"))
+    feature_df, target_nav_column, resolved_preprocess_path = load_selected_feature_matrix(
+        factor_selection_output=factor_selection_output,
+        selected_factor_input_list=selected_factor_input_list,
     )
+    target_nav_series = pd.Series(feature_df[target_nav_column], copy=True).astype(float)
     fold_list = build_walk_forward_dev_fold_list(
-        price_series=price_series,
+        price_series=target_nav_series,
         walk_forward_config=dict(config["walk_forward_config"]),
         split_config=config["data_split_dict"],
     )
-    multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
-    forward_return_series = build_forward_return_series(price_series=price_series, forward_window=5)
+    forward_return_series = build_forward_return_series(price_series=target_nav_series, forward_window=5)
 
     stability_record_list = []
     for factor_candidate in selected_factor_input_list:
-        factor_series = build_single_factor_series(
-            price_series=price_series,
-            factor_name=factor_candidate["factor_name"],
-            strategy_params=multi_factor_params,
-            factor_param_override=dict(factor_candidate["factor_param_dict"]),
-        )
+        # 候选因子已经在流程0中固化为特征列，这里直接按 candidate_label 读取对应列。
+        factor_series = pd.Series(feature_df[str(factor_candidate["candidate_label"])], copy=True).astype(float)
         train_metric_list = []
         valid_metric_list = []
         for fold_dict in fold_list:
@@ -156,8 +172,10 @@ def run_single_factor_stability_analysis(config_override=None):
     stability_analysis_output = {
         "fund_code": fund_code,
         "preprocess_path": str(resolved_preprocess_path),
+        "preprocess_metadata_path": factor_selection_output.get("preprocess_metadata_path"),
         "factor_selection_path": str(resolved_factor_selection_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
+        "target_nav_column": target_nav_column,
         "candidate_count": int(len(summary_df)),
         "selected_count": int(selected_mask.sum()),
         "tail_reject_candidate_label_list": summary_df.loc[~selected_mask, "candidate_label"].tolist(),
