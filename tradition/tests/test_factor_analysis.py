@@ -263,6 +263,42 @@ def test_build_mean_train_corr_matrix_matches_pairwise_fold_mean_with_pairwise_d
     assert abs(float(mean_train_corr_matrix[1, 0]) - float(expected_ab)) < 1e-12
 
 
+def test_incremental_combination_score_matches_original_sum_with_missing_values():
+    sample_index = pd.date_range("2024-01-01", periods=5, freq="D")
+    factor_series_dict = {
+        "factor_a": pd.Series([1.0, np.nan, 2.0, 1.5, np.nan], index=sample_index, dtype=float),
+        "factor_b": pd.Series([np.nan, 0.5, 1.0, np.nan, 2.0], index=sample_index, dtype=float),
+        "factor_c": pd.Series([0.2, 0.3, np.nan, 0.4, 0.5], index=sample_index, dtype=float),
+    }
+
+    _, original_score_series = factor_analysis.build_instance_combination_score(
+        factor_candidate_list=[
+            {"candidate_label": "factor_a"},
+            {"candidate_label": "factor_b"},
+            {"candidate_label": "factor_c"},
+        ],
+        factor_series_dict=factor_series_dict,
+    )
+    incremental_score_series = factor_analysis.dedup._build_single_candidate_score_series(
+        candidate_label="factor_a",
+        factor_series_dict=factor_series_dict,
+    )
+    incremental_score_series = factor_analysis.dedup._extend_combination_score_series(
+        parent_score_series=incremental_score_series,
+        candidate_label="factor_b",
+        factor_series_dict=factor_series_dict,
+        candidate_label_list=["factor_a", "factor_b"],
+    )
+    incremental_score_series = factor_analysis.dedup._extend_combination_score_series(
+        parent_score_series=incremental_score_series,
+        candidate_label="factor_c",
+        factor_series_dict=factor_series_dict,
+        candidate_label_list=["factor_a", "factor_b", "factor_c"],
+    )
+
+    pd.testing.assert_series_equal(original_score_series, incremental_score_series)
+
+
 def test_run_train_forward_selection_builds_tree_path_from_topk_singleton_roots(monkeypatch):
     candidate_record_list = [
         {
@@ -291,15 +327,15 @@ def test_run_train_forward_selection_builds_tree_path_from_topk_singleton_roots(
         },
     ]
 
-    def fake_evaluate_factor_candidate_subset(
-        factor_candidate_list,
-        factor_series_dict,
+    def fake_evaluate_combination_score_series(
+        score_series,
         forward_return_series,
         fold_list,
+        candidate_label_list,
         include_valid=True,
         ic_aggregation_config=None,
     ):
-        label_tuple = tuple(item["candidate_label"] for item in factor_candidate_list)
+        label_tuple = tuple(candidate_label_list)
         metric_dict = {
             ("factor_a",): {"train_spearman_ic_mean": 0.1, "train_spearman_icir": 0.6},
             ("factor_b",): {"train_spearman_ic_mean": 0.09, "train_spearman_icir": 0.55},
@@ -314,7 +350,11 @@ def test_run_train_forward_selection_builds_tree_path_from_topk_singleton_roots(
         selected_metric_dict["factor_count"] = len(label_tuple)
         return selected_metric_dict
 
-    monkeypatch.setattr(factor_analysis.dedup, "evaluate_factor_candidate_subset", fake_evaluate_factor_candidate_subset)
+    monkeypatch.setattr(
+        factor_analysis.dedup,
+        "_evaluate_combination_score_series",
+        fake_evaluate_combination_score_series,
+    )
     path_summary_list = factor_analysis.run_train_forward_selection(
         candidate_record_list=candidate_record_list,
         factor_series_dict={record["candidate_label"]: pd.Series([1.0, 2.0], dtype=float) for record in candidate_record_list},

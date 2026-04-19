@@ -180,11 +180,26 @@ def build_corr_dedup_result(selected_summary_df, factor_series_dict, fold_list, 
     return summary_df, dropped_candidate_label_list
 
 
-def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, include_valid=True, ic_aggregation_config=None):
-    _, score_series = build_instance_combination_score(
-        factor_candidate_list=factor_candidate_list,
-        factor_series_dict=factor_series_dict,
-    )
+def _build_combination_score_name(candidate_label_list):
+    return "|".join([str(candidate_label) for candidate_label in candidate_label_list])
+
+
+def _build_single_candidate_score_series(candidate_label, factor_series_dict):
+    score_series = pd.Series(factor_series_dict[str(candidate_label)], copy=True).astype(float).fillna(0.0)
+    score_series.name = _build_combination_score_name([candidate_label])
+    return score_series
+
+
+def _extend_combination_score_series(parent_score_series, candidate_label, factor_series_dict, candidate_label_list):
+    candidate_series = pd.Series(factor_series_dict[str(candidate_label)], copy=True).astype(float)
+    # 组合分数在当前流程里等于逐日求和，这里直接基于父分数做增量更新，避免重建整张组合表。
+    child_score_series = pd.Series(parent_score_series, copy=True).astype(float).add(candidate_series, fill_value=0.0)
+    child_score_series = child_score_series.astype(float)
+    child_score_series.name = _build_combination_score_name(candidate_label_list)
+    return child_score_series
+
+
+def _evaluate_combination_score_series(score_series, forward_return_series, fold_list, candidate_label_list, include_valid=True, ic_aggregation_config=None):
     train_metric_list = []
     valid_metric_list = []
     for fold_dict in fold_list:
@@ -207,8 +222,8 @@ def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, 
         ic_aggregation_config = {"mode": "classic", "half_life": 3.0}
     train_summary = build_spearman_metric_summary([metric_dict["spearman_ic"] for metric_dict in train_metric_list], ic_aggregation_config=ic_aggregation_config)
     summary_dict = {
-        "candidate_label_list": [str(item["candidate_label"]) for item in factor_candidate_list],
-        "factor_count": int(len(factor_candidate_list)),
+        "candidate_label_list": [str(candidate_label) for candidate_label in candidate_label_list],
+        "factor_count": int(len(candidate_label_list)),
         "train_spearman_ic_mean": train_summary["mean"],
         "train_spearman_icir": train_summary["icir"],
     }
@@ -217,6 +232,21 @@ def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, 
         summary_dict["valid_spearman_ic_mean"] = valid_summary["mean"]
         summary_dict["valid_spearman_icir"] = valid_summary["icir"]
     return summary_dict
+
+
+def evaluate_factor_candidate_subset(factor_candidate_list, factor_series_dict, forward_return_series, fold_list, include_valid=True, ic_aggregation_config=None):
+    _, score_series = build_instance_combination_score(
+        factor_candidate_list=factor_candidate_list,
+        factor_series_dict=factor_series_dict,
+    )
+    return _evaluate_combination_score_series(
+        score_series=score_series,
+        forward_return_series=forward_return_series,
+        fold_list=fold_list,
+        candidate_label_list=[str(item["candidate_label"]) for item in factor_candidate_list],
+        include_valid=include_valid,
+        ic_aggregation_config=ic_aggregation_config,
+    )
 
 
 def build_candidate_label_signature(candidate_label_list):
@@ -268,11 +298,16 @@ def run_train_forward_selection(candidate_record_list, factor_series_dict, forwa
     frontier_node_list = []
     for root_candidate_record in sorted_candidate_record_list[:root_topk]:
         root_candidate_list = [dict(root_candidate_record)]
-        root_summary = evaluate_factor_candidate_subset(
-            factor_candidate_list=root_candidate_list,
+        root_candidate_label = str(root_candidate_record["candidate_label"])
+        root_score_series = _build_single_candidate_score_series(
+            candidate_label=root_candidate_label,
             factor_series_dict=factor_series_dict,
+        )
+        root_summary = _evaluate_combination_score_series(
+            score_series=root_score_series,
             forward_return_series=forward_return_series,
             fold_list=fold_list,
+            candidate_label_list=[root_candidate_label],
             include_valid=False,
             ic_aggregation_config=ic_aggregation_config,
         )
@@ -283,6 +318,7 @@ def run_train_forward_selection(candidate_record_list, factor_series_dict, forwa
             {
                 "candidate_record_list": root_candidate_list,
                 "summary": root_summary,
+                "score_series": root_score_series,
             }
         )
 
@@ -294,6 +330,8 @@ def run_train_forward_selection(candidate_record_list, factor_series_dict, forwa
     )
     try:
         while len(frontier_node_list) > 0:
+            current_layer = int(frontier_node_list[0]["summary"]["step"])
+            progress_bar.set_description(f"forward search 第{current_layer}层")
             # 每一层都要拿 frontier 中每条路径去尝试全量候选扩展，因此总量按层动态补齐。
             progress_bar.total += int(len(frontier_node_list) * len(sorted_candidate_record_list))
             progress_bar.refresh()
@@ -301,6 +339,7 @@ def run_train_forward_selection(candidate_record_list, factor_series_dict, forwa
             for frontier_node in frontier_node_list:
                 parent_candidate_list = list(frontier_node["candidate_record_list"])
                 parent_summary = dict(frontier_node["summary"])
+                parent_score_series = pd.Series(frontier_node["score_series"], copy=True).astype(float)
                 parent_candidate_label_set = set(parent_summary["candidate_label_list"])
                 for candidate_record in sorted_candidate_record_list:
                     progress_bar.update(1)
@@ -311,11 +350,17 @@ def run_train_forward_selection(candidate_record_list, factor_series_dict, forwa
                     child_signature = build_candidate_label_signature([item["candidate_label"] for item in child_candidate_list])
                     if child_signature in path_summary_dict:
                         continue
-                    child_summary = evaluate_factor_candidate_subset(
-                        factor_candidate_list=child_candidate_list,
+                    child_score_series = _extend_combination_score_series(
+                        parent_score_series=parent_score_series,
+                        candidate_label=candidate_label,
                         factor_series_dict=factor_series_dict,
+                        candidate_label_list=[str(item["candidate_label"]) for item in child_candidate_list],
+                    )
+                    child_summary = _evaluate_combination_score_series(
+                        score_series=child_score_series,
                         forward_return_series=forward_return_series,
                         fold_list=fold_list,
+                        candidate_label_list=[str(item["candidate_label"]) for item in child_candidate_list],
                         include_valid=False,
                         ic_aggregation_config=ic_aggregation_config,
                     )
@@ -329,6 +374,7 @@ def run_train_forward_selection(candidate_record_list, factor_series_dict, forwa
                         {
                             "candidate_record_list": child_candidate_list,
                             "summary": child_summary,
+                            "score_series": child_score_series,
                         }
                     )
             frontier_node_list = next_frontier_node_list
