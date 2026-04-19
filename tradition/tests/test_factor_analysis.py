@@ -576,14 +576,32 @@ def test_resolve_factor_group_name_raises_for_unknown_factor():
 
 def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, sample_fund_df, tmp_path):
     sample_index = pd.date_range("2024-01-01", periods=30, freq="D")
-    sample_df = pd.DataFrame(
-        {
-            "date": sample_index,
-            "code": ["007301"] * len(sample_index),
-            "fund": ["半导体"] * len(sample_index),
-            "nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
-        }
+    
+    # 物理创建特征 CSV 文件，包含必要的因子列和目标列
+    preprocess_csv_path = tmp_path / "fake_preprocess.csv"
+    pd.DataFrame({
+        "date": sample_index,
+        "nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+        "momentum(window=10)": list(range(len(sample_index))),
+        "momentum(window=15)": list(reversed(range(len(sample_index))))
+    }).to_csv(preprocess_csv_path, index=False)
+
+    # 物理创建元数据 JSON，补全符合系统校验要求的 feature_preprocess_output 结构
+    metadata_path = tmp_path / "fake_metadata.json"
+    metadata_path.write_text(
+        json.dumps({
+            "feature_preprocess_output": {
+                "fund_code": "007301",
+                "data_mode": "feature_matrix",
+                "csv_path": str(preprocess_csv_path.resolve()),
+                "target_nav_column": "nav",
+                "target_price_column": "nav",
+                "factor_feature_column_list": ["momentum(window=10)", "momentum(window=15)"]
+            }
+        }),
+        encoding="utf-8"
     )
+
     monkeypatch.setattr(
         factor_analysis.selection,
         "build_tradition_config",
@@ -594,20 +612,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
             "force_refresh": False,
             "cache_prefix": "tradition_fund",
             "default_fund_code": "007301",
-            "strategy_param_dict": {
-                "multi_factor_score": {
-                    "enabled_factor_list": ["momentum", "ma_slope"],
-                    "factor_param_dict": {
-                        "momentum": {"window": 20},
-                        "ma_slope": {"window": 20, "lookback": 5},
-                    },
-                    "score_window": 60,
-                    "factor_weight_dict": {
-                        "momentum": 0.5,
-                        "ma_slope": 0.5,
-                    },
-                }
-            },
+            "preprocess_metadata_path": str(metadata_path),
             "walk_forward_config": {
                 "window_size": 20,
                 "step_size": 5,
@@ -624,17 +629,10 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
             "train_min_spearman_icir": 0.0,
         },
     )
-    monkeypatch.setattr(factor_analysis.selection, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis.selection, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis.selection, "filter_single_fund", lambda data, fund_code: data)
-    monkeypatch.setattr(
-        factor_analysis.selection,
-        "adapt_to_price_series",
-        lambda fund_df: (
-            pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
-            "nav_price_series",
-        ),
-    )
+    
+    # 移除原有的 fetch_fund_data_with_cache、normalize_fund_data、filter_single_fund 等 Mock
+    # 因为 selection.py 已改为直接从 bundle 加载，不再走数据抓取流程
+
     monkeypatch.setattr(
         factor_analysis.selection,
         "build_walk_forward_dev_fold_list",
@@ -652,18 +650,6 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
                 "test": price_series.iloc[20:25],
             },
         ],
-    )
-    monkeypatch.setattr(
-        factor_analysis.selection,
-        "build_single_factor_series",
-        lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
-            range(len(price_series))
-            if factor_name == "momentum" and int(factor_param_override["window"]) == 10
-            else list(reversed(range(len(price_series)))),
-            index=price_series.index,
-            dtype=float,
-            name=factor_analysis.build_factor_candidate_label(factor_name=factor_name, factor_param_dict=factor_param_override or {}),
-        ),
     )
     monkeypatch.setattr(
         factor_analysis.selection,
@@ -690,10 +676,10 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
     result = factor_analysis.run_factor_selection_single_fund()
 
     assert result["fund_code"] == "007301"
-    assert result["selected_factor_name_list"] == ["momentum"]
+    assert result["selected_factor_name_list"] == ["momentum(window=10)"]
     assert result["selected_candidate_label_list"] == ["momentum(window=10)"]
     assert result["summary_df"].iloc[0]["candidate_label"] == "momentum(window=10)"
-    assert result["summary_df"].iloc[0]["factor_param_dict"] == {"window": 10}
+    assert result["summary_df"].iloc[0]["factor_param_dict"] == {}
     assert bool(result["summary_df"].iloc[0]["train_passed"]) is True
     assert bool(result["summary_df"].iloc[0]["valid_passed"]) is True
     assert abs(float(result["summary_df"].iloc[0]["train_spearman_positive_ic_ratio"]) - 1.0) < 1e-12
@@ -710,7 +696,7 @@ def test_run_factor_selection_single_fund_returns_ranked_selection(monkeypatch, 
     assert saved_payload["factor_selection_output"]["fund_code"] == "007301"
     assert saved_payload["factor_selection_output"]["ic_aggregation_config"]["mode"] == "classic"
     assert saved_payload["factor_selection_output"]["record_dict"]["momentum(window=10)"]["candidate_label"] == "momentum(window=10)"
-    assert saved_payload["factor_selection_output"]["record_dict"]["momentum(window=10)"]["factor_param_dict"] == {"window": 10}
+    assert saved_payload["factor_selection_output"]["record_dict"]["momentum(window=10)"]["factor_param_dict"] == {}
 
 
 def test_run_factor_selection_single_fund_supports_csv_path_from_metadata(monkeypatch, tmp_path):
