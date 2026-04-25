@@ -413,6 +413,7 @@ def run_factor_combination(config_override=None):
     factor_combination_output = {
         "fund_code": fund_code,
         "preprocess_path": str(resolved_preprocess_path),
+        "target_nav_column": target_nav_column,
         "dedup_selection_path": str(resolved_dedup_selection_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
         "input_candidate_label_list": input_candidate_label_list,
