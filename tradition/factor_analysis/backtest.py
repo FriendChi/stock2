@@ -1,15 +1,15 @@
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from tradition.config import build_tradition_config
-from tradition.factor_engine import build_single_factor_series
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.optimizer import load_optuna_module
 from tradition.splitter import build_walk_forward_dev_fold_list, split_time_series_by_ratio
 
-from .common import build_weighted_instance_combination_score, load_preprocess_price_series
+from .common import build_weighted_instance_combination_score
 from .io import (
     allocate_strategy_backtest_paths,
     load_factor_combination_input,
@@ -380,10 +380,29 @@ def run_strategy_backtest(config_override=None):
     preprocess_path = factor_combination_output.get("preprocess_path")
     if preprocess_path is None:
         raise ValueError("factor_combination 结果缺少 preprocess_path，请重新执行流程4。")
-    price_series, data_mode, _, resolved_preprocess_path = load_preprocess_price_series(
-        preprocess_path=preprocess_path,
-        expected_fund_code=fund_code,
-    )
+    target_nav_column = str(factor_combination_output.get("target_nav_column", "")).strip()
+    if len(target_nav_column) == 0:
+        raise ValueError("factor_combination 结果缺少 target_nav_column，请重新执行流程4。")
+    resolved_preprocess_path = Path(preprocess_path)
+    if not resolved_preprocess_path.exists():
+        raise FileNotFoundError(f"流程4特征 CSV 不存在: {resolved_preprocess_path}")
+    feature_df = pd.read_csv(resolved_preprocess_path)
+    required_column_list = ["date", target_nav_column] + input_candidate_label_list
+    missing_column_list = [column for column in required_column_list if column not in feature_df.columns]
+    if len(missing_column_list) > 0:
+        raise ValueError(f"流程4特征 CSV 缺少流程5必需列: {missing_column_list[:10]}")
+
+    # 逻辑块：直接复用流程4承接的特征 CSV，保持流程3/4/5使用同一份固化因子列口径。
+    feature_df = feature_df.copy()
+    feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
+    feature_df = feature_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    feature_df = feature_df.set_index("date")
+    if str(fund_code) not in target_nav_column:
+        raise ValueError(f"流程4结果中的 target_nav_column 与 fund_code 不匹配: fund_code={fund_code}, target_nav_column={target_nav_column}")
+    price_series = pd.Series(feature_df[target_nav_column], copy=True).astype(float)
+    if len(price_series.dropna()) < 2:
+        raise ValueError("流程4特征 CSV 中目标净值列有效样本不足，无法执行流程5。")
+    data_mode = str(factor_combination_output.get("data_mode", "feature_matrix"))
     split_dict = split_time_series_by_ratio(
         price_series=price_series,
         split_config=config["data_split_dict"],
@@ -394,17 +413,13 @@ def run_strategy_backtest(config_override=None):
         split_config=dict(config["data_split_dict"]),
     )
     dev_series = pd.concat([split_dict["train"], split_dict["valid"]]).sort_index()
-    base_multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
     factor_candidate_list = [dict(factor_candidate_record_dict[candidate_label]) for candidate_label in input_candidate_label_list]
     factor_series_dict = {}
     for factor_candidate in factor_candidate_list:
         candidate_label = str(factor_candidate["candidate_label"])
-        factor_series_dict[candidate_label] = build_single_factor_series(
-            price_series=price_series,
-            factor_name=factor_candidate["factor_name"],
-            strategy_params=base_multi_factor_params,
-            factor_param_override=dict(factor_candidate["factor_param_dict"]),
-        )
+        factor_series_dict[candidate_label] = pd.Series(feature_df[candidate_label], copy=True).astype(float)
+        if factor_series_dict[candidate_label].dropna().empty:
+            raise ValueError(f"流程4特征 CSV 中候选因子列全为空: {candidate_label}")
     score_series = build_strategy_score_series(
         factor_candidate_list=factor_candidate_list,
         factor_series_dict=factor_series_dict,
