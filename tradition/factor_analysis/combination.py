@@ -1,14 +1,15 @@
 from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
 
 from tradition.config import build_tradition_config
-from tradition.factor_engine import build_single_factor_series
 from tradition.optimizer import load_optuna_module
 from tradition.splitter import build_walk_forward_dev_fold_list
 
 from .common import (
     build_forward_return_series,
     build_ic_aggregation_config,
-    load_preprocess_price_series,
     build_metric_summary,
     build_spearman_metric_summary,
     build_weighted_instance_combination_score,
@@ -306,33 +307,54 @@ def run_factor_combination(config_override=None):
     preprocess_path = dedup_selection_output.get("preprocess_path")
     if preprocess_path is None:
         raise ValueError("dedup 结果缺少 preprocess_path，请重新执行流程3。")
-    price_series, data_mode, _, resolved_preprocess_path = load_preprocess_price_series(
-        preprocess_path=preprocess_path,
-        expected_fund_code=fund_code,
-    )
+    resolved_preprocess_path = Path(preprocess_path)
+    if not resolved_preprocess_path.exists():
+        raise FileNotFoundError(f"流程3特征 CSV 不存在: {resolved_preprocess_path}")
+    target_nav_column = str(dedup_selection_output.get("target_nav_column", "")).strip()
+    if len(target_nav_column) == 0:
+        raise ValueError("dedup 结果缺少 target_nav_column，请重新执行流程3。")
+    feature_df = pd.read_csv(resolved_preprocess_path)
+    required_column_list = ["date", target_nav_column] + input_candidate_label_list
+    missing_column_list = [column for column in required_column_list if column not in feature_df.columns]
+    if len(missing_column_list) > 0:
+        raise ValueError(f"流程3特征 CSV 缺少流程4必需列: {missing_column_list[:10]}")
+
+    # 逻辑块：直接复用流程3固化的特征 CSV，保持流程3与流程4使用完全一致的因子列口径。
+    feature_df = feature_df.copy()
+    feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
+    feature_df = feature_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    feature_df = feature_df.set_index("date")
+    price_series = pd.Series(feature_df[target_nav_column], copy=True).astype(float)
+    data_mode = str(dedup_selection_output.get("data_mode", "feature_matrix"))
     fold_list = build_walk_forward_dev_fold_list(
         price_series=price_series,
         walk_forward_config=dict(config["walk_forward_config"]),
         split_config=config["data_split_dict"],
     )
-    base_multi_factor_params = dict(config["strategy_param_dict"]["multi_factor_score"])
     forward_return_series = build_forward_return_series(price_series=price_series, forward_window=5)
 
     candidate_record_lookup = {
         str(candidate_label): dict(record)
         for candidate_label, record in dict(dedup_selection_output["record_dict"]).items()
     }
+    missing_candidate_record_list = [
+        str(candidate_label) for candidate_label in input_candidate_label_list
+        if str(candidate_label) not in candidate_record_lookup
+    ]
+    if len(missing_candidate_record_list) > 0:
+        raise ValueError(f"流程3结果中的 record_dict 缺少流程4必需候选: {missing_candidate_record_list[:10]}")
+    if str(fund_code) not in target_nav_column:
+        raise ValueError(f"流程3结果中的 target_nav_column 与 fund_code 不匹配: fund_code={fund_code}, target_nav_column={target_nav_column}")
     factor_candidate_list = [dict(candidate_record_lookup[candidate_label]) for candidate_label in input_candidate_label_list]
     factor_series_dict = {}
     candidate_train_icir_dict = {}
+    if len(price_series.dropna()) < 2:
+        raise ValueError("流程3特征 CSV 中目标净值列有效样本不足，无法执行流程4。")
     for factor_candidate in factor_candidate_list:
         candidate_label = str(factor_candidate["candidate_label"])
-        factor_series_dict[candidate_label] = build_single_factor_series(
-            price_series=price_series,
-            factor_name=factor_candidate["factor_name"],
-            strategy_params=base_multi_factor_params,
-            factor_param_override=dict(factor_candidate["factor_param_dict"]),
-        )
+        factor_series_dict[candidate_label] = pd.Series(feature_df[candidate_label], copy=True).astype(float)
+        if factor_series_dict[candidate_label].dropna().empty:
+            raise ValueError(f"流程3特征 CSV 中候选因子列全为空: {candidate_label}")
         candidate_train_icir_dict[candidate_label] = float(candidate_record_lookup[candidate_label]["train_spearman_icir"])
 
     combination_summary_list = [
@@ -383,14 +405,10 @@ def run_factor_combination(config_override=None):
         "valid_spearman_icir": float(best_tuned_trial_summary["valid_spearman_icir"]),
         "trial_number": int(best_tuned_trial_summary["trial_number"]),
     }
+    # 逻辑块：流程4直接沿用流程3的候选记录摘要，不再假定可恢复因子定义字段。
     factor_candidate_record_dict = {
-        str(factor_candidate["candidate_label"]): {
-            "candidate_label": str(factor_candidate["candidate_label"]),
-            "factor_name": str(factor_candidate["factor_name"]),
-            "factor_group": str(factor_candidate["factor_group"]),
-            "factor_param_dict": dict(factor_candidate["factor_param_dict"]),
-        }
-        for factor_candidate in factor_candidate_list
+        str(candidate_label): dict(candidate_record_lookup[str(candidate_label)])
+        for candidate_label in input_candidate_label_list
     }
     factor_combination_output = {
         "fund_code": fund_code,
