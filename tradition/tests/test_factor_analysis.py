@@ -327,15 +327,13 @@ def test_run_train_forward_selection_builds_tree_path_from_topk_singleton_roots(
         },
     ]
 
-    def fake_evaluate_combination_score_series(
-        score_series,
-        forward_return_series,
-        fold_list,
+    def fake_evaluate_train_score_segment_list(
+        train_score_segment_list,
+        train_target_rank_component_list,
         candidate_label_list,
-        include_valid=True,
         ic_aggregation_config=None,
     ):
-        label_tuple = tuple(candidate_label_list)
+        label_tuple = tuple(sorted(candidate_label_list))
         metric_dict = {
             ("factor_a",): {"train_spearman_ic_mean": 0.1, "train_spearman_icir": 0.6},
             ("factor_b",): {"train_spearman_ic_mean": 0.09, "train_spearman_icir": 0.55},
@@ -352,15 +350,17 @@ def test_run_train_forward_selection_builds_tree_path_from_topk_singleton_roots(
 
     monkeypatch.setattr(
         factor_analysis.dedup,
-        "_evaluate_combination_score_series",
-        fake_evaluate_combination_score_series,
+        "_evaluate_train_score_segment_list",
+        fake_evaluate_train_score_segment_list,
     )
+    # 并行评估时会绕过 evaluate_train_score_segment_list 直接在子进程调，因此测试时设为单进程
     path_summary_list = factor_analysis.run_train_forward_selection(
         candidate_record_list=candidate_record_list,
         factor_series_dict={record["candidate_label"]: pd.Series([1.0, 2.0], dtype=float) for record in candidate_record_list},
         forward_return_series=pd.Series([0.1, 0.2], dtype=float),
-        fold_list=[],
+        fold_list=[{"train": pd.Series([0.1, 0.2], index=pd.Index([1, 2]))}],
         root_topk=2,
+        n_processes=1
     )
     assert [item["candidate_label_list"] for item in path_summary_list] == [
         ["factor_a"],
