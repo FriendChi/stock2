@@ -383,6 +383,77 @@ def save_strategy_backtest_output(factor_combination_input, strategy_backtest_ou
     return output_path
 
 
+def load_strategy_backtest_input(strategy_backtest_path):
+    strategy_backtest_path = Path(strategy_backtest_path)
+    if not strategy_backtest_path.exists():
+        raise FileNotFoundError(f"策略回测结果文件不存在: {strategy_backtest_path}")
+    with strategy_backtest_path.open("r", encoding="utf-8") as input_file:
+        strategy_backtest_input = json.load(input_file)
+    if not isinstance(strategy_backtest_input, dict):
+        raise ValueError("策略回测结果文件必须是顶层字典。")
+    strategy_backtest_output = strategy_backtest_input.get("strategy_backtest_output")
+    if not isinstance(strategy_backtest_output, dict):
+        raise ValueError("策略回测结果文件缺少 strategy_backtest_output 子字典。")
+    return strategy_backtest_input, strategy_backtest_path
+
+
+def resolve_fund_code_from_strategy_backtest_input(strategy_backtest_input, strategy_backtest_path):
+    strategy_backtest_output = dict(strategy_backtest_input.get("strategy_backtest_output", {}))
+    candidate_code = str(strategy_backtest_output.get("fund_code", "")).strip()
+    if len(candidate_code) > 0:
+        candidate_code = candidate_code.zfill(6)
+        if len(candidate_code) == 6 and candidate_code.isdigit():
+            return candidate_code
+    input_ref = dict(strategy_backtest_input.get("input_ref", {}))
+    candidate_code = str(input_ref.get("fund_code", "")).strip()
+    if len(candidate_code) > 0:
+        candidate_code = candidate_code.zfill(6)
+        if len(candidate_code) == 6 and candidate_code.isdigit():
+            return candidate_code
+    extracted_code = extract_path_code_from_path(strategy_backtest_path)
+    raise ValueError(f"无法从策略回测结果中解析基金代码: {strategy_backtest_path.name}, path_code={extracted_code}")
+
+
+def allocate_strategy_advice_output_path(strategy_backtest_input, strategy_backtest_path, output_dir, fund_code):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    inherited_path_code = resolve_input_path_code(
+        input_payload=strategy_backtest_input,
+        input_path=strategy_backtest_path,
+    )
+    return allocate_stage_output_path(
+        output_dir=output_dir,
+        output_prefix="strategy_advice",
+        fund_code=fund_code,
+        stage_index=5,
+        inherited_path_code=inherited_path_code,
+    )
+
+
+def save_strategy_advice_output(strategy_backtest_input, strategy_advice_output, output_dir, fund_code, output_path=None, path_code=None):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_path is None or not is_valid_path_code(path_code):
+        output_path, path_code = allocate_strategy_advice_output_path(
+            strategy_backtest_input=strategy_backtest_input,
+            strategy_backtest_path=strategy_advice_output.get("strategy_backtest_path"),
+            output_dir=output_dir,
+            fund_code=fund_code,
+        )
+    else:
+        output_path = Path(output_path)
+        path_code = str(path_code)
+    payload = {
+        "path_code": path_code,
+        "input_ref": {
+            "strategy_backtest_path": str(strategy_advice_output.get("strategy_backtest_path", "")),
+            "fund_code": str(strategy_advice_output.get("fund_code", str(fund_code).zfill(6))),
+        },
+        "strategy_advice_output": strategy_advice_output,
+    }
+    with output_path.open("w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, ensure_ascii=False, indent=2)
+    return output_path
+
+
 def print_strategy_backtest_summary(result):
     print("策略回测结果:")
     print("基金代码:", result["fund_code"])
@@ -392,6 +463,24 @@ def print_strategy_backtest_summary(result):
     print("最终组合因子:", result["best_strategy_test_summary"]["candidate_label_list"])
     print("最终 test Sharpe:", result["best_strategy_test_summary"]["test_result"]["stats"]["sharpe"])
     print("图像输出:", result["plot_path"])
+    print("汇总输出:", result["summary_path"])
+
+
+def print_strategy_advice_summary(result):
+    print("策略建议结果:")
+    print("基金代码:", result["fund_code"])
+    print("输入策略回测文件:", result["strategy_backtest_path"])
+    print("最新原始宽表:", result["latest_wide_feature_path"])
+    print("复用宽表快照:", result["used_cached_wide_feature_snapshot"])
+    print("宽表快照最新日期:", result["latest_wide_feature_snapshot_date"])
+    print("最新日期:", result["latest_date"])
+    print("昨日日期:", result["previous_date"])
+    print("最新分数:", result["latest_score"])
+    print("最新目标仓位:", result["latest_target_position"])
+    print("昨日目标仓位:", result["previous_target_position"])
+    print("仓位变化:", result["position_delta"])
+    print("交易门槛:", result["trade_gate"])
+    print("建议动作:", result["action"])
     print("汇总输出:", result["summary_path"])
 
 

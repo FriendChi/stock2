@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 
 from tradition.config import build_tradition_config
+from tradition.factor_engine import normalize_factor_series, rolling_zscore
+from tradition.factor_library import build_raw_factor_series
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
 from tradition.optimizer import load_optuna_module
 from tradition.splitter import build_walk_forward_dev_fold_list, split_time_series_by_ratio
@@ -13,9 +15,21 @@ from .common import build_weighted_instance_combination_score
 from .io import (
     allocate_strategy_backtest_paths,
     load_factor_combination_input,
+    load_strategy_backtest_input,
     print_strategy_backtest_summary,
+    print_strategy_advice_summary,
+    resolve_fund_code_from_strategy_backtest_input,
     resolve_fund_code_from_factor_combination_input,
+    save_strategy_advice_output,
     save_strategy_backtest_output,
+)
+from .feature_preprocess import (
+    _build_single_feature_missing_report,
+    _fill_single_feature_missing_by_linear_interpolation,
+    _fetch_feature_df_with_cache,
+    _fetch_feature_df_by_type,
+    _resolve_feature_preprocess_code_type_dict,
+    _trim_initial_rows,
 )
 
 
@@ -534,4 +548,418 @@ def run_strategy_backtest(config_override=None):
         "summary_path": summary_path,
     }
     print_strategy_backtest_summary(result)
+    return result
+
+
+def _parse_candidate_label_config(candidate_label):
+    # 逻辑块：流程6需要从流程5保存下来的最终列名反推基础特征、因子名和是否翻转。
+    candidate_label = str(candidate_label)
+    if not candidate_label.endswith("__zscore"):
+        raise ValueError(f"流程6只支持 __zscore 因子列: {candidate_label}")
+    column_body = candidate_label[: -len("__zscore")]
+    body_part_list = column_body.split("__")
+    if len(body_part_list) < 2:
+        raise ValueError(f"无法解析因子列来源: {candidate_label}")
+    source_column = "__".join(body_part_list[:2])
+    if len(body_part_list) == 2:
+        return {
+            "candidate_label": candidate_label,
+            "source_column": source_column,
+            "factor_name": "zscore",
+            "factor_param_dict": {},
+            "flipped": False,
+        }
+    factor_label = "__".join(body_part_list[2:])
+    flipped = False
+    if factor_label.startswith("-"):
+        flipped = True
+        factor_label = factor_label[1:]
+    left_paren_position = factor_label.find("(")
+    right_paren_position = factor_label.rfind(")")
+    if left_paren_position < 0 or right_paren_position < left_paren_position:
+        raise ValueError(f"无法解析因子参数: {candidate_label}")
+    factor_name = factor_label[:left_paren_position]
+    factor_param_text = factor_label[left_paren_position + 1 : right_paren_position]
+    factor_param_dict = {}
+    if len(factor_param_text.strip()) > 0:
+        for param_pair_text in factor_param_text.split(","):
+            param_name, param_value = [part.strip() for part in str(param_pair_text).split("=", 1)]
+            numeric_value = float(param_value)
+            if numeric_value.is_integer():
+                numeric_value = int(numeric_value)
+            factor_param_dict[str(param_name)] = numeric_value
+    return {
+        "candidate_label": candidate_label,
+        "source_column": source_column,
+        "factor_name": str(factor_name),
+        "factor_param_dict": factor_param_dict,
+        "flipped": bool(flipped),
+    }
+
+
+def _build_latest_wide_feature_df(config, fund_code):
+    # 逻辑块：流程6直接复用流程0原始特征抓取与宽表拼接口径，只是不落整套流程0文件。
+    code_type_dict = _resolve_feature_preprocess_code_type_dict(config=config)
+    normalized_fund_code = str(fund_code).zfill(6)
+    if normalized_fund_code not in code_type_dict:
+        raise ValueError(f"流程6缺少主代码类型映射: {normalized_fund_code}")
+    import akshare as ak
+
+    feature_df_dict = {}
+    for code, code_type in dict(code_type_dict).items():
+        normalized_code = str(code).zfill(6)
+        feature_df = _fetch_feature_df_with_cache(
+            ak_module=ak,
+            code=normalized_code,
+            code_type=code_type,
+            cache_dir=config["data_dir"],
+            force_refresh=bool(config.get("force_refresh", False)),
+        )
+        feature_df_dict[normalized_code] = pd.DataFrame(feature_df, copy=True).set_index("date")
+    primary_index = pd.Index(feature_df_dict[normalized_fund_code].index, copy=True)
+    wide_feature_df = pd.DataFrame(index=primary_index)
+    for code in dict(code_type_dict).keys():
+        normalized_code = str(code).zfill(6)
+        feature_df = feature_df_dict[normalized_code].reindex(primary_index).copy()
+        feature_df.columns = [f"{normalized_code}__{column}" for column in feature_df.columns]
+        wide_feature_df = pd.concat([wide_feature_df, feature_df], axis=1)
+    wide_feature_df = wide_feature_df[~wide_feature_df.index.duplicated(keep="last")]
+    wide_feature_df = wide_feature_df.reset_index().rename(columns={"index": "date"})
+    wide_feature_df["date"] = pd.to_datetime(wide_feature_df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return wide_feature_df, code_type_dict
+
+
+def _build_strategy_advice_wide_feature_cache_path(data_dir, fund_code):
+    # 逻辑块：流程6把当次增量更新后的原始宽表快照落回 data 目录，便于排查和复用。
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir / f"strategy_advice_latest_wide_feature_{str(fund_code).zfill(6)}.csv"
+
+
+def _save_strategy_advice_wide_feature_df(wide_feature_df, cache_path):
+    wide_feature_df = pd.DataFrame(wide_feature_df, copy=True)
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    wide_feature_df.to_csv(cache_path, index=False)
+    return cache_path
+
+
+def _load_strategy_advice_wide_feature_df(cache_path):
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        raise FileNotFoundError(f"流程6原始宽表快照不存在: {cache_path}")
+    return pd.read_csv(cache_path)
+
+
+def _resolve_strategy_advice_wide_feature_snapshot_date(cache_path):
+    # 逻辑块：宽表快照是否可复用，先看快照自身最后日期，避免无意义地重读整张表参与后续判断。
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+    wide_feature_df = pd.read_csv(cache_path, usecols=["date"])
+    if len(wide_feature_df) == 0 or "date" not in wide_feature_df.columns:
+        return None
+    snapshot_date_series = pd.to_datetime(wide_feature_df["date"], errors="coerce").dropna()
+    if len(snapshot_date_series) == 0:
+        return None
+    return pd.Timestamp(snapshot_date_series.max())
+
+
+def _resolve_remote_feature_latest_date_dict(code_type_dict):
+    # 逻辑块：快照复用判据改为“网上当前可拉取到的最新日期”，不再参考本地原始缓存日期。
+    import akshare as ak
+
+    latest_date_dict = {}
+    for code, code_type in dict(code_type_dict).items():
+        feature_df = _fetch_feature_df_by_type(
+            ak_module=ak,
+            code=str(code).zfill(6),
+            code_type=code_type,
+            last_cached_date=None,
+        )
+        if len(feature_df) == 0 or "date" not in feature_df.columns:
+            latest_date_dict[str(code).zfill(6)] = None
+            continue
+        remote_date_series = pd.to_datetime(feature_df["date"], errors="coerce").dropna()
+        latest_date_dict[str(code).zfill(6)] = None if len(remote_date_series) == 0 else pd.Timestamp(remote_date_series.max())
+    return latest_date_dict
+
+
+def _should_reuse_strategy_advice_wide_feature_snapshot(config, fund_code, code_type_dict):
+    # 逻辑块：只有当宽表快照不落后于网上当前可拉取数据时才直接复用，否则继续走增量更新并重建。
+    if bool(config.get("force_refresh", False)):
+        return False, None, None, _build_strategy_advice_wide_feature_cache_path(data_dir=config["data_dir"], fund_code=fund_code)
+    snapshot_path = _build_strategy_advice_wide_feature_cache_path(
+        data_dir=config["data_dir"],
+        fund_code=fund_code,
+    )
+    snapshot_latest_date = _resolve_strategy_advice_wide_feature_snapshot_date(cache_path=snapshot_path)
+    if snapshot_latest_date is None:
+        return False, snapshot_path, None, {}
+    remote_latest_date_dict = _resolve_remote_feature_latest_date_dict(code_type_dict=code_type_dict)
+    comparable_latest_date_list = [date_value for date_value in remote_latest_date_dict.values() if date_value is not None]
+    if len(comparable_latest_date_list) == 0:
+        return False, snapshot_path, snapshot_latest_date, remote_latest_date_dict
+    if snapshot_latest_date >= max(comparable_latest_date_list):
+        return True, snapshot_path, snapshot_latest_date, remote_latest_date_dict
+    return False, snapshot_path, snapshot_latest_date, remote_latest_date_dict
+
+
+def _build_latest_checked_source_feature_df(wide_feature_df, required_source_column_list):
+    # 逻辑块：流程6按流程0单列缺失治理规则处理基础特征，只保留最终组合需要的基础特征列。
+    checked_feature_df = pd.DataFrame(wide_feature_df, copy=True)
+    required_source_column_set = set(str(column) for column in required_source_column_list)
+    feature_quality_report_list = []
+    dropped_source_column_list = []
+    for feature_column in [column for column in checked_feature_df.columns if column != "date"]:
+        feature_quality_report = _build_single_feature_missing_report(
+            checked_feature_df=checked_feature_df,
+            feature_column=feature_column,
+        )
+        if bool(feature_quality_report["dropped"]):
+            dropped_source_column_list.append(str(feature_column))
+            feature_quality_report["filled"] = False
+            feature_quality_report["filled_missing_count"] = 0
+            feature_quality_report_list.append(feature_quality_report)
+            continue
+        if int(feature_quality_report["missing_count"]) > 0:
+            checked_feature_df = _fill_single_feature_missing_by_linear_interpolation(
+                checked_feature_df=checked_feature_df,
+                feature_column=feature_column,
+            )
+            feature_quality_report["filled"] = True
+            feature_quality_report["filled_missing_count"] = int(feature_quality_report["missing_count"])
+        else:
+            feature_quality_report["filled"] = False
+            feature_quality_report["filled_missing_count"] = 0
+        feature_quality_report_list.append(feature_quality_report)
+    available_source_column_set = set(column for column in checked_feature_df.columns if column != "date") - set(dropped_source_column_list)
+    missing_required_source_column_list = sorted(list(required_source_column_set - available_source_column_set))
+    if len(missing_required_source_column_list) > 0:
+        raise ValueError(f"流程6所需基础特征列因缺失质量问题不可用: {missing_required_source_column_list}")
+    kept_column_list = ["date"] + [column for column in checked_feature_df.columns if column in required_source_column_set]
+    return checked_feature_df[kept_column_list].copy(), feature_quality_report_list
+
+
+def _build_latest_required_factor_df(checked_source_feature_df, candidate_label_config_list, score_window):
+    # 逻辑块：流程6只重建流程5最终组合需要的因子列，并保持与流程0一致的标准化与翻转语义。
+    checked_source_feature_df = pd.DataFrame(checked_source_feature_df, copy=True)
+    factor_df = checked_source_feature_df[["date"]].copy()
+    source_column_config_dict = {}
+    for candidate_label_config in candidate_label_config_list:
+        source_column_config_dict.setdefault(str(candidate_label_config["source_column"]), []).append(dict(candidate_label_config))
+    for source_column, source_config_list in source_column_config_dict.items():
+        feature_series = pd.Series(checked_source_feature_df[source_column], copy=True).astype(float)
+        factor_df[f"{source_column}__zscore"] = rolling_zscore(feature_series, window=int(score_window))
+        for source_config in source_config_list:
+            if str(source_config["factor_name"]) == "zscore":
+                continue
+            raw_factor_series = pd.Series(
+                build_raw_factor_series(
+                    price_series=feature_series,
+                    factor_name=str(source_config["factor_name"]),
+                    factor_param_dict={
+                        str(source_config["factor_name"]): dict(source_config["factor_param_dict"]),
+                    },
+                ),
+                copy=True,
+            ).astype(float)
+            raw_factor_series = raw_factor_series.replace([float("inf"), -float("inf")], float("nan"))
+            normalized_factor_series = normalize_factor_series(
+                raw_factor_series=raw_factor_series,
+                factor_name=str(source_config["factor_name"]),
+                score_window=int(score_window),
+            )
+            output_series = pd.Series(normalized_factor_series, copy=True).astype(float)
+            output_column = str(source_config["candidate_label"])
+            if bool(source_config["flipped"]):
+                output_series = -output_series
+            factor_df[output_column] = output_series
+    required_candidate_column_list = [str(config["candidate_label"]) for config in candidate_label_config_list]
+    kept_column_list = ["date"] + required_candidate_column_list
+    factor_df = factor_df[[column for column in kept_column_list if column in factor_df.columns]].copy()
+    factor_df = _trim_initial_rows(feature_df=factor_df)
+    return factor_df
+
+
+def run_strategy_advice(config_override=None):
+    config = build_tradition_config(config_override=config_override)
+    strategy_backtest_path = config.get("strategy_backtest_path")
+    if strategy_backtest_path is None:
+        raise ValueError("strategy-advice 模式必须提供 strategy_backtest_path。")
+    strategy_backtest_input, resolved_strategy_backtest_path = load_strategy_backtest_input(strategy_backtest_path)
+    strategy_backtest_output = dict(strategy_backtest_input["strategy_backtest_output"])
+    fund_code = resolve_fund_code_from_strategy_backtest_input(
+        strategy_backtest_input=strategy_backtest_input,
+        strategy_backtest_path=resolved_strategy_backtest_path,
+    )
+    candidate_label_list = [str(candidate_label) for candidate_label in strategy_backtest_output.get("candidate_label_list", [])]
+    if len(candidate_label_list) == 0:
+        raise ValueError("strategy_backtest 结果缺少 candidate_label_list，请重新执行流程5。")
+    candidate_weight_dict = {
+        str(candidate_label): float(weight_value)
+        for candidate_label, weight_value in dict(strategy_backtest_output.get("candidate_weight_dict", {})).items()
+    }
+    best_strategy_summary = dict(strategy_backtest_output.get("best_strategy_test_summary", {}))
+    if len(best_strategy_summary) == 0:
+        raise ValueError("strategy_backtest 结果缺少 best_strategy_test_summary，请重新执行流程5。")
+    required_strategy_key_list = ["position_function_name", "position_function_params", "ema_span", "trade_gate"]
+    missing_strategy_key_list = [key for key in required_strategy_key_list if key not in best_strategy_summary]
+    if len(missing_strategy_key_list) > 0:
+        raise ValueError(f"strategy_backtest 结果缺少流程6必需字段: {missing_strategy_key_list}")
+
+    factor_combination_path = strategy_backtest_output.get("factor_combination_path")
+    if factor_combination_path is None:
+        raise ValueError("strategy_backtest 结果缺少 factor_combination_path，请重新执行流程5。")
+    factor_combination_input, resolved_factor_combination_path = load_factor_combination_input(factor_combination_path)
+    factor_combination_output = dict(factor_combination_input["factor_combination_output"])
+    score_window = int(dict(config["strategy_param_dict"]["multi_factor_score"])["score_window"])
+    candidate_label_config_list = [_parse_candidate_label_config(candidate_label) for candidate_label in candidate_label_list]
+    required_source_column_list = sorted(
+        set(str(candidate_label_config["source_column"]) for candidate_label_config in candidate_label_config_list)
+    )
+
+    # 逻辑块：流程6主动回源拉最新数据，再按流程0口径处理基础特征并重建最终组合所需因子。
+    code_type_dict = _resolve_feature_preprocess_code_type_dict(config=config)
+    should_reuse_snapshot, latest_wide_feature_path, snapshot_latest_date, remote_feature_latest_date_dict = _should_reuse_strategy_advice_wide_feature_snapshot(
+        config=config,
+        fund_code=fund_code,
+        code_type_dict=code_type_dict,
+    )
+    if bool(should_reuse_snapshot):
+        wide_feature_df = _load_strategy_advice_wide_feature_df(cache_path=latest_wide_feature_path)
+    else:
+        wide_feature_df, _ = _build_latest_wide_feature_df(config=config, fund_code=fund_code)
+        latest_wide_feature_path = _save_strategy_advice_wide_feature_df(
+            wide_feature_df=wide_feature_df,
+            cache_path=latest_wide_feature_path,
+        )
+        wide_feature_df = _load_strategy_advice_wide_feature_df(cache_path=latest_wide_feature_path)
+        snapshot_latest_date = _resolve_strategy_advice_wide_feature_snapshot_date(cache_path=latest_wide_feature_path)
+        remote_feature_latest_date_dict = _resolve_remote_feature_latest_date_dict(code_type_dict=code_type_dict)
+    checked_source_feature_df, feature_quality_report_list = _build_latest_checked_source_feature_df(
+        wide_feature_df=wide_feature_df,
+        required_source_column_list=required_source_column_list,
+    )
+    factor_feature_df = _build_latest_required_factor_df(
+        checked_source_feature_df=checked_source_feature_df,
+        candidate_label_config_list=candidate_label_config_list,
+        score_window=score_window,
+    )
+    factor_feature_df["date"] = pd.to_datetime(factor_feature_df["date"], errors="coerce")
+    factor_feature_df = factor_feature_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    factor_feature_df = factor_feature_df.set_index("date")
+    missing_candidate_column_list = [column for column in candidate_label_list if column not in factor_feature_df.columns]
+    if len(missing_candidate_column_list) > 0:
+        raise ValueError(f"流程6未能重建最终组合所需因子列: {missing_candidate_column_list}")
+    factor_candidate_list = [
+        dict(dict(factor_combination_output.get("factor_candidate_record_dict", {})).get(candidate_label, {"candidate_label": candidate_label}))
+        for candidate_label in candidate_label_list
+    ]
+    factor_series_dict = {
+        candidate_label: pd.Series(factor_feature_df[candidate_label], copy=True).astype(float)
+        for candidate_label in candidate_label_list
+    }
+    score_series = build_strategy_score_series(
+        factor_candidate_list=factor_candidate_list,
+        factor_series_dict=factor_series_dict,
+        candidate_weight_dict=candidate_weight_dict,
+    )
+    target_position_series = build_target_position_series(
+        score_series=score_series,
+        position_function_name=str(best_strategy_summary["position_function_name"]),
+        function_param_dict=dict(best_strategy_summary["position_function_params"]),
+        ema_span=int(best_strategy_summary["ema_span"]),
+        trade_gate=float(best_strategy_summary["trade_gate"]),
+    )
+    target_position_series = pd.Series(target_position_series, copy=True).dropna()
+    score_series = pd.Series(score_series, copy=True).reindex(target_position_series.index)
+    if len(target_position_series) < 2:
+        raise ValueError("流程6至少需要两个有效交易日样本，当前样本不足。")
+
+    latest_date = pd.Timestamp(target_position_series.index[-1])
+    previous_date = pd.Timestamp(target_position_series.index[-2])
+    latest_target_position = float(target_position_series.iloc[-1])
+    previous_target_position = float(target_position_series.iloc[-2])
+    position_delta = float(latest_target_position - previous_target_position)
+    trade_gate = float(best_strategy_summary["trade_gate"])
+    if position_delta > 1e-12:
+        action = "加仓"
+    elif position_delta < -1e-12:
+        action = "减仓"
+    else:
+        action = "持有"
+
+    # 逻辑块：拆解最新一日因子贡献，输出正负贡献最大的因子，便于解释今日动作来源。
+    latest_contribution_record_list = []
+    for candidate_label in candidate_label_list:
+        factor_value = float(factor_series_dict[candidate_label].reindex([latest_date]).iloc[0])
+        weight_value = float(candidate_weight_dict[candidate_label])
+        contribution_value = float(factor_value * weight_value)
+        latest_contribution_record_list.append(
+            {
+                "candidate_label": candidate_label,
+                "factor_value": factor_value,
+                "weight": weight_value,
+                "contribution": contribution_value,
+            }
+        )
+    positive_contribution_record_list = [
+        dict(record)
+        for record in sorted(
+            [record for record in latest_contribution_record_list if float(record["contribution"]) > 0.0],
+            key=lambda record: (-float(record["contribution"]), str(record["candidate_label"])),
+        )[:3]
+    ]
+    negative_contribution_record_list = [
+        dict(record)
+        for record in sorted(
+            [record for record in latest_contribution_record_list if float(record["contribution"]) < 0.0],
+            key=lambda record: (float(record["contribution"]), str(record["candidate_label"])),
+        )[:3]
+    ]
+
+    strategy_advice_output = {
+        "fund_code": fund_code,
+        "analysis_date": datetime.today().strftime("%Y-%m-%d"),
+        "strategy_backtest_path": str(resolved_strategy_backtest_path),
+        "factor_combination_path": str(resolved_factor_combination_path),
+        "latest_wide_feature_path": str(latest_wide_feature_path),
+        "used_cached_wide_feature_snapshot": bool(should_reuse_snapshot),
+        "latest_wide_feature_snapshot_date": None if snapshot_latest_date is None else pd.Timestamp(snapshot_latest_date).strftime("%Y-%m-%d"),
+        "remote_feature_latest_date_dict": {
+            str(code): None if date_value is None else pd.Timestamp(date_value).strftime("%Y-%m-%d")
+            for code, date_value in dict(remote_feature_latest_date_dict).items()
+        },
+        "latest_date": latest_date.strftime("%Y-%m-%d"),
+        "previous_date": previous_date.strftime("%Y-%m-%d"),
+        "latest_score": float(score_series.loc[latest_date]),
+        "previous_score": float(score_series.loc[previous_date]),
+        "latest_target_position": latest_target_position,
+        "previous_target_position": previous_target_position,
+        "position_delta": position_delta,
+        "trade_gate": trade_gate,
+        "trade_triggered": bool(abs(position_delta) >= trade_gate),
+        "action": action,
+        "position_function_name": str(best_strategy_summary["position_function_name"]),
+        "position_function_params": dict(best_strategy_summary["position_function_params"]),
+        "ema_span": int(best_strategy_summary["ema_span"]),
+        "candidate_label_list": list(candidate_label_list),
+        "candidate_weight_dict": dict(candidate_weight_dict),
+        "required_source_column_list": required_source_column_list,
+        "feature_quality_report_list": feature_quality_report_list,
+        "top_positive_contributors": positive_contribution_record_list,
+        "top_negative_contributors": negative_contribution_record_list,
+    }
+    summary_path = save_strategy_advice_output(
+        strategy_backtest_input=strategy_backtest_input,
+        strategy_advice_output=strategy_advice_output,
+        output_dir=config["output_dir"],
+        fund_code=fund_code,
+    )
+    result = {
+        **strategy_advice_output,
+        "summary_path": summary_path,
+    }
+    print_strategy_advice_summary(result)
     return result

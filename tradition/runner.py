@@ -13,6 +13,7 @@ from tradition.factor_analysis import (
     run_factor_selection_single_fund,
     run_single_factor_dedup_selection,
     run_single_factor_stability_analysis,
+    run_strategy_advice,
     run_strategy_backtest,
 )
 from tradition.metrics import compute_return_metrics, save_equity_curve_plot
@@ -77,6 +78,7 @@ def add_research_io_cli_arguments(parser):
     parser.add_argument("--dedup-root-topk", dest="dedup_root_topk", type=int, help="single_factor_dedup_selection 树形搜索使用的根节点数量，默认 3")
     parser.add_argument("--dedup-selection-path", dest="dedup_selection_path", help="single_factor_dedup_selection 流程输出的 JSON 文件路径")
     parser.add_argument("--factor-combination-path", dest="factor_combination_path", help="factor_combination 流程输出的 JSON 文件路径")
+    parser.add_argument("--strategy-backtest-path", dest="strategy_backtest_path", help="strategy_backtest 流程输出的 JSON 文件路径")
 
 
 def add_legacy_mode_arguments(parser):
@@ -178,6 +180,13 @@ def add_research_subparsers(subparsers):
         help="流程 5 连续仓位策略回测",
     )
     strategy_backtest_parser.set_defaults(command_group="research", command_name="strategy-backtest")
+
+    strategy_advice_parser = subparsers.add_parser(
+        "strategy-advice",
+        parents=[io_parent],
+        help="流程 6 今日策略建议",
+    )
+    strategy_advice_parser.set_defaults(command_group="research", command_name="strategy-advice")
 
 
 def resolve_legacy_cli_command(args):
@@ -282,6 +291,8 @@ def build_research_command_override(args, command_name):
         override["factor_combination"] = True
     elif command_name == "strategy-backtest":
         override["strategy_backtest"] = True
+    elif command_name == "strategy-advice":
+        override["strategy_advice"] = True
 
     if args.factor_groups is not None:
         override["factor_group_list"] = [group_name.strip() for group_name in str(args.factor_groups).split(",") if group_name.strip()]
@@ -305,6 +316,8 @@ def build_research_command_override(args, command_name):
         override["dedup_selection_path"] = str(args.dedup_selection_path)
     if args.factor_combination_path is not None:
         override["factor_combination_path"] = str(args.factor_combination_path)
+    if getattr(args, "strategy_backtest_path", None) is not None:
+        override["strategy_backtest_path"] = str(args.strategy_backtest_path)
     return override
 
 
@@ -1110,6 +1123,7 @@ def dispatch_runner_command(command_name, config_override):
         "research.dedup": run_single_factor_dedup_selection,
         "research.combination": run_factor_combination,
         "research.strategy-backtest": run_strategy_backtest,
+        "research.strategy-advice": run_strategy_advice,
     }
     if command_name not in dispatch_dict:
         raise ValueError(f"未知命令: {command_name}")

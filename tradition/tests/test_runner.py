@@ -191,6 +191,21 @@ def test_build_cli_override_collects_strategy_backtest_args():
     assert override["factor_combination_path"] == "/tmp/factor_combination_007301_2026-04-09.json"
 
 
+def test_build_cli_override_collects_strategy_advice_args():
+    parser = runner.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "research",
+            "strategy-advice",
+            "--strategy-backtest-path",
+            "/tmp/strategy_backtest_007301_2026-04-09.json",
+        ]
+    )
+    override = runner.build_cli_override(args)
+    assert override["strategy_advice"] is True
+    assert override["strategy_backtest_path"] == "/tmp/strategy_backtest_007301_2026-04-09.json"
+
+
 def test_resolve_runner_command_supports_legacy_flags():
     parser = runner.build_arg_parser()
     args = parser.parse_args(["--single-factor-dedup-selection"])
@@ -928,3 +943,21 @@ def test_main_dispatches_strategy_backtest_mode(monkeypatch):
         ]
     )
     assert "strategy_backtest" in called
+
+
+def test_main_dispatches_strategy_advice_mode(monkeypatch):
+    called = {}
+    monkeypatch.setattr(
+        runner,
+        "run_strategy_advice",
+        lambda config_override=None: called.setdefault("strategy_advice", config_override),
+    )
+    runner.main(
+        [
+            "research",
+            "strategy-advice",
+            "--strategy-backtest-path",
+            "/tmp/strategy_backtest_007301_2026-04-09.json",
+        ]
+    )
+    assert "strategy_advice" in called

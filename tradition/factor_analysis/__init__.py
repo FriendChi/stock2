@@ -6,6 +6,7 @@ from .backtest import (
     build_strategy_score_series,
     build_target_position_series,
     run_position_function_search,
+    run_strategy_advice,
     run_strategy_backtest,
     select_best_strategy_trial_summary,
 )
@@ -118,6 +119,7 @@ __all__ = [
     "run_factor_selection_single_fund",
     "run_optuna_extension_search",
     "run_position_function_search",
+    "run_strategy_advice",
     "run_single_factor_dedup_selection",
     "run_single_factor_stability_analysis",
     "run_strategy_backtest",
