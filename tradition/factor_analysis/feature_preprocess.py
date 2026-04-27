@@ -26,8 +26,11 @@ FEATURE_CACHE_PREFIX = "temp_price_cache"
 INCREMENTAL_FETCH_BUFFER_DAYS = 15
 OPEN_FUND_PERIOD_BUFFER_DAYS = 15
 MAX_FILL_MISSING_ROW_COUNT = 4
-MAX_RAW_NAN_RATIO = 0.2
-MAX_NORMALIZED_ZERO_RATIO = 0.8
+MAX_FACTOR_RAW_NAN_RATIO = 0.10
+MAX_NORMALIZED_ZERO_RATIO = 1.0
+INITIAL_TRIM_ROW_COUNT = 120
+MAX_FEATURE_MISSING_RATIO = 0.10
+MAX_FEATURE_CONSECUTIVE_MISSING_COUNT = 20
 
 
 def _resolve_feature_preprocess_code_type_dict(config):
@@ -474,7 +477,7 @@ def _load_saved_wide_feature_table(raw_output_path):
     return pd.read_csv(raw_output_path)
 
 
-def _validate_wide_feature_table_structure(wide_feature_df, code_type_dict, primary_code):
+def _validate_wide_feature_table_structure(wide_feature_df, code_type_dict, primary_code, require_all_code_group_columns=True):
     # 结构性问题属于硬错误，必须在补缺前先挡住。
     if len(wide_feature_df) == 0:
         raise ValueError("宽表为空，无法继续检查。")
@@ -487,11 +490,12 @@ def _validate_wide_feature_table_structure(wide_feature_df, code_type_dict, prim
         raise ValueError("宽表存在重复日期。")
     if not bool(date_series.is_monotonic_increasing):
         raise ValueError("宽表日期未按升序排列。")
-    for code in dict(code_type_dict).keys():
-        normalized_code = str(code).zfill(6)
-        column_list = [column for column in wide_feature_df.columns if column.startswith(f"{normalized_code}__")]
-        if len(column_list) == 0:
-            raise ValueError(f"宽表缺少代码列组: {normalized_code}")
+    if bool(require_all_code_group_columns):
+        for code in dict(code_type_dict).keys():
+            normalized_code = str(code).zfill(6)
+            column_list = [column for column in wide_feature_df.columns if column.startswith(f"{normalized_code}__")]
+            if len(column_list) == 0:
+                raise ValueError(f"宽表缺少代码列组: {normalized_code}")
     primary_prefix = f"{str(primary_code).zfill(6)}__"
     primary_column_list = [column for column in wide_feature_df.columns if column.startswith(primary_prefix)]
     primary_missing_mask = ~wide_feature_df[primary_column_list].notna().any(axis=1)
@@ -500,42 +504,79 @@ def _validate_wide_feature_table_structure(wide_feature_df, code_type_dict, prim
         raise ValueError(f"主代码存在整组缺失行: {missing_date_list}")
 
 
-def _resolve_group_missing_row_position_list(wide_feature_df, feature_column_list):
-    # 缺失行按“该代码整组字段全部为空”定义，而不是按单列缺失定义。
-    if len(feature_column_list) == 0:
-        return []
-    missing_mask = ~wide_feature_df[feature_column_list].notna().any(axis=1)
-    return wide_feature_df.index[missing_mask].tolist()
+def _build_missing_position_list(feature_series):
+    # 基础特征缺失治理改为单列口径，便于直接淘汰质量差的列并阻断整条派生链。
+    feature_series = pd.Series(feature_series, copy=False)
+    return feature_series.index[feature_series.isna()].tolist()
 
 
-def _is_non_consecutive_position_list(position_list):
-    # 只有离散零散缺口才允许用局部均值修补，连续缺口直接保留为问题。
-    if len(position_list) <= 1:
-        return True
-    return all(int(position_list[idx]) - int(position_list[idx - 1]) > 1 for idx in range(1, len(position_list)))
+def _compute_max_consecutive_missing_span(position_list):
+    # 连续缺失段长度用于直接淘汰长缺口特征，不再依赖整组字段是否同时为空。
+    if len(position_list) == 0:
+        return 0, None, None
+    best_length = 1
+    best_start = int(position_list[0])
+    best_end = int(position_list[0])
+    current_start = int(position_list[0])
+    current_end = int(position_list[0])
+    for position in position_list[1:]:
+        position = int(position)
+        if position == current_end + 1:
+            current_end = position
+        else:
+            current_length = current_end - current_start + 1
+            if current_length > best_length:
+                best_length = current_length
+                best_start = current_start
+                best_end = current_end
+            current_start = position
+            current_end = position
+    current_length = current_end - current_start + 1
+    if current_length > best_length:
+        best_length = current_length
+        best_start = current_start
+        best_end = current_end
+    return int(best_length), int(best_start), int(best_end)
 
 
-def _fill_group_missing_rows_by_neighbor_average(wide_feature_df, feature_column_list, missing_row_position_list):
-    # 满足条件的缺失行按列取前后相邻有效值平均，避免跨代码或跨列混算。
-    filled_df = wide_feature_df.copy()
-    filled_date_list = []
-    unresolved_date_list = []
-    for position in missing_row_position_list:
-        if position <= 0 or position >= len(filled_df) - 1:
-            unresolved_date_list.append(str(filled_df.loc[position, "date"]))
-            continue
-        previous_row = filled_df.loc[position - 1, feature_column_list]
-        next_row = filled_df.loc[position + 1, feature_column_list]
-        if bool(previous_row.isna().any()) or bool(next_row.isna().any()):
-            unresolved_date_list.append(str(filled_df.loc[position, "date"]))
-            continue
-        filled_df.loc[position, feature_column_list] = (previous_row.astype(float) + next_row.astype(float)) / 2.0
-        filled_date_list.append(str(filled_df.loc[position, "date"]))
-    return filled_df, filled_date_list, unresolved_date_list
+def _build_single_feature_missing_report(checked_feature_df, feature_column):
+    # 单列缺失报告既服务于阈值淘汰，也服务于末尾警告和元信息落盘。
+    feature_series = pd.to_numeric(pd.Series(checked_feature_df[feature_column], copy=True), errors="coerce")
+    missing_position_list = _build_missing_position_list(feature_series=feature_series)
+    max_consecutive_missing_count, max_start_position, max_end_position = _compute_max_consecutive_missing_span(
+        position_list=missing_position_list,
+    )
+    missing_ratio = float(len(missing_position_list) / len(feature_series)) if len(feature_series) > 0 else 0.0
+    drop_reason_list = []
+    if missing_ratio >= float(MAX_FEATURE_MISSING_RATIO):
+        drop_reason_list.append("missing_ratio_threshold")
+    if max_consecutive_missing_count >= int(MAX_FEATURE_CONSECUTIVE_MISSING_COUNT):
+        drop_reason_list.append("consecutive_missing_threshold")
+    return {
+        "column": str(feature_column),
+        "missing_count": int(len(missing_position_list)),
+        "missing_ratio": missing_ratio,
+        "missing_date_list": [str(checked_feature_df.loc[position, "date"]) for position in missing_position_list],
+        "max_consecutive_missing_count": int(max_consecutive_missing_count),
+        "max_consecutive_missing_start_date": None if max_start_position is None else str(checked_feature_df.loc[max_start_position, "date"]),
+        "max_consecutive_missing_end_date": None if max_end_position is None else str(checked_feature_df.loc[max_end_position, "date"]),
+        "dropped": bool(len(drop_reason_list) > 0),
+        "drop_reason_list": drop_reason_list,
+    }
+
+
+def _fill_single_feature_missing_by_linear_interpolation(checked_feature_df, feature_column):
+    # 方案B：先线性插值，再用最近有效值补齐边界缺口，避免首尾残留 NaN。
+    filled_df = checked_feature_df.copy()
+    feature_series = pd.to_numeric(pd.Series(filled_df[feature_column], copy=True), errors="coerce")
+    interpolated_series = feature_series.interpolate(method="linear", limit_direction="both")
+    interpolated_series = interpolated_series.ffill().bfill()
+    filled_df[feature_column] = interpolated_series.astype(float)
+    return filled_df
 
 
 def _check_and_fill_wide_feature_table(raw_output_path, code_type_dict, primary_code):
-    # 检查与补缺都基于原始文件执行，补后的结果另存为 checked 文件。
+    # 基础特征先按单列质量做淘汰和线性补全，再进入流程0后续因子构造。
     raw_feature_df = _load_saved_wide_feature_table(raw_output_path=raw_output_path)
     _validate_wide_feature_table_structure(
         wide_feature_df=raw_feature_df,
@@ -543,51 +584,49 @@ def _check_and_fill_wide_feature_table(raw_output_path, code_type_dict, primary_
         primary_code=primary_code,
     )
     checked_feature_df = raw_feature_df.copy()
-    code_report_list = []
-    for code in dict(code_type_dict).keys():
-        normalized_code = str(code).zfill(6)
-        feature_column_list = [column for column in checked_feature_df.columns if column.startswith(f"{normalized_code}__")]
-        missing_row_position_list = _resolve_group_missing_row_position_list(
-            wide_feature_df=checked_feature_df,
-            feature_column_list=feature_column_list,
+    source_column_list = [column for column in checked_feature_df.columns if column != "date"]
+    feature_quality_report_list = []
+    dropped_source_column_list = []
+    for feature_column in source_column_list:
+        feature_quality_report = _build_single_feature_missing_report(
+            checked_feature_df=checked_feature_df,
+            feature_column=feature_column,
         )
-        missing_date_list = [str(checked_feature_df.loc[position, "date"]) for position in missing_row_position_list]
-        filled_date_list = []
-        unresolved_date_list = list(missing_date_list)
-        if (
-            0 < len(missing_row_position_list) <= int(MAX_FILL_MISSING_ROW_COUNT)
-            and _is_non_consecutive_position_list(missing_row_position_list)
-        ):
-            checked_feature_df, filled_date_list, unresolved_date_list = _fill_group_missing_rows_by_neighbor_average(
-                wide_feature_df=checked_feature_df,
-                feature_column_list=feature_column_list,
-                missing_row_position_list=missing_row_position_list,
+        if bool(feature_quality_report["dropped"]):
+            dropped_source_column_list.append(str(feature_column))
+            feature_quality_report["filled"] = False
+            feature_quality_report["filled_missing_count"] = 0
+            feature_quality_report_list.append(feature_quality_report)
+            continue
+        if int(feature_quality_report["missing_count"]) > 0:
+            checked_feature_df = _fill_single_feature_missing_by_linear_interpolation(
+                checked_feature_df=checked_feature_df,
+                feature_column=feature_column,
             )
-        code_report_list.append(
-            {
-                "code": normalized_code,
-                "missing_row_count": int(len(missing_row_position_list)),
-                "missing_date_list": missing_date_list,
-                "filled_row_count": int(len(filled_date_list)),
-                "filled_date_list": filled_date_list,
-                "remaining_missing_row_count": int(len(unresolved_date_list)),
-                "remaining_missing_date_list": unresolved_date_list,
-            }
-        )
+            feature_quality_report["filled"] = True
+            feature_quality_report["filled_missing_count"] = int(feature_quality_report["missing_count"])
+        else:
+            feature_quality_report["filled"] = False
+            feature_quality_report["filled_missing_count"] = 0
+        feature_quality_report_list.append(feature_quality_report)
+    if len(dropped_source_column_list) > 0:
+        checked_feature_df = checked_feature_df.drop(columns=dropped_source_column_list).copy()
     _validate_wide_feature_table_structure(
         wide_feature_df=checked_feature_df,
         code_type_dict=code_type_dict,
         primary_code=primary_code,
+        require_all_code_group_columns=False,
     )
     checked_output_path = _build_checked_output_path(raw_output_path=raw_output_path)
     checked_feature_df.to_csv(checked_output_path, index=False)
-    return checked_feature_df, checked_output_path, code_report_list
+    return checked_feature_df, checked_output_path, feature_quality_report_list, dropped_source_column_list
 
 
-def _resolve_factor_source_column_list(checked_feature_df):
+def _resolve_factor_source_column_list(checked_feature_df, dropped_source_column_list=None):
     # 因子计算只消费 checked 宽表中的基础特征列，不把 date 当作输入特征。
     checked_feature_df = pd.DataFrame(checked_feature_df, copy=True)
-    return [column for column in checked_feature_df.columns if column != "date"]
+    dropped_source_column_set = set([] if dropped_source_column_list is None else list(dropped_source_column_list))
+    return [column for column in checked_feature_df.columns if column != "date" and column not in dropped_source_column_set]
 
 
 def _build_factor_candidate_config(strategy_params):
@@ -599,6 +638,40 @@ def _build_factor_candidate_config(strategy_params):
         strategy_params=resolved_strategy_params,
     )
     return resolved_strategy_params, candidate_factor_list
+
+
+def _build_mature_sample_mask(index_like, trim_row_count=INITIAL_TRIM_ROW_COUNT):
+    # 前段统一裁剪口径同时服务于筛选统计和最终整表输出，避免两处各自维护边界。
+    sample_index = pd.Index(index_like)
+    mature_sample_mask = pd.Series(True, index=sample_index, dtype=bool)
+    trim_row_count = max(int(trim_row_count), 0)
+    if trim_row_count <= 0 or len(sample_index) == 0:
+        return mature_sample_mask
+    mature_sample_mask.iloc[: min(trim_row_count, len(sample_index))] = False
+    return mature_sample_mask
+
+
+def _compute_normalized_zero_ratio_on_mature_samples(normalized_factor_series, trim_row_count=INITIAL_TRIM_ROW_COUNT):
+    # 高零占比判定只看成熟样本段，避免初始窗口不足和早期不稳定区间放大零值比例。
+    normalized_factor_series = pd.Series(normalized_factor_series, copy=True).astype(float)
+    mature_sample_mask = _build_mature_sample_mask(
+        index_like=normalized_factor_series.index,
+        trim_row_count=trim_row_count,
+    )
+    mature_sample_series = normalized_factor_series.loc[mature_sample_mask]
+    if len(mature_sample_series) == 0:
+        return 0.0
+    return float((mature_sample_series == 0.0).mean())
+
+
+def _trim_initial_rows(feature_df, trim_row_count=INITIAL_TRIM_ROW_COUNT):
+    # 流程0最终输出按统一行裁剪，保证 date、价格列和全部因子列继续共享同一索引。
+    feature_df = pd.DataFrame(feature_df, copy=True)
+    trim_row_count = max(int(trim_row_count), 0)
+    if trim_row_count <= 0 or len(feature_df) == 0:
+        return feature_df.reset_index(drop=True)
+    trimmed_feature_df = feature_df.iloc[min(trim_row_count, len(feature_df)) :].copy()
+    return trimmed_feature_df.reset_index(drop=True)
 
 
 def _build_single_feature_factor_df(feature_series, candidate_factor_list, strategy_params):
@@ -628,13 +701,21 @@ def _build_single_feature_factor_df(feature_series, candidate_factor_list, strat
             score_window=score_window,
         )
         normalized_factor_series = pd.Series(normalized_factor_series, copy=True).astype(float)
-        normalized_zero_ratio = float((normalized_factor_series == 0.0).mean())
-        if raw_nan_ratio > float(MAX_RAW_NAN_RATIO) or normalized_zero_ratio > float(MAX_NORMALIZED_ZERO_RATIO):
+        normalized_zero_ratio = _compute_normalized_zero_ratio_on_mature_samples(
+            normalized_factor_series=normalized_factor_series,
+        )
+        drop_reason_list = []
+        if raw_nan_ratio >= float(MAX_FACTOR_RAW_NAN_RATIO):
+            drop_reason_list.append("raw_nan_ratio_threshold")
+        if normalized_zero_ratio > float(MAX_NORMALIZED_ZERO_RATIO):
+            drop_reason_list.append("normalized_zero_ratio_threshold")
+        if len(drop_reason_list) > 0:
             dropped_factor_report_list.append(
                 {
                     "candidate_label": candidate_label,
                     "raw_nan_ratio": raw_nan_ratio,
                     "normalized_zero_ratio": normalized_zero_ratio,
+                    "drop_reason_list": drop_reason_list,
                 }
             )
             continue
@@ -643,11 +724,14 @@ def _build_single_feature_factor_df(feature_series, candidate_factor_list, strat
     return factor_df.fillna(0.0), dropped_factor_report_list
 
 
-def _build_checked_factor_table(checked_output_path, strategy_params):
+def _build_checked_factor_table(checked_output_path, strategy_params, dropped_source_column_list=None):
     # checked 表在补缺完成后直接扩展标准化原始特征和标准化因子，不再单独落因子文件。
     checked_feature_df = _load_saved_wide_feature_table(raw_output_path=checked_output_path)
     resolved_strategy_params, candidate_factor_list = _build_factor_candidate_config(strategy_params=strategy_params)
-    source_column_list = _resolve_factor_source_column_list(checked_feature_df=checked_feature_df)
+    source_column_list = _resolve_factor_source_column_list(
+        checked_feature_df=checked_feature_df,
+        dropped_source_column_list=dropped_source_column_list,
+    )
     extended_checked_df = checked_feature_df.copy()
     total_source_count = int(len(source_column_list))
     expected_added_column_count = int(total_source_count * (1 + len(candidate_factor_list)))
@@ -854,7 +938,8 @@ def _build_feature_preprocess_metadata(
     code_type_dict,
     source_column_list,
     candidate_factor_list,
-    code_report_list,
+    feature_quality_report_list,
+    dropped_source_column_list,
     dropped_factor_report_list,
     flipped_factor_report_list,
 ):
@@ -887,10 +972,24 @@ def _build_feature_preprocess_metadata(
         "row_count": int(len(checked_feature_df)),
         "column_count": int(len(checked_feature_df.columns)),
         "quality_summary": {
-            "code_report_list": list(code_report_list),
+            "feature_quality_report_list": list(feature_quality_report_list),
+            "dropped_source_column_count": int(len(dropped_source_column_list)),
             "dropped_factor_count": int(len(dropped_factor_report_list)),
             "flipped_factor_count": int(len(flipped_factor_report_list)),
         },
+        "dropped_source_feature_list": [
+            {
+                "column": str(record["column"]),
+                "missing_count": int(record["missing_count"]),
+                "missing_ratio": float(record["missing_ratio"]),
+                "max_consecutive_missing_count": int(record["max_consecutive_missing_count"]),
+                "max_consecutive_missing_start_date": record["max_consecutive_missing_start_date"],
+                "max_consecutive_missing_end_date": record["max_consecutive_missing_end_date"],
+                "drop_reason_list": list(record["drop_reason_list"]),
+            }
+            for record in list(feature_quality_report_list)
+            if bool(record["dropped"])
+        ],
         "dropped_feature_list": [
             {
                 "source_column": str(record["source_column"]),
@@ -898,7 +997,7 @@ def _build_feature_preprocess_metadata(
                 "output_column": f"{str(record['source_column'])}__{str(record['candidate_label'])}__zscore",
                 "raw_nan_ratio": float(record["raw_nan_ratio"]),
                 "normalized_zero_ratio": float(record["normalized_zero_ratio"]),
-                "drop_reason": "threshold_exceeded",
+                "drop_reason_list": list(record["drop_reason_list"]),
             }
             for record in list(dropped_factor_report_list)
         ],
@@ -916,23 +1015,43 @@ def _build_feature_preprocess_metadata(
     }
 
 
-def _print_code_report_list(code_report_list):
-    print("缺失值修补情况:")
-    if len(code_report_list) == 0:
+def _print_feature_quality_report_list(feature_quality_report_list):
+    print("基础特征缺失治理情况:")
+    if len(feature_quality_report_list) == 0:
         print("无")
         return
-    for code_report in code_report_list:
+    for feature_quality_report in feature_quality_report_list:
         print(
-            "代码检查:",
-            code_report["code"],
-            f"缺失行数={code_report['missing_row_count']}",
-            f"已填补={code_report['filled_row_count']}",
-            f"剩余缺失={code_report['remaining_missing_row_count']}",
+            "基础特征检查:",
+            feature_quality_report["column"],
+            f"缺失数={feature_quality_report['missing_count']}",
+            f"缺失率={feature_quality_report['missing_ratio']:.4f}",
+            f"最长连续缺失={feature_quality_report['max_consecutive_missing_count']}",
+            f"已填补={int(feature_quality_report['filled_missing_count'])}",
+            f"已抛弃={bool(feature_quality_report['dropped'])}",
         )
-        if len(code_report["filled_date_list"]) > 0:
-            print("已填补日期:", ",".join(code_report["filled_date_list"]))
-        if len(code_report["remaining_missing_date_list"]) > 0:
-            print("剩余缺失日期:", ",".join(code_report["remaining_missing_date_list"]))
+        if feature_quality_report["max_consecutive_missing_start_date"] is not None:
+            print(
+                "最长连续缺失区间:",
+                f"{feature_quality_report['max_consecutive_missing_start_date']} -> {feature_quality_report['max_consecutive_missing_end_date']}",
+            )
+        if len(feature_quality_report["drop_reason_list"]) > 0:
+            print("抛弃原因:", ",".join(feature_quality_report["drop_reason_list"]))
+
+
+def _print_dropped_source_column_warning_list(feature_quality_report_list):
+    dropped_feature_quality_report_list = [record for record in list(feature_quality_report_list) if bool(record["dropped"])]
+    if len(dropped_feature_quality_report_list) == 0:
+        return
+    print("警告: 以下基础特征列已因缺失质量问题被抛弃")
+    for feature_quality_report in dropped_feature_quality_report_list:
+        print(
+            "抛弃基础特征:",
+            feature_quality_report["column"],
+            f"缺失率={feature_quality_report['missing_ratio']:.4f}",
+            f"最长连续缺失={feature_quality_report['max_consecutive_missing_count']}",
+            f"原因={','.join(feature_quality_report['drop_reason_list'])}",
+        )
 
 
 def _print_dropped_factor_report_list(dropped_factor_report_list):
@@ -947,7 +1066,7 @@ def _print_dropped_factor_report_list(dropped_factor_report_list):
             f"因子={dropped_factor_report['candidate_label']}__zscore",
             f"raw_nan_ratio={dropped_factor_report['raw_nan_ratio']:.4f}",
             f"normalized_zero_ratio={dropped_factor_report['normalized_zero_ratio']:.4f}",
-            "原因=超过阈值",
+            f"原因={','.join(dropped_factor_report['drop_reason_list'])}",
         )
 
 
@@ -967,7 +1086,7 @@ def _print_flipped_factor_report_list(flipped_factor_report_list):
         )
 
 
-def _print_feature_preprocess_summary(result, code_report_list, source_column_list, candidate_factor_list, dropped_factor_report_list, flipped_factor_report_list):
+def _print_feature_preprocess_summary(result, feature_quality_report_list, source_column_list, candidate_factor_list, dropped_factor_report_list, flipped_factor_report_list):
     # 流程0最终摘要集中打印关键产物、补缺、删因子和翻转结果，便于一次性审阅完整候选生成过程。
     print("特征预处理结果:")
     print("基金代码:", result["fund_code"])
@@ -981,9 +1100,10 @@ def _print_feature_preprocess_summary(result, code_report_list, source_column_li
     print("原始输出:", result["raw_output_path"])
     print("特征输出:", result["summary_path"])
     print("元信息输出:", result["metadata_path"])
-    _print_code_report_list(code_report_list=code_report_list)
+    _print_feature_quality_report_list(feature_quality_report_list=feature_quality_report_list)
     _print_dropped_factor_report_list(dropped_factor_report_list=dropped_factor_report_list)
     _print_flipped_factor_report_list(flipped_factor_report_list=flipped_factor_report_list)
+    _print_dropped_source_column_warning_list(feature_quality_report_list=feature_quality_report_list)
 
 
 def run_feature_preprocess_single_fund(config_override=None):
@@ -1002,7 +1122,7 @@ def run_feature_preprocess_single_fund(config_override=None):
         primary_code=fund_code,
         force_refresh=bool(config["force_refresh"]),
     )
-    checked_feature_df, checked_output_path, code_report_list = _check_and_fill_wide_feature_table(
+    checked_feature_df, checked_output_path, feature_quality_report_list, dropped_source_column_list = _check_and_fill_wide_feature_table(
         raw_output_path=resolved_raw_output_path,
         code_type_dict=code_type_dict,
         primary_code=fund_code,
@@ -1010,6 +1130,7 @@ def run_feature_preprocess_single_fund(config_override=None):
     checked_feature_df, checked_output_path, source_column_list, candidate_factor_list, dropped_factor_report_list = _build_checked_factor_table(
         checked_output_path=checked_output_path,
         strategy_params=config["strategy_param_dict"]["multi_factor_score"],
+        dropped_source_column_list=dropped_source_column_list,
     )
     # 翻转列生成沿用流程1训练集口径，只把稳定负向候选追加成新的 factor_feature 列。
     checked_feature_df, checked_output_path, flipped_factor_report_list = _append_flipped_factor_feature_columns(
@@ -1019,6 +1140,9 @@ def run_feature_preprocess_single_fund(config_override=None):
         fund_code=fund_code,
         config=config,
     )
+    # 流程0最终供后续阶段消费的整张特征表统一裁掉前段不稳定样本，保持全表列对齐。
+    checked_feature_df = _trim_initial_rows(feature_df=checked_feature_df)
+    checked_feature_df.to_csv(checked_output_path, index=False)
     metadata_output = _build_feature_preprocess_metadata(
         checked_feature_df=checked_feature_df,
         csv_path=checked_output_path,
@@ -1027,7 +1151,8 @@ def run_feature_preprocess_single_fund(config_override=None):
         code_type_dict=code_type_dict,
         source_column_list=source_column_list,
         candidate_factor_list=candidate_factor_list,
-        code_report_list=code_report_list,
+        feature_quality_report_list=feature_quality_report_list,
+        dropped_source_column_list=dropped_source_column_list,
         dropped_factor_report_list=dropped_factor_report_list,
         flipped_factor_report_list=flipped_factor_report_list,
     )
@@ -1050,7 +1175,7 @@ def run_feature_preprocess_single_fund(config_override=None):
     }
     _print_feature_preprocess_summary(
         result=result,
-        code_report_list=code_report_list,
+        feature_quality_report_list=feature_quality_report_list,
         source_column_list=source_column_list,
         candidate_factor_list=candidate_factor_list,
         dropped_factor_report_list=dropped_factor_report_list,

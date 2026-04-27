@@ -11,6 +11,7 @@ from tradition.factor_engine import (
     calculate_trend_r2,
     calculate_trend_residual,
     calculate_trend_tvalue,
+    normalize_factor_series,
     resolve_factor_name_list_by_group,
     resolve_factor_param_dict,
     rolling_zscore,
@@ -74,6 +75,31 @@ def test_rolling_zscore_returns_zero_for_constant_series():
     series = pd.Series([1.0] * 10)
     zscore = rolling_zscore(series, window=3)
     assert (zscore == 0.0).all()
+
+
+def test_rolling_zscore_uses_expanding_history_statistics():
+    series = pd.Series([1.0, 2.0, 3.0, 4.0], dtype=float)
+    zscore = rolling_zscore(series, window=3)
+    expected = pd.Series(
+        [
+            0.0,
+            1.0,
+            1.224744871391589,
+            1.3416407864998738,
+        ],
+        dtype=float,
+    )
+    assert expected.round(12).equals(zscore.round(12))
+
+
+def test_normalize_factor_series_skips_binary_series():
+    series = pd.Series([0.0, 1.0, 0.0, 1.0, 1.0], dtype=float)
+    normalized = normalize_factor_series(
+        raw_factor_series=series,
+        factor_name="donchian_breakout",
+        score_window=3,
+    )
+    assert series.equals(normalized)
 
 
 def test_calculate_factor_momentum_keeps_pct_change_semantics():

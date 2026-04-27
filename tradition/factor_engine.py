@@ -21,11 +21,11 @@ from tradition.factor_library import (
 
 
 def rolling_zscore(series, window):
-    # 用滚动均值和标准差做时序标准化，避免直接使用全样本统计带来未来信息污染。
+    # 按截至当前时点的累计历史做标准化，既避免未来信息污染，也不让局部固定窗口决定尺度。
     series = pd.Series(series, copy=True).astype(float)
-    rolling_mean = series.rolling(int(window)).mean()
-    rolling_std = series.rolling(int(window)).std(ddof=0)
-    zscore = (series - rolling_mean) / rolling_std.replace(0.0, float("nan"))
+    history_mean = series.expanding(min_periods=1).mean()
+    history_std = series.expanding(min_periods=1).std(ddof=0)
+    zscore = (series - history_mean) / history_std.replace(0.0, float("nan"))
     return zscore.fillna(0.0).astype(float)
 
 
@@ -80,6 +80,11 @@ def resolve_factor_param_dict(strategy_params):
 
 def normalize_factor_series(raw_factor_series, factor_name, score_window):
     # 标准化和同向化在统一入口处理，保证新增因子复用同一套评分口径。
+    raw_factor_series = pd.Series(raw_factor_series, copy=True).astype(float)
+    # 纯二值事件因子保留原始语义，避免把触发/未触发信号压成连续标准分。
+    non_na_unique_value_list = sorted(raw_factor_series.dropna().unique().tolist())
+    if len(non_na_unique_value_list) > 0 and set(non_na_unique_value_list).issubset({0.0, 1.0}):
+        return raw_factor_series
     normalized_factor = rolling_zscore(raw_factor_series, window=int(score_window))
     if factor_name in {"volatility", "drawdown", "trend_residual"}:
         return -normalized_factor
