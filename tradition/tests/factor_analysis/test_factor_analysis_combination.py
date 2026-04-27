@@ -17,20 +17,25 @@ def test_build_weight_search_range_dict_uses_five_percent_window():
 
 def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
     sample_index = pd.date_range("2024-01-01", periods=30, freq="D")
-    sample_df = pd.DataFrame(
+    preprocess_path = tmp_path / "feature_preprocess_007301_2026-04-09_c00000_checked.csv"
+    preprocess_df = pd.DataFrame(
         {
             "date": sample_index,
-            "code": ["007301"] * len(sample_index),
-            "fund": ["半导体"] * len(sample_index),
-            "nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "007301__cumulative_nav": [1.0 + idx * 0.01 for idx in range(len(sample_index))],
+            "momentum(window=10)": list(range(len(sample_index))),
+            "ma_slope(lookback=5, window=20)": list(reversed(range(len(sample_index)))),
         }
     )
+    preprocess_df.to_csv(preprocess_path, index=False)
     dedup_selection_path = tmp_path / "single_factor_dedup_007301_2026-04-09.json"
     dedup_selection_path.write_text(
         json.dumps(
             {
                 "dedup_selection_output": {
                     "fund_code": "007301",
+                    "data_mode": "feature_matrix",
+                    "preprocess_path": str(preprocess_path),
+                    "target_nav_column": "007301__cumulative_nav",
                     "record_dict": {
                         "momentum(window=10)": {
                             "candidate_label": "momentum(window=10)",
@@ -90,17 +95,6 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
             "dedup_selection_path": str(dedup_selection_path),
         },
     )
-    monkeypatch.setattr(factor_analysis.combination, "fetch_fund_data_with_cache", lambda **kwargs: sample_df)
-    monkeypatch.setattr(factor_analysis.combination, "normalize_fund_data", lambda data: data)
-    monkeypatch.setattr(factor_analysis.combination, "filter_single_fund", lambda data, fund_code: data)
-    monkeypatch.setattr(
-        factor_analysis.combination,
-        "adapt_to_price_series",
-        lambda fund_df: (
-            pd.Series(fund_df["nav"].values, index=pd.to_datetime(fund_df["date"]), dtype=float),
-            "nav_price_series",
-        ),
-    )
     monkeypatch.setattr(
         factor_analysis.combination,
         "build_walk_forward_dev_fold_list",
@@ -121,19 +115,6 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         factor_analysis.combination,
-        "build_single_factor_series",
-        lambda price_series, factor_name, strategy_params, factor_param_override=None: pd.Series(
-            range(len(price_series)) if factor_name == "momentum" else list(reversed(range(len(price_series)))),
-            index=price_series.index,
-            dtype=float,
-            name=factor_analysis.build_factor_candidate_label(
-                factor_name=factor_name,
-                factor_param_dict=factor_param_override or {},
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        factor_analysis,
         "build_forward_return_series",
         lambda price_series, forward_window=5: pd.Series(range(len(price_series)), index=price_series.index, dtype=float),
     )
@@ -186,7 +167,7 @@ def test_run_factor_combination_outputs_independent_json(monkeypatch, tmp_path):
     assert result["summary_path"].exists()
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert saved_payload["input_ref"]["fund_code"] == "007301"
-    assert len(saved_payload["path_code"]) == 5
+    assert len(saved_payload["path_code"]) == 6
     assert str(saved_payload["path_code"]).isalnum()
     assert result["summary_path"].stem.split("_")[-1] == saved_payload["path_code"]
     assert "factor_combination_output" in saved_payload

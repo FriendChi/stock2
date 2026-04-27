@@ -166,12 +166,63 @@ def test_run_train_forward_selection_builds_tree_path_from_topk_singleton_roots(
         selected_metric_dict["factor_count"] = len(label_tuple)
         return selected_metric_dict
 
+    def fake_worker_evaluate_batch(task_payload):
+        _, batch_payloads, _, _ = task_payload
+        metric_dict = {
+            ("factor_a", "factor_b"): {"train_spearman_ic_mean": 0.12, "train_spearman_icir": 0.8},
+            ("factor_a", "factor_c"): {"train_spearman_ic_mean": 0.11, "train_spearman_icir": 0.7},
+            ("factor_b", "factor_c"): {"train_spearman_ic_mean": 0.10, "train_spearman_icir": 0.60},
+            ("factor_a", "factor_b", "factor_c"): {"train_spearman_ic_mean": 0.10, "train_spearman_icir": 0.80},
+        }
+        result_list = []
+        for child_labels, child_sig, label in batch_payloads:
+            result_list.append(
+                (
+                    label,
+                    dict(metric_dict[tuple(child_labels)]),
+                    child_labels,
+                    child_sig,
+                )
+            )
+        return result_list
+
+    class FakeAsyncResult:
+        def __init__(self, func, args):
+            self.func = func
+            self.args = args
+
+        def ready(self):
+            return True
+
+        def get(self, timeout=None):
+            return self.func(*self.args)
+
+    class FakePool:
+        def __init__(self, processes=None, initializer=None, initargs=()):
+            if initializer is not None:
+                initializer(*initargs)
+
+        def apply_async(self, func, args=(), kwds=None):
+            assert kwds in (None, {})
+            return FakeAsyncResult(func, args)
+
+        def terminate(self):
+            return None
+
+        def close(self):
+            return None
+
+        def join(self):
+            return None
+
     monkeypatch.setattr(
         factor_analysis.dedup,
         "_evaluate_train_score_segment_list",
         fake_evaluate_train_score_segment_list,
     )
-    # 并行评估时会绕过 evaluate_train_score_segment_list 直接在子进程调，因此测试时设为单进程
+    # 第二层开始实际走批处理 worker，这里改为同步 fake pool，确保测试覆盖当前调度路径。
+    monkeypatch.setattr(factor_analysis.dedup, "_worker_evaluate_batch", fake_worker_evaluate_batch)
+    monkeypatch.setattr(factor_analysis.dedup.multiprocessing, "Pool", FakePool)
     path_summary_list = factor_analysis.run_train_forward_selection(
         candidate_record_list=candidate_record_list,
         factor_series_dict={record["candidate_label"]: pd.Series([1.0, 2.0], dtype=float) for record in candidate_record_list},
@@ -251,25 +302,41 @@ def test_run_optuna_extension_search_uses_remaining_factor_square_trials_and_can
     }
 
     class FakeTrial:
-        def __init__(self, value_dict):
+        def __init__(self, number, value_dict):
+            self.number = int(number)
             self.value_dict = dict(value_dict)
+            self.params = {}
+            self.value = None
+            self.state = None
 
         def suggest_int(self, name, low, high):
-            return int(self.value_dict[name])
+            selected_value = int(self.value_dict[name])
+            self.params[name] = selected_value
+            return selected_value
 
     class FakeStudy:
         def __init__(self, trial_value_list):
             self.trial_value_list = list(trial_value_list)
             self.optimize_calls = []
+            self.trials = []
 
-        def optimize(self, objective, n_trials):
+        def optimize(self, objective, n_trials, timeout=None, callbacks=None, n_jobs=1):
             self.optimize_calls.append(int(n_trials))
-            for trial_value_dict in self.trial_value_list[:n_trials]:
-                objective(FakeTrial(trial_value_dict))
+            callbacks = list(callbacks or [])
+            for trial_idx, trial_value_dict in enumerate(self.trial_value_list[:n_trials]):
+                trial = FakeTrial(number=trial_idx, value_dict=trial_value_dict)
+                trial.value = float(objective(trial))
+                trial.state = FakeTrialState.COMPLETE
+                self.trials.append(trial)
+                for callback in callbacks:
+                    callback(self, trial)
 
     class FakeSampler:
         def __init__(self, seed=None):
             self.seed = seed
+
+    class FakeTrialState:
+        COMPLETE = "COMPLETE"
 
     fake_study = FakeStudy(
         [
@@ -285,42 +352,75 @@ def test_run_optuna_extension_search_uses_remaining_factor_square_trials_and_can
         {
             "create_study": staticmethod(lambda direction, sampler: fake_study),
             "samplers": type("Samplers", (), {"TPESampler": FakeSampler}),
+            "trial": type("TrialModule", (), {"TrialState": FakeTrialState}),
         },
     )
     monkeypatch.setattr(factor_analysis.dedup, "load_optuna_module", lambda: fake_optuna_module)
 
-    def fake_evaluate_factor_candidate_subset(
-        factor_candidate_list,
-        factor_series_dict,
-        forward_return_series,
-        fold_list,
-        include_valid=True,
+    def fake_evaluate_train_score_segment_list(
+        train_score_segment_list,
+        train_target_rank_component_list,
+        candidate_label_list,
         ic_aggregation_config=None,
     ):
-        label_tuple = tuple(sorted(item["candidate_label"] for item in factor_candidate_list))
+        label_tuple = tuple(sorted(candidate_label_list))
         metric_dict = {
-            ("factor_a",): {"train_spearman_ic_mean": 0.10, "train_spearman_icir": 0.90, "valid_spearman_ic_mean": 0.08, "valid_spearman_icir": 0.50},
-            ("factor_a", "factor_b"): {"train_spearman_ic_mean": 0.11, "train_spearman_icir": 1.00, "valid_spearman_ic_mean": 0.09, "valid_spearman_icir": 0.48},
-            ("factor_a", "factor_c"): {"train_spearman_ic_mean": 0.12, "train_spearman_icir": 1.10, "valid_spearman_ic_mean": 0.11, "valid_spearman_icir": 0.60},
-            ("factor_a", "factor_b", "factor_c"): {"train_spearman_ic_mean": 0.13, "train_spearman_icir": 1.05, "valid_spearman_ic_mean": 0.10, "valid_spearman_icir": 0.55},
+            ("factor_a",): {"train_spearman_ic_mean": 0.10, "train_spearman_icir": 0.90},
+            ("factor_a", "factor_b"): {"train_spearman_ic_mean": 0.11, "train_spearman_icir": 1.00},
+            ("factor_a", "factor_c"): {"train_spearman_ic_mean": 0.12, "train_spearman_icir": 1.10},
+            ("factor_a", "factor_b", "factor_c"): {"train_spearman_ic_mean": 0.13, "train_spearman_icir": 1.05},
         }
         selected_metric_dict = dict(metric_dict[label_tuple])
         selected_metric_dict["candidate_label_list"] = list(label_tuple)
         selected_metric_dict["factor_count"] = len(label_tuple)
-        if not include_valid:
-            selected_metric_dict.pop("valid_spearman_ic_mean")
-            selected_metric_dict.pop("valid_spearman_icir")
         return selected_metric_dict
 
-    monkeypatch.setattr(factor_analysis.dedup, "evaluate_factor_candidate_subset", fake_evaluate_factor_candidate_subset)
+    def fake_evaluate_valid_for_path_summary_list(
+        path_summary_list,
+        candidate_record_lookup,
+        valid_cache,
+        ic_aggregation_config=None,
+        progress_desc=None,
+        n_processes=2,
+    ):
+        metric_dict = {
+            ("factor_a", "factor_b"): {"valid_spearman_ic_mean": 0.09, "valid_spearman_icir": 0.48},
+            ("factor_a", "factor_c"): {"valid_spearman_ic_mean": 0.11, "valid_spearman_icir": 0.60},
+            ("factor_a", "factor_b", "factor_c"): {"valid_spearman_ic_mean": 0.10, "valid_spearman_icir": 0.55},
+        }
+        evaluated_summary_list = []
+        for summary in path_summary_list:
+            updated_summary = dict(summary)
+            updated_summary.update(metric_dict[tuple(sorted(summary["candidate_label_list"]))])
+            evaluated_summary_list.append(updated_summary)
+        return evaluated_summary_list
+
+    monkeypatch.setattr(factor_analysis.dedup, "_evaluate_train_score_segment_list", fake_evaluate_train_score_segment_list)
+    monkeypatch.setattr(factor_analysis.dedup, "evaluate_valid_for_path_summary_list", fake_evaluate_valid_for_path_summary_list)
+
+    train_cache = {
+        "candidate_segment_dict": {
+            "factor_a": [np.array([1.0, 2.0], dtype=float)],
+            "factor_b": [np.array([0.5, 1.0], dtype=float)],
+            "factor_c": [np.array([1.5, 0.5], dtype=float)],
+        },
+        "target_rank_component_list": [None],
+    }
+    valid_cache = {
+        "candidate_segment_dict": {
+            "factor_a": [np.array([1.0, 2.0], dtype=float)],
+            "factor_b": [np.array([0.5, 1.0], dtype=float)],
+            "factor_c": [np.array([1.5, 0.5], dtype=float)],
+        },
+        "target_rank_component_list": [None],
+    }
 
     result = factor_analysis.run_optuna_extension_search(
         baseline_summary=baseline_summary,
         corr_selected_candidate_list=corr_selected_candidate_list,
         candidate_record_lookup=candidate_record_lookup,
-        factor_series_dict={},
-        forward_return_series=pd.Series(dtype=float),
-        fold_list=[],
+        train_cache=train_cache,
+        valid_cache=valid_cache,
     )
 
     assert fake_study.optimize_calls == [4]
@@ -461,7 +561,7 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     result = factor_analysis.run_single_factor_dedup_selection()
 
     assert result["fund_code"] == "007301"
-    assert result["best_forward_selection_summary"]["candidate_label_list"] == ["ma_slope(lookback=5, window=20)"]
+    assert result["best_forward_selection_summary"]["candidate_label_list"] == ["momentum(window=10)"]
     assert result["summary_path"].exists()
     saved_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert saved_payload["input_ref"]["fund_code"] == "007301"
@@ -482,9 +582,9 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     assert "forward_selection_path_summary" not in saved_payload["dedup_selection_output"]
     assert "optuna_extension_output" not in saved_payload["dedup_selection_output"]
     assert saved_payload["dedup_selection_output"]["final_selected_source"] == "forward_selection"
-    assert saved_payload["dedup_selection_output"]["forward_selected_candidate_label_list"] == ["ma_slope(lookback=5, window=20)"]
-    assert saved_payload["dedup_selection_output"]["best_final_selection_summary"]["candidate_label_list"] == ["ma_slope(lookback=5, window=20)"]
-    selected_record = saved_payload["dedup_selection_output"]["record_dict"]["ma_slope(lookback=5, window=20)"]
+    assert saved_payload["dedup_selection_output"]["forward_selected_candidate_label_list"] == ["momentum(window=10)"]
+    assert saved_payload["dedup_selection_output"]["best_final_selection_summary"]["candidate_label_list"] == ["momentum(window=10)"]
+    selected_record = saved_payload["dedup_selection_output"]["record_dict"]["momentum(window=10)"]
     assert "factor_name" not in selected_record
     assert "factor_param_dict" not in selected_record
     assert "factor_group" not in selected_record

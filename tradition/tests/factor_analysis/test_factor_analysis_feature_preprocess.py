@@ -169,7 +169,7 @@ def test_build_single_feature_factor_df_drops_candidate_when_raw_nan_ratio_reach
         {
             "candidate_label": "mock_factor(window=10)",
             "raw_nan_ratio": 0.1,
-            "normalized_zero_ratio": 0.1,
+            "normalized_zero_ratio": 0.0,
             "drop_reason_list": ["raw_nan_ratio_threshold"],
         }
     ]
@@ -220,7 +220,7 @@ def test_check_and_fill_wide_feature_table_drops_column_by_consecutive_missing_c
     assert dropped_report["max_consecutive_missing_count"] == 20
     assert dropped_report["drop_reason_list"] == ["missing_ratio_threshold", "consecutive_missing_threshold"]
 
-def test_check_and_fill_wide_feature_table_uses_linear_interpolation_with_boundary_fill(tmp_path):
+def test_check_and_fill_wide_feature_table_drops_column_before_interpolation_when_missing_ratio_exceeds_threshold(tmp_path):
     raw_output_path = tmp_path / "feature_preprocess_raw.csv"
     checked_df = pd.DataFrame(
         {
@@ -237,11 +237,13 @@ def test_check_and_fill_wide_feature_table_uses_linear_interpolation_with_bounda
         primary_code="007301",
     )
 
-    assert dropped_source_column_list == []
-    assert updated_df["512480__price"].round(6).tolist() == [10.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 28.0]
-    filled_report = next(record for record in feature_quality_report_list if record["column"] == "512480__price")
-    assert bool(filled_report["filled"]) is True
-    assert filled_report["filled_missing_count"] == 4
+    assert "512480__price" not in updated_df.columns
+    assert dropped_source_column_list == ["512480__price"]
+    dropped_report = next(record for record in feature_quality_report_list if record["column"] == "512480__price")
+    assert abs(float(dropped_report["missing_ratio"]) - (4 / 12)) < 1e-12
+    assert dropped_report["drop_reason_list"] == ["missing_ratio_threshold"]
+    assert bool(dropped_report["filled"]) is False
+    assert dropped_report["filled_missing_count"] == 0
 
 def test_build_checked_factor_table_skips_dropped_source_columns(monkeypatch, tmp_path):
     checked_output_path = tmp_path / "feature_preprocess_checked.csv"
@@ -372,15 +374,27 @@ def test_run_feature_preprocess_trims_final_checked_table(monkeypatch, tmp_path)
         ),
     )
 
-    result = factor_analysis_feature_preprocess.run_feature_preprocess()
+    result = factor_analysis_feature_preprocess.run_feature_preprocess_single_fund()
 
     saved_df = pd.read_csv(checked_output_path)
     saved_payload = json.loads(metadata_output_path.read_text(encoding="utf-8"))
     assert result["record_count"] == 5
     assert len(saved_df) == 5
     assert str(saved_df.iloc[0]["date"])[:10] == str(sample_index[factor_analysis_feature_preprocess.INITIAL_TRIM_ROW_COUNT].date())
-    assert saved_df["007301__price"].tolist() == initial_checked_df["007301__price"].iloc[-5:].tolist()
-    assert saved_df["007301__cumulative_nav"].tolist() == initial_checked_df["007301__cumulative_nav"].iloc[-5:].tolist()
+    pd.testing.assert_series_equal(
+        saved_df["007301__price"],
+        initial_checked_df["007301__price"].iloc[-5:].reset_index(drop=True),
+        check_names=False,
+        atol=1e-12,
+        rtol=0.0,
+    )
+    pd.testing.assert_series_equal(
+        saved_df["007301__cumulative_nav"],
+        initial_checked_df["007301__cumulative_nav"].iloc[-5:].reset_index(drop=True),
+        check_names=False,
+        atol=1e-12,
+        rtol=0.0,
+    )
     assert saved_df["007301__price__donchian_breakout(window=20)__zscore"].tolist() == [0.0, 1.0, 1.0, 0.0, 1.0]
     assert saved_payload["feature_preprocess_output"]["row_count"] == 5
     assert saved_payload["feature_preprocess_output"]["csv_path"] == str(checked_output_path.resolve())
@@ -472,7 +486,7 @@ def test_run_feature_preprocess_metadata_records_dropped_source_columns(monkeypa
         ),
     )
 
-    factor_analysis_feature_preprocess.run_feature_preprocess()
+    factor_analysis_feature_preprocess.run_feature_preprocess_single_fund()
 
     saved_payload = json.loads(metadata_output_path.read_text(encoding="utf-8"))
     assert saved_payload["feature_preprocess_output"]["quality_summary"]["dropped_source_column_count"] == 1
