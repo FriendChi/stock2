@@ -213,3 +213,37 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     assert pd.Timestamp(captured_plot_kwargs["highlight_start"]) == sample_price_series.index[6]
     assert pd.Timestamp(captured_plot_kwargs["highlight_end"]) == sample_price_series.index[7]
     assert captured_plot_kwargs["highlight_label"] == "test"
+
+
+def test_execute_continuous_position_backtest_logic():
+    # 逻辑块：构造基础价格序列（线性增长）
+    dates = pd.date_range("2024-01-01", periods=5)
+    price_series = pd.Series([10.0, 11.0, 12.0, 11.0, 12.0], index=dates)
+
+    # 逻辑块：构造全仓持有策略
+    target_position = pd.Series([1.0, 1.0, 1.0, 1.0, 1.0], index=dates)
+
+    result = factor_analysis.backtest.execute_continuous_position_backtest(
+        price_series=price_series,
+        target_position_series=target_position,
+        init_cash=10000.0,
+        fees=0.001,
+    )
+
+    # 逻辑块：验证权益曲线计算。注意：held_position 是 shift(1)，第一天会有建仓手续费
+    assert result["equity_curve"].iloc[0] == 9990.0
+    assert result["equity_curve"].iloc[1] > 10000.0
+    assert result["trade_count"] >= 1  # 初始买入
+
+
+def test_apply_position_change_gate():
+    # 逻辑块：验证交易门槛（Gate）对调仓的抑制作用
+    positions = pd.Series([0.0, 0.04, 0.10, 0.08, 0.20])
+
+    # 门槛 0.05：0.04 不触发，0.10 触发（相对于0.0），0.08 不触发，0.20 触发
+    gated = factor_analysis.backtest.apply_position_change_gate(positions, trade_gate=0.05)
+
+    assert gated.iloc[1] == 0.0  # 0.04 < 0.05
+    assert gated.iloc[2] == 0.10  # abs(0.10 - 0.0) > 0.05
+    assert gated.iloc[3] == 0.10  # abs(0.08 - 0.10) < 0.05
+    assert gated.iloc[4] == 0.20  # abs(0.20 - 0.10) > 0.05
