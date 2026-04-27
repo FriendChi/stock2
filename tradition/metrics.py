@@ -72,7 +72,7 @@ def compute_return_metrics(equity_curve, rf_series=None):
     }
 
 
-def save_equity_curve_plot(equity_curve, output_path, title, benchmark_curve=None):
+def save_equity_curve_plot(equity_curve, output_path, title, benchmark_curve=None, highlight_start=None, highlight_end=None, highlight_label=None):
     # 图像输出固定为静态 PNG，默认同时支持展示基金净值归一化曲线，便于直观看相对表现。
     equity_series = pd.Series(equity_curve, dtype=float).dropna()
     if equity_series.empty:
@@ -89,11 +89,23 @@ def save_equity_curve_plot(equity_curve, output_path, title, benchmark_curve=Non
         if not benchmark_series.empty:
             normalized_benchmark = benchmark_series / float(benchmark_series.iloc[0])
             ax.plot(normalized_benchmark.index, normalized_benchmark.values, label="fund")
+    # 逻辑块：对测试集区间做背景标记，保证流程5产出的整段净值图能直接区分测试样本位置。
+    if highlight_start is not None and highlight_end is not None:
+        highlight_start = pd.Timestamp(highlight_start)
+        highlight_end = pd.Timestamp(highlight_end)
+        if highlight_start <= highlight_end:
+            ax.axvspan(
+                highlight_start,
+                highlight_end,
+                color="#f59e0b",
+                alpha=0.12,
+                label=str(highlight_label or "highlight"),
+            )
     ax.set_title(title)
     ax.set_xlabel("date")
     ax.set_ylabel("normalized value")
     ax.grid(True, alpha=0.3)
-    if benchmark_curve is not None:
+    if benchmark_curve is not None or (highlight_start is not None and highlight_end is not None):
         ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")

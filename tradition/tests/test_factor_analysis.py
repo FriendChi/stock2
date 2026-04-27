@@ -1914,10 +1914,26 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
             "position_series": pd.Series([0.5, 0.6], index=pd.Index(segment_series.index[:2])),
         },
     )
+    captured_plot_kwargs = {}
+
+    def fake_save_equity_curve_plot(
+        equity_curve,
+        output_path,
+        title,
+        benchmark_curve=None,
+        highlight_start=None,
+        highlight_end=None,
+        highlight_label=None,
+    ):
+        captured_plot_kwargs["highlight_start"] = highlight_start
+        captured_plot_kwargs["highlight_end"] = highlight_end
+        captured_plot_kwargs["highlight_label"] = highlight_label
+        return output_path
+
     monkeypatch.setattr(
         factor_analysis.backtest,
         "save_equity_curve_plot",
-        lambda equity_curve, output_path, title, benchmark_curve=None: output_path,
+        fake_save_equity_curve_plot,
     )
 
     result = factor_analysis.run_strategy_backtest(config_override={})
@@ -1938,3 +1954,6 @@ def test_run_strategy_backtest_outputs_independent_json(monkeypatch, tmp_path):
     assert "best_function_valid_summary" not in output_payload["strategy_backtest_output"]
     assert "position_function_search_output" not in output_payload["strategy_backtest_output"]
     assert Path(output_payload["strategy_backtest_output"]["plot_path"]).stem.split("_")[-1] == output_payload["path_code"]
+    assert pd.Timestamp(captured_plot_kwargs["highlight_start"]) == sample_price_series.index[6]
+    assert pd.Timestamp(captured_plot_kwargs["highlight_end"]) == sample_price_series.index[7]
+    assert captured_plot_kwargs["highlight_label"] == "test"

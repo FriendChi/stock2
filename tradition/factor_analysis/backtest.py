@@ -490,6 +490,9 @@ def run_strategy_backtest(config_override=None):
         output_path=plot_output_path,
         title=f"{fund_code} strategy_backtest",
         benchmark_curve=price_series,
+        highlight_start=split_dict["test"].index.min(),
+        highlight_end=split_dict["test"].index.max(),
+        highlight_label="test",
     )
     strategy_backtest_output = {
         "fund_code": fund_code,
