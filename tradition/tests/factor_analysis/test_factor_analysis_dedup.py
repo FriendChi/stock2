@@ -255,6 +255,109 @@ def test_select_top_train_path_summary_list_keeps_top_half():
     )
     assert [item["candidate_label_list"] for item in selected_path_summary_list] == [["a"], ["b"], ["c"]]
 
+def test_run_train_forward_selection_stops_when_train_ic_mean_decreases(monkeypatch):
+    candidate_record_list = [
+        {
+            "candidate_label": "factor_a",
+            "factor_name": "momentum",
+            "factor_param_dict": {"window": 10},
+            "train_spearman_icir": 0.6,
+            "valid_spearman_icir": 0.4,
+            "valid_spearman_ic_mean": 0.1,
+        },
+        {
+            "candidate_label": "factor_b",
+            "factor_name": "trend_tvalue",
+            "factor_param_dict": {"window": 15},
+            "train_spearman_icir": 0.5,
+            "valid_spearman_icir": 0.3,
+            "valid_spearman_ic_mean": 0.1,
+        },
+    ]
+
+    def fake_evaluate_train_score_segment_list(
+        train_score_segment_list,
+        train_target_rank_component_list,
+        candidate_label_list,
+        ic_aggregation_config=None,
+    ):
+        label_tuple = tuple(sorted(candidate_label_list))
+        metric_dict = {
+            ("factor_a",): {"train_spearman_ic_mean": 0.10, "train_spearman_icir": 0.60},
+            ("factor_b",): {"train_spearman_ic_mean": 0.09, "train_spearman_icir": 0.50},
+            ("factor_a", "factor_b"): {"train_spearman_ic_mean": 0.08, "train_spearman_icir": 0.70},
+        }
+        selected_metric_dict = dict(metric_dict[label_tuple])
+        selected_metric_dict["candidate_label_list"] = list(label_tuple)
+        selected_metric_dict["factor_count"] = len(label_tuple)
+        return selected_metric_dict
+
+    def fake_worker_evaluate_batch(task_payload):
+        _, batch_payloads, _, _ = task_payload
+        metric_dict = {
+            ("factor_a", "factor_b"): {"train_spearman_ic_mean": 0.08, "train_spearman_icir": 0.70},
+        }
+        result_list = []
+        for child_labels, child_sig, label in batch_payloads:
+            result_list.append(
+                (
+                    label,
+                    dict(metric_dict[tuple(child_labels)]),
+                    child_labels,
+                    child_sig,
+                )
+            )
+        return result_list
+
+    class FakeAsyncResult:
+        def __init__(self, func, args):
+            self.func = func
+            self.args = args
+
+        def ready(self):
+            return True
+
+        def get(self, timeout=None):
+            return self.func(*self.args)
+
+    class FakePool:
+        def __init__(self, processes=None, initializer=None, initargs=()):
+            if initializer is not None:
+                initializer(*initargs)
+
+        def apply_async(self, func, args=(), kwds=None):
+            assert kwds in (None, {})
+            return FakeAsyncResult(func, args)
+
+        def terminate(self):
+            return None
+
+        def close(self):
+            return None
+
+        def join(self):
+            return None
+
+    monkeypatch.setattr(
+        factor_analysis.dedup,
+        "_evaluate_train_score_segment_list",
+        fake_evaluate_train_score_segment_list,
+    )
+    monkeypatch.setattr(factor_analysis.dedup, "_worker_evaluate_batch", fake_worker_evaluate_batch)
+    monkeypatch.setattr(factor_analysis.dedup.multiprocessing, "Pool", FakePool)
+    path_summary_list = factor_analysis.run_train_forward_selection(
+        candidate_record_list=candidate_record_list,
+        factor_series_dict={record["candidate_label"]: pd.Series([1.0, 2.0], dtype=float) for record in candidate_record_list},
+        forward_return_series=pd.Series([0.1, 0.2], dtype=float),
+        fold_list=[{"train": pd.Series([0.1, 0.2], index=pd.Index([1, 2]))}],
+        root_topk=1,
+        n_processes=1,
+    )
+    assert [item["candidate_label_list"] for item in path_summary_list] == [
+        ["factor_a"],
+        ["factor_a", "factor_b"],
+    ]
+
 def test_select_best_forward_path_summary_uses_valid_first():
     best_summary = factor_analysis.select_best_forward_path_summary(
         [

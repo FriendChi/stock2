@@ -691,14 +691,17 @@ def run_train_forward_selection(
                 step_pbar.close()
 
             # 逻辑块：层级同步
-            # 只基于本层已完成或缓存命中的结果构造下一层，并优先扩展训练 ICIR 更高的路径。
+            # 只保留训练 ICIR 与训练 IC 均不下降的子路径，避免均值走弱的组合继续扩张。
             next_frontier_node_list = []
             for child_sig, (frontier_node, cand_record, child_labels) in child_parent_node_dict.items():
                 child_summary = path_summary_dict.get(child_sig)
                 if child_summary is None or int(child_summary["step"]) != step:
                     continue
                 parent_summary = frontier_node["summary"]
-                if float(child_summary["train_spearman_icir"]) >= float(parent_summary["train_spearman_icir"]):
+                if (
+                    float(child_summary["train_spearman_icir"]) >= float(parent_summary["train_spearman_icir"])
+                    and float(child_summary["train_spearman_ic_mean"]) >= float(parent_summary["train_spearman_ic_mean"])
+                ):
                     next_frontier_node_list.append({
                         "candidate_record_list": frontier_node["candidate_record_list"] + [dict(cand_record)],
                         "summary": child_summary,
