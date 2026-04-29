@@ -265,12 +265,17 @@ def _fetch_fund_feature_df(ak_module, code, last_cached_date=None):
 
 def _fetch_index_hist_feature_df(ak_module, code, start_date=DEFAULT_START_DATE, end_date=DEFAULT_END_DATE):
     # 指数优先使用东方财富指数历史接口，字段口径与 ETF 日线基本一致。
-    index_df = ak_module.index_zh_a_hist(
-        symbol=code,
-        period="daily",
-        start_date=start_date,
-        end_date=end_date,
-    )
+    try:
+        index_df = ak_module.index_zh_a_hist(
+            symbol=code,
+            period="daily",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except Exception:
+        return pd.DataFrame(columns=["date"])
+    if index_df is None or "日期" not in getattr(index_df, "columns", []):
+        return pd.DataFrame(columns=["date"])
     standardized_df = _standardize_feature_df(
         df=index_df,
         rename_map={
@@ -323,11 +328,16 @@ def _fetch_index_hist_feature_df(ak_module, code, start_date=DEFAULT_START_DATE,
 
 def _fetch_prefixed_index_feature_df(ak_module, symbol, code, start_date=DEFAULT_START_DATE, end_date=DEFAULT_END_DATE):
     # 带市场前缀的股票指数接口可覆盖部分普通指数接口无法识别的代码。
-    index_df = ak_module.stock_zh_index_daily_em(
-        symbol=symbol,
-        start_date=start_date,
-        end_date=end_date,
-    )
+    try:
+        index_df = ak_module.stock_zh_index_daily_em(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except Exception:
+        return pd.DataFrame(columns=["date"])
+    if index_df is None or "date" not in getattr(index_df, "columns", []):
+        return pd.DataFrame(columns=["date"])
     standardized_df = _standardize_feature_df(
         df=index_df,
         rename_map={
@@ -351,7 +361,12 @@ def _fetch_prefixed_index_feature_df(ak_module, symbol, code, start_date=DEFAULT
 
 def _fetch_sina_index_feature_df(ak_module, symbol, code):
     # 新浪指数接口没有 start_date 参数，只在东方财富接口不稳定时作为补充来源。
-    index_df = ak_module.stock_zh_index_daily(symbol=symbol)
+    try:
+        index_df = ak_module.stock_zh_index_daily(symbol=symbol)
+    except Exception:
+        return pd.DataFrame(columns=["date"])
+    if index_df is None or "date" not in getattr(index_df, "columns", []):
+        return pd.DataFrame(columns=["date"])
     standardized_df = _standardize_feature_df(
         df=index_df,
         rename_map={
@@ -374,7 +389,12 @@ def _fetch_sina_index_feature_df(ak_module, symbol, code):
 
 def _fetch_tx_index_feature_df(ak_module, symbol, code):
     # 腾讯指数接口作为最后兜底，补足个别指数代码在前两类接口上的缺口。
-    index_df = ak_module.stock_zh_index_daily_tx(symbol=symbol)
+    try:
+        index_df = ak_module.stock_zh_index_daily_tx(symbol=symbol)
+    except Exception:
+        return pd.DataFrame(columns=["date"])
+    if index_df is None or "date" not in getattr(index_df, "columns", []):
+        return pd.DataFrame(columns=["date"])
     standardized_df = _standardize_feature_df(
         df=index_df,
         rename_map={
@@ -395,6 +415,38 @@ def _fetch_tx_index_feature_df(ak_module, symbol, code):
     return _normalize_feature_df(feature_df=standardized_df[existing_column_list])
 
 
+def _fetch_csindex_index_feature_df(ak_module, code, start_date=DEFAULT_START_DATE, end_date=DEFAULT_END_DATE):
+    try:
+        index_df = ak_module.stock_zh_index_hist_csindex(
+            symbol=code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except Exception:
+        return pd.DataFrame(columns=["date"])
+    if index_df is None or "日期" not in getattr(index_df, "columns", []):
+        return pd.DataFrame(columns=["date"])
+    standardized_df = _standardize_feature_df(
+        df=index_df,
+        rename_map={
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交金额": "amount",
+        },
+        ordered_column_list=["date", "open", "close", "high", "low", "volume", "amount"],
+        code=code,
+    )
+    if "close" in standardized_df.columns:
+        standardized_df["price"] = standardized_df["close"]
+    ordered_column_list = ["date", "price", "open", "close", "high", "low", "volume", "amount"]
+    existing_column_list = [column for column in ordered_column_list if column in standardized_df.columns]
+    return _normalize_feature_df(feature_df=standardized_df[existing_column_list])
+
+
 def _fetch_index_feature_df(ak_module, code, last_cached_date=None):
     # index 类型先走支持增量时间窗的主接口，再顺序回退到带前缀接口和其他数据源。
     exception_list = []
@@ -410,9 +462,22 @@ def _fetch_index_feature_df(ak_module, code, last_cached_date=None):
             return feature_df
     except Exception as exc:
         exception_list.append(exc)
+    try:
+        feature_df = _fetch_csindex_index_feature_df(
+            ak_module=ak_module,
+            code=code,
+            start_date=incremental_start_date,
+            end_date=DEFAULT_END_DATE,
+        )
+        if len(feature_df) > 0:
+            return feature_df
+    except Exception as exc:
+        exception_list.append(exc)
     for prefixed_symbol in (f"sh{code}", f"sz{code}", f"csi{code}"):
         for fetcher in (_fetch_prefixed_index_feature_df, _fetch_sina_index_feature_df, _fetch_tx_index_feature_df):
             try:
+                if fetcher is _fetch_tx_index_feature_df and prefixed_symbol.startswith("csi"):
+                    continue
                 if fetcher is _fetch_prefixed_index_feature_df:
                     feature_df = fetcher(
                         ak_module=ak_module,
