@@ -44,7 +44,7 @@ def load_preprocess_price_series(preprocess_path, expected_fund_code=None):
 
 
 def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, expected_fund_code=None):
-    # 新流程0输出必须提供元信息 JSON；若未显式传 CSV，则从 JSON 中回填 csv_path。
+    # 新流程0输出必须提供元信息 JSON；特征主文件路径与格式优先从 metadata 恢复，并兼容旧 csv_path 契约。
     if preprocess_metadata_path is None:
         raise ValueError("必须提供 preprocess_metadata_path。")
     preprocess_metadata_path = Path(preprocess_metadata_path)
@@ -60,36 +60,46 @@ def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, ex
     fund_code = str(feature_preprocess_output.get("fund_code", "")).zfill(6)
     if expected_fund_code is not None and fund_code != str(expected_fund_code).zfill(6):
         raise ValueError(f"流程0元信息基金代码不匹配: expected={str(expected_fund_code).zfill(6)} actual={fund_code}")
-    csv_path_in_metadata = str(feature_preprocess_output.get("csv_path", "")).strip()
-    if len(csv_path_in_metadata) == 0:
-        raise ValueError("流程0元信息缺少 csv_path。")
-    # 仅提供元信息路径时，优先复用流程0固化下来的特征 CSV 绝对路径。
+    feature_path_in_metadata = str(feature_preprocess_output.get("feature_path", "")).strip()
+    if len(feature_path_in_metadata) == 0:
+        feature_path_in_metadata = str(feature_preprocess_output.get("csv_path", "")).strip()
+    if len(feature_path_in_metadata) == 0:
+        raise ValueError("流程0元信息缺少 feature_path/csv_path。")
+    feature_format = str(feature_preprocess_output.get("feature_format", "")).strip().lower()
+    if len(feature_format) == 0:
+        feature_format = Path(feature_path_in_metadata).suffix.lstrip(".").lower()
+    # 仅提供元信息路径时，优先复用流程0固化下来的特征文件绝对路径。
     if preprocess_path is None:
-        preprocess_path = csv_path_in_metadata
+        preprocess_path = feature_path_in_metadata
     preprocess_path = Path(preprocess_path)
-    if Path(csv_path_in_metadata).resolve() != preprocess_path.resolve():
-        raise ValueError("流程0元信息中的 csv_path 与传入 preprocess_path 不一致。")
+    if Path(feature_path_in_metadata).resolve() != preprocess_path.resolve():
+        raise ValueError("流程0元信息中的 feature_path/csv_path 与传入 preprocess_path 不一致。")
     if not preprocess_path.exists():
-        raise FileNotFoundError(f"流程0特征 CSV 不存在: {preprocess_path}")
-    feature_df = pd.read_csv(preprocess_path)
+        raise FileNotFoundError(f"流程0特征文件不存在: {preprocess_path}")
+    if feature_format == "parquet":
+        feature_df = pd.read_parquet(preprocess_path)
+    elif feature_format == "csv":
+        feature_df = pd.read_csv(preprocess_path)
+    else:
+        raise ValueError(f"未支持的流程0特征文件格式: {feature_format}")
     required_column_list = ["date"]
     missing_column_list = [column for column in required_column_list if column not in feature_df.columns]
     if len(missing_column_list) > 0:
-        raise ValueError(f"流程0特征 CSV 缺少字段: {missing_column_list}")
+        raise ValueError(f"流程0特征文件缺少字段: {missing_column_list}")
     target_nav_column = str(feature_preprocess_output.get("target_nav_column", "")).strip()
     target_price_column = str(feature_preprocess_output.get("target_price_column", "")).strip()
     factor_feature_column_list = [str(column) for column in list(feature_preprocess_output.get("factor_feature_column_list", []))]
     if len(target_nav_column) == 0:
         raise ValueError("流程0元信息缺少 target_nav_column。")
     if target_nav_column not in feature_df.columns:
-        raise ValueError(f"target_nav_column 不存在于流程0特征 CSV: {target_nav_column}")
+        raise ValueError(f"target_nav_column 不存在于流程0特征文件: {target_nav_column}")
     if len(target_price_column) == 0:
         raise ValueError("流程0元信息缺少 target_price_column。")
     if target_price_column not in feature_df.columns:
-        raise ValueError(f"target_price_column 不存在于流程0特征 CSV: {target_price_column}")
+        raise ValueError(f"target_price_column 不存在于流程0特征文件: {target_price_column}")
     missing_factor_column_list = [column for column in factor_feature_column_list if column not in feature_df.columns]
     if len(missing_factor_column_list) > 0:
-        raise ValueError(f"流程0元信息中的因子列不存在于 CSV: {missing_factor_column_list[:10]}")
+        raise ValueError(f"流程0元信息中的因子列不存在于特征文件: {missing_factor_column_list[:10]}")
     feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
     feature_df = feature_df.dropna(subset=["date"]).copy()
     feature_df = feature_df.sort_values("date").reset_index(drop=True)

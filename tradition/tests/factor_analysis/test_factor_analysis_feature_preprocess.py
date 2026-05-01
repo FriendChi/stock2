@@ -336,13 +336,13 @@ def test_build_checked_factor_table_generates_multi_field_same_asset_factor_colu
     checked_output_path = tmp_path / "feature_preprocess_checked.csv"
     checked_df = pd.DataFrame(
         {
-            "date": pd.date_range("2024-01-01", periods=8, freq="D"),
-            "007301__open": [1.0 + idx * 0.01 for idx in range(8)],
-            "007301__high": [1.2 + idx * 0.01 for idx in range(8)],
-            "007301__low": [0.8 + idx * 0.01 for idx in range(8)],
-            "007301__close": [1.1 + idx * 0.01 for idx in range(8)],
-            "000510__high": [2.2 + idx * 0.01 for idx in range(8)],
-            "000510__low": [1.7 + idx * 0.01 for idx in range(8)],
+            "date": pd.date_range("2024-01-01", periods=12, freq="D"),
+            "007301__open": [1.0 + idx * 0.01 for idx in range(12)],
+            "007301__high": [1.2 + idx * 0.01 for idx in range(12)],
+            "007301__low": [0.8 + idx * 0.01 for idx in range(12)],
+            "007301__close": [1.1 + idx * 0.01 for idx in range(12)],
+            "000510__high": [2.2 + idx * 0.01 for idx in range(12)],
+            "000510__low": [1.7 + idx * 0.01 for idx in range(12)],
         }
     )
     checked_df.to_csv(checked_output_path, index=False)
@@ -425,7 +425,7 @@ def test_trim_initial_rows_keeps_binary_factor_semantics():
 
 def test_run_feature_preprocess_trims_final_checked_table(monkeypatch, tmp_path):
     sample_size = factor_analysis_feature_preprocess.INITIAL_TRIM_ROW_COUNT + 5
-    checked_output_path = tmp_path / "feature_preprocess_checked.csv"
+    checked_output_path = tmp_path / "feature_preprocess_checked.parquet"
     raw_output_path = tmp_path / "feature_preprocess_raw.csv"
     metadata_output_path = tmp_path / "feature_preprocess.json"
     sample_index = pd.date_range("2024-01-01", periods=sample_size, freq="D")
@@ -495,7 +495,7 @@ def test_run_feature_preprocess_trims_final_checked_table(monkeypatch, tmp_path)
 
     result = factor_analysis_feature_preprocess.run_feature_preprocess_single_fund()
 
-    saved_df = pd.read_csv(checked_output_path)
+    saved_df = pd.read_parquet(checked_output_path)
     saved_payload = json.loads(metadata_output_path.read_text(encoding="utf-8"))
     assert result["record_count"] == 5
     assert len(saved_df) == 5
@@ -516,7 +516,8 @@ def test_run_feature_preprocess_trims_final_checked_table(monkeypatch, tmp_path)
     )
     assert saved_df["007301__price__donchian_breakout(window=20)__zscore"].tolist() == [0.0, 1.0, 1.0, 0.0, 1.0]
     assert saved_payload["feature_preprocess_output"]["row_count"] == 5
-    assert saved_payload["feature_preprocess_output"]["csv_path"] == str(checked_output_path.resolve())
+    assert saved_payload["feature_preprocess_output"]["feature_path"] == str(checked_output_path.resolve())
+    assert saved_payload["feature_preprocess_output"]["feature_format"] == "parquet"
     assert saved_payload["feature_preprocess_output"]["factor_binding_record_list"] == []
 
 def test_run_feature_preprocess_metadata_records_dropped_source_columns(monkeypatch, tmp_path):

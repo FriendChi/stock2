@@ -22,6 +22,7 @@ DEFAULT_START_DATE = "19700101"
 DEFAULT_END_DATE = "20500101"
 DEFAULT_OUTPUT_NAME = "feature_preprocess_code_feature_table.csv"
 CHECKED_OUTPUT_SUFFIX = "_checked"
+PARQUET_OUTPUT_SUFFIX = ".parquet"
 FEATURE_CACHE_PREFIX = "temp_price_cache"
 INCREMENTAL_FETCH_BUFFER_DAYS = 15
 OPEN_FUND_PERIOD_BUFFER_DAYS = 15
@@ -529,17 +530,38 @@ def _fetch_feature_df_with_cache(ak_module, code, code_type, cache_dir, force_re
 
 
 def _build_checked_output_path(raw_output_path):
-    # 检查后文件与原始文件并存，命名上保留稳定可推导关系。
+    # 最终特征宽表主文件切换到 parquet，仅保留与原始宽表稳定可推导的命名关系。
     raw_output_path = Path(raw_output_path)
-    return raw_output_path.with_name(f"{raw_output_path.stem}{CHECKED_OUTPUT_SUFFIX}{raw_output_path.suffix}")
+    return raw_output_path.with_name(f"{raw_output_path.stem}{CHECKED_OUTPUT_SUFFIX}{PARQUET_OUTPUT_SUFFIX}")
+
+
+def _load_saved_feature_table(table_path):
+    # 流程0宽表读写按文件后缀自动分流，兼容原始 csv 和最终 parquet。
+    table_path = Path(table_path)
+    if not table_path.exists():
+        raise FileNotFoundError(f"宽表文件不存在: {table_path}")
+    if table_path.suffix.lower() == ".parquet":
+        return pd.read_parquet(table_path)
+    return pd.read_csv(table_path)
+
+
+def _save_feature_table(feature_df, table_path):
+    # 最终特征宽表优先落 parquet，原始宽表和缓存仍沿用 csv。
+    table_path = Path(table_path)
+    output_df = pd.DataFrame(feature_df, copy=True)
+    if "date" in output_df.columns:
+        output_df["date"] = pd.to_datetime(output_df["date"], errors="coerce")
+    if table_path.suffix.lower() == ".parquet":
+        output_df.to_parquet(table_path, index=False)
+        return
+    if "date" in output_df.columns:
+        output_df["date"] = output_df["date"].dt.strftime("%Y-%m-%d")
+    output_df.to_csv(table_path, index=False)
 
 
 def _load_saved_wide_feature_table(raw_output_path):
-    # 检查阶段直接读取刚保存的原始文件，确保后续处理基于落盘结果而不是内存态对象。
-    raw_output_path = Path(raw_output_path)
-    if not raw_output_path.exists():
-        raise FileNotFoundError(f"原始宽表文件不存在: {raw_output_path}")
-    return pd.read_csv(raw_output_path)
+    # 检查阶段统一复用按后缀分流的宽表加载逻辑，避免 csv/parquet 分支散落。
+    return _load_saved_feature_table(table_path=raw_output_path)
 
 
 def _validate_wide_feature_table_structure(wide_feature_df, code_type_dict, primary_code, require_all_code_group_columns=True):
@@ -683,7 +705,7 @@ def _check_and_fill_wide_feature_table(raw_output_path, code_type_dict, primary_
         require_all_code_group_columns=False,
     )
     checked_output_path = _build_checked_output_path(raw_output_path=raw_output_path)
-    checked_feature_df.to_csv(checked_output_path, index=False)
+    _save_feature_table(feature_df=checked_feature_df, table_path=checked_output_path)
     return checked_feature_df, checked_output_path, feature_quality_report_list, dropped_source_column_list
 
 
@@ -961,16 +983,16 @@ def _build_bound_factor_series(feature_input_dict, factor_candidate, strategy_pa
 
 
 def _build_checked_factor_table(checked_output_path, strategy_params, fund_code, dropped_source_column_list=None):
-    # checked 表改为先做绑定任务展开，再统一计算单输入/跨标的因子，保留旧列名并补充跨标的新列名。
+    # checked 表中的新增列先批量收集再一次性拼接，避免数千次逐列插入导致 DataFrame 高碎片。
     checked_feature_df = _load_saved_wide_feature_table(raw_output_path=checked_output_path)
     resolved_strategy_params, candidate_factor_list = _build_factor_candidate_config(strategy_params=strategy_params)
     source_column_list = _resolve_factor_source_column_list(
         checked_feature_df=checked_feature_df,
         dropped_source_column_list=dropped_source_column_list,
     )
-    extended_checked_df = checked_feature_df.copy()
+    base_factor_column_dict = {}
     for source_column in list(source_column_list):
-        extended_checked_df[f"{source_column}__zscore"] = rolling_zscore(
+        base_factor_column_dict[f"{source_column}__zscore"] = rolling_zscore(
             pd.Series(checked_feature_df[source_column], copy=True).astype(float),
             window=int(resolved_strategy_params["score_window"]),
         )
@@ -984,6 +1006,7 @@ def _build_checked_factor_table(checked_output_path, strategy_params, fund_code,
     dropped_factor_report_list = []
     factor_binding_record_list = []
     accumulated_added_column_count = accumulated_added_column_count + int(len(source_column_list))
+    generated_factor_column_dict = {}
     for task_idx, factor_task in enumerate(factor_task_list, start=1):
         feature_input_dict = _build_bound_feature_input_dict(
             checked_feature_df=checked_feature_df,
@@ -1009,7 +1032,7 @@ def _build_checked_factor_table(checked_output_path, strategy_params, fund_code,
                 "原因=超过阈值",
             )
             continue
-        extended_checked_df[str(factor_task["output_column"])] = factor_result["normalized_factor_series"].to_numpy(dtype=float)
+        generated_factor_column_dict[str(factor_task["output_column"])] = factor_result["normalized_factor_series"].to_numpy(dtype=float)
         factor_binding_record_list.append(dict(factor_task["binding_record"]))
         accumulated_added_column_count = accumulated_added_column_count + 1
         print(
@@ -1017,7 +1040,15 @@ def _build_checked_factor_table(checked_output_path, strategy_params, fund_code,
             f"输出列={factor_task['output_column']}",
             f"已生成新增列={accumulated_added_column_count}/{expected_added_column_count}",
         )
-    extended_checked_df.to_csv(checked_output_path, index=False)
+    factor_df = pd.DataFrame(
+        {
+            **base_factor_column_dict,
+            **generated_factor_column_dict,
+        },
+        index=checked_feature_df.index,
+    )
+    extended_checked_df = pd.concat([checked_feature_df.copy(), factor_df], axis=1)
+    _save_feature_table(feature_df=extended_checked_df, table_path=checked_output_path)
     return extended_checked_df, checked_output_path, source_column_list, candidate_factor_list, dropped_factor_report_list, factor_binding_record_list
 
 
@@ -1159,7 +1190,7 @@ def _build_flipped_factor_report_list(checked_feature_df, factor_feature_column_
 
 
 def _append_flipped_factor_feature_columns(checked_feature_df, checked_output_path, source_column_list, fund_code, config):
-    # 翻转列只基于当前已生成好的候选因子快照执行一次，避免本次流程内递归地对翻转列再次翻转。
+    # 翻转列同样先批量构造成新表，再统一拼接到 checked 宽表，避免继续逐列插入。
     checked_feature_df = checked_feature_df.copy()
     _, _, factor_feature_column_list = _resolve_feature_column_group_list(
         checked_feature_df=checked_feature_df,
@@ -1175,17 +1206,23 @@ def _append_flipped_factor_feature_columns(checked_feature_df, checked_output_pa
         target_nav_column=target_nav_column,
         config=config,
     )
+    flipped_factor_column_dict = {}
     for flipped_factor_report in flipped_factor_report_list:
         original_column = str(flipped_factor_report["original_column"])
         flipped_column = str(flipped_factor_report["flipped_column"])
-        checked_feature_df[flipped_column] = -pd.Series(checked_feature_df[original_column], copy=True).astype(float)
-    checked_feature_df.to_csv(checked_output_path, index=False)
+        flipped_factor_column_dict[flipped_column] = -pd.Series(checked_feature_df[original_column], copy=True).astype(float)
+    if len(flipped_factor_column_dict) > 0:
+        checked_feature_df = pd.concat(
+            [checked_feature_df, pd.DataFrame(flipped_factor_column_dict, index=checked_feature_df.index)],
+            axis=1,
+        )
+    _save_feature_table(feature_df=checked_feature_df, table_path=checked_output_path)
     return checked_feature_df, checked_output_path, flipped_factor_report_list
 
 
 def _build_feature_preprocess_metadata(
     checked_feature_df,
-    csv_path,
+    feature_path,
     path_code,
     fund_code,
     code_type_dict,
@@ -1214,7 +1251,8 @@ def _build_feature_preprocess_metadata(
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
         "data_mode": "feature_matrix",
         "path_code": str(path_code),
-        "csv_path": str(Path(csv_path).resolve()),
+        "feature_path": str(Path(feature_path).resolve()),
+        "feature_format": str(Path(feature_path).suffix).lstrip(".").lower(),
         "target_price_column": target_price_column,
         "target_nav_column": target_nav_column,
         "feature_column_list": feature_column_list,
@@ -1399,10 +1437,10 @@ def run_feature_preprocess_single_fund(config_override=None):
     )
     # 流程0最终供后续阶段消费的整张特征表统一裁掉前段不稳定样本，保持全表列对齐。
     checked_feature_df = _trim_initial_rows(feature_df=checked_feature_df)
-    checked_feature_df.to_csv(checked_output_path, index=False)
+    _save_feature_table(feature_df=checked_feature_df, table_path=checked_output_path)
     metadata_output = _build_feature_preprocess_metadata(
         checked_feature_df=checked_feature_df,
-        csv_path=checked_output_path,
+        feature_path=checked_output_path,
         path_code=path_code,
         fund_code=fund_code,
         code_type_dict=code_type_dict,
