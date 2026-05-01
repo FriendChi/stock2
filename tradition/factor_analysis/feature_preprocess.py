@@ -13,7 +13,7 @@ from tradition.factor_analysis.common import (
     compute_segment_correlation_metrics,
 )
 from tradition.factor_engine import normalize_factor_series, rolling_zscore
-from tradition.factor_library import build_raw_factor_series, resolve_factor_allowed_field_name_list
+from tradition.factor_library import build_raw_factor_series, resolve_factor_dependency_spec
 from tradition.splitter import build_walk_forward_dev_fold_list
 
 from .io import allocate_stage_csv_json_output_path
@@ -812,38 +812,96 @@ def _build_single_input_factor_output_column(source_column, candidate_label):
     return f"{str(source_column)}__{str(candidate_label)}__zscore"
 
 
+def _build_multi_field_factor_output_column(asset_code, bound_field_name_list, candidate_label):
+    # 同一资产下多字段因子把依赖字段压到列名前缀中，保证输出列名可直接回溯绑定来源。
+    field_signature = "-".join([str(field_name) for field_name in list(bound_field_name_list)])
+    return f"{str(asset_code).zfill(6)}__{field_signature}__{str(candidate_label)}__zscore"
+
+
+def _build_feature_column_dict_by_asset_code(source_column_list):
+    # 同一资产多字段依赖需要先把基础列聚合到 code -> field_name -> column 的索引结构中。
+    feature_column_dict_by_asset_code = {}
+    for record in _build_feature_column_record_list(source_column_list=source_column_list):
+        asset_code = str(record["code"])
+        field_name = str(record["field_name"])
+        feature_column_dict_by_asset_code.setdefault(asset_code, {})
+        feature_column_dict_by_asset_code[asset_code][field_name] = str(record["column"])
+    return feature_column_dict_by_asset_code
+
+
 def _build_factor_task_list(source_column_list, candidate_factor_list, fund_code):
-    # 因子任务先按“因子 -> 允许字段集合”过滤基础列，只对语义允许的字段生成单输入任务。
+    # 因子任务按依赖规格展开：单字段因子继续逐列绑定，多字段因子按同一资产内字段齐全性生成任务。
     feature_column_record_list = _build_feature_column_record_list(source_column_list=source_column_list)
+    feature_column_dict_by_asset_code = _build_feature_column_dict_by_asset_code(source_column_list=source_column_list)
     target_code = str(fund_code).zfill(6)
     task_list = []
     for factor_candidate in list(candidate_factor_list):
         factor_name = str(factor_candidate["factor_name"])
         candidate_label = str(factor_candidate["candidate_label"])
-        allowed_field_name_list = resolve_factor_allowed_field_name_list(factor_name=factor_name)
-        for record in feature_column_record_list:
-            if str(record["field_name"]) not in allowed_field_name_list:
-                continue
-            task_list.append(
-                {
-                    "dependency_mode": "single_input",
-                    "factor_candidate": dict(factor_candidate),
-                    "output_column": _build_single_input_factor_output_column(
-                        source_column=record["column"],
-                        candidate_label=candidate_label,
-                    ),
-                    "feature_input_key_to_column_dict": {
-                        "source": str(record["column"]),
-                    },
-                    "binding_record": {
+        dependency_spec = resolve_factor_dependency_spec(factor_name=factor_name)
+        binding_mode = str(dependency_spec["binding_mode"])
+        if binding_mode == "single_field":
+            candidate_field_name_list = [str(field_name) for field_name in list(dependency_spec["candidate_field_name_list"])]
+            for record in feature_column_record_list:
+                if str(record["field_name"]) not in candidate_field_name_list:
+                    continue
+                task_list.append(
+                    {
+                        "dependency_mode": binding_mode,
+                        "factor_candidate": dict(factor_candidate),
                         "output_column": _build_single_input_factor_output_column(
                             source_column=record["column"],
                             candidate_label=candidate_label,
                         ),
+                        "feature_input_key_to_column_dict": {
+                            "source": str(record["column"]),
+                        },
+                        "binding_record": {
+                            "output_column": _build_single_input_factor_output_column(
+                                source_column=record["column"],
+                                candidate_label=candidate_label,
+                            ),
+                            "factor_name": factor_name,
+                            "candidate_label": candidate_label,
+                            "binding_mode": binding_mode,
+                            "asset_code": str(record["code"]),
+                            "bound_field_name_list": [str(record["field_name"])],
+                            "bound_source_column_list": [str(record["column"])],
+                            "target_code": target_code,
+                            "linked_code": None,
+                        },
+                    }
+                )
+            continue
+        if binding_mode != "multi_field_same_asset":
+            raise ValueError(f"未支持的 binding_mode: {binding_mode}")
+        required_field_name_list = [str(field_name) for field_name in list(dependency_spec["required_field_name_list"])]
+        for asset_code, field_to_column_dict in feature_column_dict_by_asset_code.items():
+            if any(field_name not in field_to_column_dict for field_name in required_field_name_list):
+                continue
+            feature_input_key_to_column_dict = {
+                str(field_name): str(field_to_column_dict[field_name]) for field_name in required_field_name_list
+            }
+            bound_source_column_list = [str(field_to_column_dict[field_name]) for field_name in required_field_name_list]
+            output_column = _build_multi_field_factor_output_column(
+                asset_code=asset_code,
+                bound_field_name_list=required_field_name_list,
+                candidate_label=candidate_label,
+            )
+            task_list.append(
+                {
+                    "dependency_mode": binding_mode,
+                    "factor_candidate": dict(factor_candidate),
+                    "output_column": output_column,
+                    "feature_input_key_to_column_dict": feature_input_key_to_column_dict,
+                    "binding_record": {
+                        "output_column": output_column,
                         "factor_name": factor_name,
                         "candidate_label": candidate_label,
-                        "binding_mode": "single_input",
-                        "bound_source_column_list": [str(record["column"])],
+                        "binding_mode": binding_mode,
+                        "asset_code": str(asset_code),
+                        "bound_field_name_list": list(required_field_name_list),
+                        "bound_source_column_list": list(bound_source_column_list),
                         "target_code": target_code,
                         "linked_code": None,
                     },
@@ -861,7 +919,7 @@ def _build_bound_feature_input_dict(checked_feature_df, feature_input_key_to_col
 
 
 def _build_bound_factor_series(feature_input_dict, factor_candidate, strategy_params):
-    # 单输入和跨标的因子统一在绑定后生成 raw/normalized 结果，过滤规则继续复用流程0现有阈值。
+    # 单字段和同资产多字段因子统一在绑定后生成 raw/normalized 结果，过滤规则继续复用流程0现有阈值。
     factor_candidate = dict(factor_candidate)
     factor_name = str(factor_candidate["factor_name"])
     candidate_label = str(factor_candidate["candidate_label"])

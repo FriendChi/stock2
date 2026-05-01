@@ -329,7 +329,64 @@ def test_build_checked_factor_table_filters_single_input_fields_by_factor_mappin
     assert "000510__amount__momentum(window=10)__zscore" in updated_df.columns
     assert "930955__daily_growth_rate__momentum(window=10)__zscore" not in updated_df.columns
     assert "930955__daily_growth_rate__ma_trend_state(window=10)__zscore" in updated_df.columns
-    assert all(record["binding_mode"] == "single_input" for record in factor_binding_record_list)
+    assert all(record["binding_mode"] == "single_field" for record in factor_binding_record_list)
+
+
+def test_build_checked_factor_table_generates_multi_field_same_asset_factor_columns(monkeypatch, tmp_path):
+    checked_output_path = tmp_path / "feature_preprocess_checked.csv"
+    checked_df = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=8, freq="D"),
+            "007301__open": [1.0 + idx * 0.01 for idx in range(8)],
+            "007301__high": [1.2 + idx * 0.01 for idx in range(8)],
+            "007301__low": [0.8 + idx * 0.01 for idx in range(8)],
+            "007301__close": [1.1 + idx * 0.01 for idx in range(8)],
+            "000510__high": [2.2 + idx * 0.01 for idx in range(8)],
+            "000510__low": [1.7 + idx * 0.01 for idx in range(8)],
+        }
+    )
+    checked_df.to_csv(checked_output_path, index=False)
+    monkeypatch.setattr(
+        factor_analysis_feature_preprocess,
+        "_build_factor_candidate_config",
+        lambda strategy_params: (
+            {"score_window": 3},
+            [
+                {
+                    "candidate_label": "intraday_range_ratio",
+                    "factor_name": "intraday_range_ratio",
+                    "param_dict": {},
+                },
+                {
+                    "candidate_label": "gap_strength",
+                    "factor_name": "gap_strength",
+                    "param_dict": {},
+                },
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        factor_analysis_feature_preprocess,
+        "normalize_factor_series",
+        lambda raw_factor_series, factor_name, score_window: pd.Series(raw_factor_series, copy=True).astype(float),
+    )
+
+    updated_df, _, _, _, _, factor_binding_record_list = factor_analysis_feature_preprocess._build_checked_factor_table(
+        checked_output_path=checked_output_path,
+        strategy_params={"score_window": 3},
+        fund_code="007301",
+        dropped_source_column_list=[],
+    )
+
+    assert "007301__high-low-close__intraday_range_ratio__zscore" in updated_df.columns
+    assert "007301__open-close__gap_strength__zscore" in updated_df.columns
+    assert "000510__high-low-close__intraday_range_ratio__zscore" not in updated_df.columns
+    assert any(
+        record["binding_mode"] == "multi_field_same_asset"
+        and record["asset_code"] == "007301"
+        and record["bound_field_name_list"] == ["high", "low", "close"]
+        for record in factor_binding_record_list
+    )
 
 def test_trim_initial_rows_keeps_date_price_and_factor_columns_aligned():
     sample_size = factor_analysis_feature_preprocess.INITIAL_TRIM_ROW_COUNT + 5

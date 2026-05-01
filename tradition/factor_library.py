@@ -108,6 +108,32 @@ def calculate_sharpe_like_trend(series, window):
     return rolling_mean / rolling_std.replace(0.0, float("nan"))
 
 
+def calculate_intraday_range_ratio(high_series, low_series, close_series):
+    # 日内振幅因子统一使用区间振幅相对收盘价，突出单日波动强度而不混入额外趋势含义。
+    high_series = pd.Series(high_series, copy=True).astype(float)
+    low_series = pd.Series(low_series, copy=True).astype(float)
+    close_series = pd.Series(close_series, copy=True).astype(float)
+    denominator = close_series.replace(0.0, float("nan"))
+    return (high_series - low_series) / denominator
+
+
+def calculate_close_to_high_ratio(close_series, high_series, low_series):
+    # 收盘靠近高点因子统一按区间位置计算，越接近 1 说明收盘更靠近当日高点。
+    close_series = pd.Series(close_series, copy=True).astype(float)
+    high_series = pd.Series(high_series, copy=True).astype(float)
+    low_series = pd.Series(low_series, copy=True).astype(float)
+    denominator = (high_series - low_series).replace(0.0, float("nan"))
+    return (close_series - low_series) / denominator
+
+
+def calculate_gap_strength(open_series, close_series):
+    # 跳空强度固定用当日开盘相对前一日收盘的偏离率，统一表达隔夜信息冲击。
+    open_series = pd.Series(open_series, copy=True).astype(float)
+    previous_close_series = pd.Series(close_series, copy=True).astype(float).shift(1)
+    denominator = previous_close_series.replace(0.0, float("nan"))
+    return open_series / denominator - 1.0
+
+
 def calculate_trend_r2(series, window):
     # 趋势拟合度只基于单价序列滚动线性回归的 R2，刻画价格路径的线性趋势稳定性。
     price_series = pd.Series(series, copy=True).astype(float)
@@ -279,6 +305,18 @@ def build_factor_pool_dict():
                 "window": {"default": 20, "search_space": (10, 60, 5)},
             },
         },
+        "intraday_range_ratio": {
+            "group": "日内结构",
+            "param_spec": {},
+        },
+        "close_to_high_ratio": {
+            "group": "日内结构",
+            "param_spec": {},
+        },
+        "gap_strength": {
+            "group": "日内结构",
+            "param_spec": {},
+        },
     }
 
 
@@ -302,6 +340,74 @@ FACTOR_ALLOWED_FIELD_NAME_LIST_DICT = {
 }
 
 
+FACTOR_DEPENDENCY_SPEC_DICT = {
+    "momentum": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "ma_trend_state": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low", "daily_growth_rate"],
+    },
+    "ma_slope": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "trend_r2": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "trend_tvalue": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "price_position": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "breakout_strength": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low", "daily_growth_rate"],
+    },
+    "donchian_breakout": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low", "daily_growth_rate"],
+    },
+    "trend_residual": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "volatility": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "drawdown": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "risk_adjusted_momentum": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "sharpe_like_trend": {
+        "binding_mode": "single_field",
+        "candidate_field_name_list": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    },
+    "intraday_range_ratio": {
+        "binding_mode": "multi_field_same_asset",
+        "required_field_name_list": ["high", "low", "close"],
+    },
+    "close_to_high_ratio": {
+        "binding_mode": "multi_field_same_asset",
+        "required_field_name_list": ["close", "high", "low"],
+    },
+    "gap_strength": {
+        "binding_mode": "multi_field_same_asset",
+        "required_field_name_list": ["open", "close"],
+    },
+}
+
+
 def resolve_factor_allowed_field_name_list(factor_name):
     factor_name = str(factor_name)
     if factor_name not in FACTOR_POOL_DICT:
@@ -309,6 +415,15 @@ def resolve_factor_allowed_field_name_list(factor_name):
     if factor_name not in FACTOR_ALLOWED_FIELD_NAME_LIST_DICT:
         raise ValueError(f"当前未定义允许字段映射: {factor_name}")
     return list(FACTOR_ALLOWED_FIELD_NAME_LIST_DICT[factor_name])
+
+
+def resolve_factor_dependency_spec(factor_name):
+    factor_name = str(factor_name)
+    if factor_name not in FACTOR_POOL_DICT:
+        raise ValueError(f"当前未定义因子: {factor_name}")
+    if factor_name not in FACTOR_DEPENDENCY_SPEC_DICT:
+        raise ValueError(f"当前未定义依赖规格: {factor_name}")
+    return dict(FACTOR_DEPENDENCY_SPEC_DICT[factor_name])
 
 
 def resolve_factor_name_list_by_group(factor_group_list):
@@ -347,6 +462,23 @@ def build_raw_factor_series(price_series, factor_name, factor_param_dict, featur
     factor_params = dict(factor_param_dict[factor_name])
     if feature_input_dict is not None:
         feature_input_dict = dict(feature_input_dict)
+        if factor_name == "intraday_range_ratio":
+            return calculate_intraday_range_ratio(
+                high_series=feature_input_dict["high"],
+                low_series=feature_input_dict["low"],
+                close_series=feature_input_dict["close"],
+            )
+        if factor_name == "close_to_high_ratio":
+            return calculate_close_to_high_ratio(
+                close_series=feature_input_dict["close"],
+                high_series=feature_input_dict["high"],
+                low_series=feature_input_dict["low"],
+            )
+        if factor_name == "gap_strength":
+            return calculate_gap_strength(
+                open_series=feature_input_dict["open"],
+                close_series=feature_input_dict["close"],
+            )
         if "source" in feature_input_dict:
             price_series = feature_input_dict["source"]
         elif "target" in feature_input_dict:
