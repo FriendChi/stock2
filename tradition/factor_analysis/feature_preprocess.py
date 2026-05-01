@@ -13,7 +13,7 @@ from tradition.factor_analysis.common import (
     compute_segment_correlation_metrics,
 )
 from tradition.factor_engine import normalize_factor_series, rolling_zscore
-from tradition.factor_library import build_raw_factor_series
+from tradition.factor_library import build_raw_factor_series, resolve_factor_allowed_field_name_list
 from tradition.splitter import build_walk_forward_dev_fold_list
 
 from .io import allocate_stage_csv_json_output_path
@@ -772,7 +772,7 @@ def _build_single_feature_factor_df(feature_series, candidate_factor_list, strat
         drop_reason_list = []
         if raw_nan_ratio >= float(MAX_FACTOR_RAW_NAN_RATIO):
             drop_reason_list.append("raw_nan_ratio_threshold")
-        if normalized_zero_ratio > float(MAX_NORMALIZED_ZERO_RATIO):
+        if normalized_zero_ratio >= float(MAX_NORMALIZED_ZERO_RATIO):
             drop_reason_list.append("normalized_zero_ratio_threshold")
         if len(drop_reason_list) > 0:
             dropped_factor_report_list.append(
@@ -789,8 +789,121 @@ def _build_single_feature_factor_df(feature_series, candidate_factor_list, strat
     return factor_df.fillna(0.0), dropped_factor_report_list
 
 
-def _build_checked_factor_table(checked_output_path, strategy_params, dropped_source_column_list=None):
-    # checked 表在补缺完成后直接扩展标准化原始特征和标准化因子，不再单独落因子文件。
+def _extract_feature_column_record(feature_column):
+    # 流程0基础列统一解析成代码和字段两段，后续单输入和跨标的绑定都复用同一份结构。
+    feature_column = str(feature_column)
+    if "__" not in feature_column:
+        raise ValueError(f"基础特征列不符合 code__field 约定: {feature_column}")
+    code, field_name = feature_column.split("__", 1)
+    return {
+        "column": feature_column,
+        "code": str(code).zfill(6),
+        "field_name": str(field_name),
+    }
+
+
+def _build_feature_column_record_list(source_column_list):
+    # checked 宽表只把原始基础列纳入绑定池，避免把已生成的因子列再次当作输入源。
+    return [_extract_feature_column_record(feature_column=source_column) for source_column in list(source_column_list)]
+
+
+def _build_single_input_factor_output_column(source_column, candidate_label):
+    # 单输入因子继续沿用旧列名契约，保证流程1-5继续消费已有产物。
+    return f"{str(source_column)}__{str(candidate_label)}__zscore"
+
+
+def _build_factor_task_list(source_column_list, candidate_factor_list, fund_code):
+    # 因子任务先按“因子 -> 允许字段集合”过滤基础列，只对语义允许的字段生成单输入任务。
+    feature_column_record_list = _build_feature_column_record_list(source_column_list=source_column_list)
+    target_code = str(fund_code).zfill(6)
+    task_list = []
+    for factor_candidate in list(candidate_factor_list):
+        factor_name = str(factor_candidate["factor_name"])
+        candidate_label = str(factor_candidate["candidate_label"])
+        allowed_field_name_list = resolve_factor_allowed_field_name_list(factor_name=factor_name)
+        for record in feature_column_record_list:
+            if str(record["field_name"]) not in allowed_field_name_list:
+                continue
+            task_list.append(
+                {
+                    "dependency_mode": "single_input",
+                    "factor_candidate": dict(factor_candidate),
+                    "output_column": _build_single_input_factor_output_column(
+                        source_column=record["column"],
+                        candidate_label=candidate_label,
+                    ),
+                    "feature_input_key_to_column_dict": {
+                        "source": str(record["column"]),
+                    },
+                    "binding_record": {
+                        "output_column": _build_single_input_factor_output_column(
+                            source_column=record["column"],
+                            candidate_label=candidate_label,
+                        ),
+                        "factor_name": factor_name,
+                        "candidate_label": candidate_label,
+                        "binding_mode": "single_input",
+                        "bound_source_column_list": [str(record["column"])],
+                        "target_code": target_code,
+                        "linked_code": None,
+                    },
+                }
+            )
+    return task_list
+
+
+def _build_bound_feature_input_dict(checked_feature_df, feature_input_key_to_column_dict):
+    # 绑定成功后的输入字典只在这里从宽表取列，避免各类因子分支重复处理 Series 对齐。
+    return {
+        str(input_key): pd.Series(checked_feature_df[str(source_column)], copy=True).astype(float)
+        for input_key, source_column in dict(feature_input_key_to_column_dict).items()
+    }
+
+
+def _build_bound_factor_series(feature_input_dict, factor_candidate, strategy_params):
+    # 单输入和跨标的因子统一在绑定后生成 raw/normalized 结果，过滤规则继续复用流程0现有阈值。
+    factor_candidate = dict(factor_candidate)
+    factor_name = str(factor_candidate["factor_name"])
+    candidate_label = str(factor_candidate["candidate_label"])
+    score_window = int(strategy_params["score_window"])
+    raw_factor_series = pd.Series(
+        build_raw_factor_series(
+            price_series=None,
+            factor_name=factor_name,
+            factor_param_dict={
+                factor_name: dict(factor_candidate["param_dict"]),
+            },
+            feature_input_dict=feature_input_dict,
+        ),
+        copy=True,
+    ).astype(float)
+    raw_factor_series = raw_factor_series.replace([float("inf"), -float("inf")], float("nan"))
+    raw_nan_ratio = float(raw_factor_series.isna().mean())
+    normalized_factor_series = normalize_factor_series(
+        raw_factor_series=raw_factor_series,
+        factor_name=factor_name,
+        score_window=score_window,
+    )
+    normalized_factor_series = pd.Series(normalized_factor_series, copy=True).astype(float)
+    normalized_zero_ratio = _compute_normalized_zero_ratio_on_mature_samples(
+        normalized_factor_series=normalized_factor_series,
+    )
+    drop_reason_list = []
+    if raw_nan_ratio >= float(MAX_FACTOR_RAW_NAN_RATIO):
+        drop_reason_list.append("raw_nan_ratio_threshold")
+    if normalized_zero_ratio >= float(MAX_NORMALIZED_ZERO_RATIO):
+        drop_reason_list.append("normalized_zero_ratio_threshold")
+    return {
+        "candidate_label": candidate_label,
+        "raw_nan_ratio": raw_nan_ratio,
+        "normalized_zero_ratio": normalized_zero_ratio,
+        "drop_reason_list": drop_reason_list,
+        "normalized_factor_series": normalized_factor_series.fillna(0.0),
+    }
+
+
+def _build_checked_factor_table(checked_output_path, strategy_params, fund_code, dropped_source_column_list=None):
+    # checked 表改为先做绑定任务展开，再统一计算单输入/跨标的因子，保留旧列名并补充跨标的新列名。
     checked_feature_df = _load_saved_wide_feature_table(raw_output_path=checked_output_path)
     resolved_strategy_params, candidate_factor_list = _build_factor_candidate_config(strategy_params=strategy_params)
     source_column_list = _resolve_factor_source_column_list(
@@ -798,39 +911,56 @@ def _build_checked_factor_table(checked_output_path, strategy_params, dropped_so
         dropped_source_column_list=dropped_source_column_list,
     )
     extended_checked_df = checked_feature_df.copy()
-    total_source_count = int(len(source_column_list))
-    expected_added_column_count = int(total_source_count * (1 + len(candidate_factor_list)))
+    for source_column in list(source_column_list):
+        extended_checked_df[f"{source_column}__zscore"] = rolling_zscore(
+            pd.Series(checked_feature_df[source_column], copy=True).astype(float),
+            window=int(resolved_strategy_params["score_window"]),
+        )
+    factor_task_list = _build_factor_task_list(
+        source_column_list=source_column_list,
+        candidate_factor_list=candidate_factor_list,
+        fund_code=fund_code,
+    )
+    expected_added_column_count = int(len(source_column_list) + len(factor_task_list))
     accumulated_added_column_count = 0
     dropped_factor_report_list = []
-    for source_idx, source_column in enumerate(source_column_list, start=1):
-        single_feature_factor_df, source_dropped_factor_report_list = _build_single_feature_factor_df(
-            feature_series=checked_feature_df[source_column],
-            candidate_factor_list=candidate_factor_list,
+    factor_binding_record_list = []
+    accumulated_added_column_count = accumulated_added_column_count + int(len(source_column_list))
+    for task_idx, factor_task in enumerate(factor_task_list, start=1):
+        feature_input_dict = _build_bound_feature_input_dict(
+            checked_feature_df=checked_feature_df,
+            feature_input_key_to_column_dict=factor_task["feature_input_key_to_column_dict"],
+        )
+        factor_result = _build_bound_factor_series(
+            feature_input_dict=feature_input_dict,
+            factor_candidate=factor_task["factor_candidate"],
             strategy_params=resolved_strategy_params,
         )
-        single_feature_factor_df.columns = [f"{source_column}__{column}" for column in single_feature_factor_df.columns]
-        single_feature_factor_df.index = extended_checked_df.index
-        extended_checked_df = pd.concat([extended_checked_df, single_feature_factor_df], axis=1)
-        accumulated_added_column_count = accumulated_added_column_count + int(len(single_feature_factor_df.columns))
-        for dropped_factor_report in source_dropped_factor_report_list:
-            dropped_factor_report = dict(dropped_factor_report)
-            dropped_factor_report["source_column"] = source_column
+        if len(factor_result["drop_reason_list"]) > 0:
+            dropped_factor_report = dict(factor_result)
+            dropped_factor_report["output_column"] = str(factor_task["output_column"])
+            dropped_factor_report["source_column"] = list(factor_task["binding_record"]["bound_source_column_list"])[0]
+            dropped_factor_report["bound_source_column_list"] = list(factor_task["binding_record"]["bound_source_column_list"])
             dropped_factor_report_list.append(dropped_factor_report)
             print(
                 "删除因子:",
-                f"基础特征={source_column}",
-                f"因子={dropped_factor_report['candidate_label']}__zscore",
-                f"raw_nan_ratio={dropped_factor_report['raw_nan_ratio']:.4f}",
-                f"normalized_zero_ratio={dropped_factor_report['normalized_zero_ratio']:.4f}",
+                f"绑定={','.join(dropped_factor_report['bound_source_column_list'])}",
+                f"因子={dropped_factor_report['output_column']}",
+                f"raw_nan_ratio={factor_result['raw_nan_ratio']:.4f}",
+                f"normalized_zero_ratio={factor_result['normalized_zero_ratio']:.4f}",
                 "原因=超过阈值",
             )
+            continue
+        extended_checked_df[str(factor_task["output_column"])] = factor_result["normalized_factor_series"].to_numpy(dtype=float)
+        factor_binding_record_list.append(dict(factor_task["binding_record"]))
+        accumulated_added_column_count = accumulated_added_column_count + 1
         print(
-            f"因子进度: {source_idx}/{total_source_count}",
-            f"基础特征={source_column}",
+            f"因子进度: {task_idx}/{len(factor_task_list)}",
+            f"输出列={factor_task['output_column']}",
             f"已生成新增列={accumulated_added_column_count}/{expected_added_column_count}",
         )
     extended_checked_df.to_csv(checked_output_path, index=False)
-    return extended_checked_df, checked_output_path, source_column_list, candidate_factor_list, dropped_factor_report_list
+    return extended_checked_df, checked_output_path, source_column_list, candidate_factor_list, dropped_factor_report_list, factor_binding_record_list
 
 
 def build_code_feature_table(code_type_dict, output_path=None, primary_code=None, force_refresh=False, config=None):
@@ -1006,6 +1136,7 @@ def _build_feature_preprocess_metadata(
     feature_quality_report_list,
     dropped_source_column_list,
     dropped_factor_report_list,
+    factor_binding_record_list,
     flipped_factor_report_list,
 ):
     # 元信息 JSON 显式声明目标列和特征列，避免流程1再从命名规则反推接口。
@@ -1032,6 +1163,7 @@ def _build_feature_preprocess_metadata(
         "raw_feature_column_list": raw_feature_column_list,
         "raw_feature_zscore_column_list": raw_feature_zscore_column_list,
         "factor_feature_column_list": factor_feature_column_list,
+        "factor_binding_record_list": list(factor_binding_record_list),
         "linked_code_type_dict": {str(code).zfill(6): str(code_type) for code, code_type in dict(code_type_dict).items()},
         "candidate_factor_count": int(len(candidate_factor_list)),
         "row_count": int(len(checked_feature_df)),
@@ -1058,8 +1190,9 @@ def _build_feature_preprocess_metadata(
         "dropped_feature_list": [
             {
                 "source_column": str(record["source_column"]),
+                "bound_source_column_list": [str(column) for column in list(record.get("bound_source_column_list", []))],
                 "candidate_label": str(record["candidate_label"]),
-                "output_column": f"{str(record['source_column'])}__{str(record['candidate_label'])}__zscore",
+                "output_column": str(record.get("output_column", f"{str(record['source_column'])}__{str(record['candidate_label'])}__zscore")),
                 "raw_nan_ratio": float(record["raw_nan_ratio"]),
                 "normalized_zero_ratio": float(record["normalized_zero_ratio"]),
                 "drop_reason_list": list(record["drop_reason_list"]),
@@ -1192,9 +1325,10 @@ def run_feature_preprocess_single_fund(config_override=None):
         code_type_dict=code_type_dict,
         primary_code=fund_code,
     )
-    checked_feature_df, checked_output_path, source_column_list, candidate_factor_list, dropped_factor_report_list = _build_checked_factor_table(
+    checked_feature_df, checked_output_path, source_column_list, candidate_factor_list, dropped_factor_report_list, factor_binding_record_list = _build_checked_factor_table(
         checked_output_path=checked_output_path,
         strategy_params=config["strategy_param_dict"]["multi_factor_score"],
+        fund_code=fund_code,
         dropped_source_column_list=dropped_source_column_list,
     )
     # 翻转列生成沿用流程1训练集口径，只把稳定负向候选追加成新的 factor_feature 列。
@@ -1219,6 +1353,7 @@ def run_feature_preprocess_single_fund(config_override=None):
         feature_quality_report_list=feature_quality_report_list,
         dropped_source_column_list=dropped_source_column_list,
         dropped_factor_report_list=dropped_factor_report_list,
+        factor_binding_record_list=factor_binding_record_list,
         flipped_factor_report_list=flipped_factor_report_list,
     )
     payload = {

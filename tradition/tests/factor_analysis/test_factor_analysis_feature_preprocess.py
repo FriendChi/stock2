@@ -261,14 +261,75 @@ def test_build_checked_factor_table_skips_dropped_source_columns(monkeypatch, tm
         lambda strategy_params: ({"score_window": 3}, []),
     )
 
-    updated_df, _, source_column_list, _, _ = factor_analysis_feature_preprocess._build_checked_factor_table(
+    updated_df, _, source_column_list, _, _, factor_binding_record_list = factor_analysis_feature_preprocess._build_checked_factor_table(
         checked_output_path=checked_output_path,
         strategy_params={"score_window": 3},
+        fund_code="007301",
         dropped_source_column_list=["512480__price"],
     )
 
     assert source_column_list == ["007301__price"]
     assert "512480__price__zscore" not in updated_df.columns
+    assert factor_binding_record_list == []
+
+
+def test_build_checked_factor_table_filters_single_input_fields_by_factor_mapping(monkeypatch, tmp_path):
+    checked_output_path = tmp_path / "feature_preprocess_checked.csv"
+    checked_df = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=8, freq="D"),
+            "007301__price": [1.0 + idx * 0.01 for idx in range(8)],
+            "000510__amount": [100 + idx for idx in range(8)],
+            "930955__daily_growth_rate": [0.01 * idx for idx in range(8)],
+        }
+    )
+    checked_df.to_csv(checked_output_path, index=False)
+    monkeypatch.setattr(
+        factor_analysis_feature_preprocess,
+        "_build_factor_candidate_config",
+        lambda strategy_params: (
+            {"score_window": 3},
+            [
+                {
+                    "candidate_label": "momentum(window=10)",
+                    "factor_name": "momentum",
+                    "param_dict": {"window": 10},
+                },
+                {
+                    "candidate_label": "ma_trend_state(window=10)",
+                    "factor_name": "ma_trend_state",
+                    "param_dict": {"window": 10},
+                },
+            ],
+        ),
+    )
+
+    def fake_build_raw_factor_series(price_series, factor_name, factor_param_dict, feature_input_dict=None):
+        return pd.Series(feature_input_dict["source"], copy=True)
+
+    monkeypatch.setattr(
+        factor_analysis_feature_preprocess,
+        "build_raw_factor_series",
+        fake_build_raw_factor_series,
+    )
+    monkeypatch.setattr(
+        factor_analysis_feature_preprocess,
+        "normalize_factor_series",
+        lambda raw_factor_series, factor_name, score_window: pd.Series(raw_factor_series, copy=True).astype(float),
+    )
+
+    updated_df, _, _, _, _, factor_binding_record_list = factor_analysis_feature_preprocess._build_checked_factor_table(
+        checked_output_path=checked_output_path,
+        strategy_params={"score_window": 3},
+        fund_code="007301",
+        dropped_source_column_list=[],
+    )
+
+    assert "007301__price__momentum(window=10)__zscore" in updated_df.columns
+    assert "000510__amount__momentum(window=10)__zscore" in updated_df.columns
+    assert "930955__daily_growth_rate__momentum(window=10)__zscore" not in updated_df.columns
+    assert "930955__daily_growth_rate__ma_trend_state(window=10)__zscore" in updated_df.columns
+    assert all(record["binding_mode"] == "single_input" for record in factor_binding_record_list)
 
 def test_trim_initial_rows_keeps_date_price_and_factor_columns_aligned():
     sample_size = factor_analysis_feature_preprocess.INITIAL_TRIM_ROW_COUNT + 5
@@ -356,10 +417,11 @@ def test_run_feature_preprocess_trims_final_checked_table(monkeypatch, tmp_path)
     monkeypatch.setattr(
         factor_analysis_feature_preprocess,
         "_build_checked_factor_table",
-        lambda checked_output_path, strategy_params, dropped_source_column_list=None: (
+        lambda checked_output_path, strategy_params, fund_code, dropped_source_column_list=None: (
             initial_checked_df.copy(),
             checked_output_path,
             ["007301__price", "007301__cumulative_nav"],
+            [],
             [],
             [],
         ),
@@ -398,6 +460,7 @@ def test_run_feature_preprocess_trims_final_checked_table(monkeypatch, tmp_path)
     assert saved_df["007301__price__donchian_breakout(window=20)__zscore"].tolist() == [0.0, 1.0, 1.0, 0.0, 1.0]
     assert saved_payload["feature_preprocess_output"]["row_count"] == 5
     assert saved_payload["feature_preprocess_output"]["csv_path"] == str(checked_output_path.resolve())
+    assert saved_payload["feature_preprocess_output"]["factor_binding_record_list"] == []
 
 def test_run_feature_preprocess_metadata_records_dropped_source_columns(monkeypatch, tmp_path):
     sample_size = factor_analysis_feature_preprocess.INITIAL_TRIM_ROW_COUNT + 5
@@ -468,10 +531,11 @@ def test_run_feature_preprocess_metadata_records_dropped_source_columns(monkeypa
     monkeypatch.setattr(
         factor_analysis_feature_preprocess,
         "_build_checked_factor_table",
-        lambda checked_output_path, strategy_params, dropped_source_column_list=None: (
+        lambda checked_output_path, strategy_params, fund_code, dropped_source_column_list=None: (
             initial_checked_df.copy(),
             checked_output_path,
             ["007301__price", "007301__cumulative_nav"],
+            [],
             [],
             [],
         ),
