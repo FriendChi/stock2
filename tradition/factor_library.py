@@ -285,6 +285,32 @@ def build_factor_pool_dict():
 FACTOR_POOL_DICT = build_factor_pool_dict()
 
 
+FACTOR_ALLOWED_FIELD_NAME_LIST_DICT = {
+    "momentum": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    "ma_trend_state": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low", "daily_growth_rate"],
+    "ma_slope": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    "trend_r2": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    "trend_tvalue": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    "price_position": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    "breakout_strength": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low", "daily_growth_rate"],
+    "donchian_breakout": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low", "daily_growth_rate"],
+    "trend_residual": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    "volatility": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    "drawdown": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    "risk_adjusted_momentum": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+    "sharpe_like_trend": ["price", "close", "cumulative_nav", "volume", "amount", "open", "high", "low"],
+}
+
+
+def resolve_factor_allowed_field_name_list(factor_name):
+    factor_name = str(factor_name)
+    if factor_name not in FACTOR_POOL_DICT:
+        raise ValueError(f"当前未定义因子: {factor_name}")
+    if factor_name not in FACTOR_ALLOWED_FIELD_NAME_LIST_DICT:
+        raise ValueError(f"当前未定义允许字段映射: {factor_name}")
+    return list(FACTOR_ALLOWED_FIELD_NAME_LIST_DICT[factor_name])
+
+
 def resolve_factor_name_list_by_group(factor_group_list):
     # 因子筛选入口允许按因子族传入，并从因子库中展开去重，避免 runner 自己感知因子库细节。
     if not isinstance(factor_group_list, list) or len(factor_group_list) == 0:
@@ -315,10 +341,16 @@ def resolve_factor_name_list_by_group(factor_group_list):
     return deduplicated_factor_name_list
 
 
-def build_raw_factor_series(price_series, factor_name, factor_param_dict):
-    # 原始因子统一在这里派发，避免因子表构建阶段堆叠大量 if/else。
+def build_raw_factor_series(price_series, factor_name, factor_param_dict, feature_input_dict=None):
+    # 原始因子统一在这里派发；流程0当前只用单输入绑定，旧入口继续兼容单输入调用。
     factor_name = str(factor_name)
     factor_params = dict(factor_param_dict[factor_name])
+    if feature_input_dict is not None:
+        feature_input_dict = dict(feature_input_dict)
+        if "source" in feature_input_dict:
+            price_series = feature_input_dict["source"]
+        elif "target" in feature_input_dict:
+            price_series = feature_input_dict["target"]
     if factor_name == "momentum":
         return calculate_factor_momentum(price_series, window=int(factor_params["window"]))
     if factor_name == "ma_trend_state":
