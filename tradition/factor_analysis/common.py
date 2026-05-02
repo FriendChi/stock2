@@ -44,7 +44,7 @@ def load_preprocess_price_series(preprocess_path, expected_fund_code=None):
 
 
 def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, expected_fund_code=None):
-    # 新流程0输出必须提供元信息 JSON；特征主文件路径与格式优先从 metadata 恢复，并兼容旧 csv_path 契约。
+    # 流程1承接流程0时只信 metadata 中的主特征文件路径和结构化因子绑定记录，不再对基金代码做阻断式强校验。
     if preprocess_metadata_path is None:
         raise ValueError("必须提供 preprocess_metadata_path。")
     preprocess_metadata_path = Path(preprocess_metadata_path)
@@ -58,13 +58,9 @@ def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, ex
     if not isinstance(feature_preprocess_output, dict):
         raise ValueError("流程0元信息 JSON 缺少 feature_preprocess_output 子字典。")
     fund_code = str(feature_preprocess_output.get("fund_code", "")).zfill(6)
-    if expected_fund_code is not None and fund_code != str(expected_fund_code).zfill(6):
-        raise ValueError(f"流程0元信息基金代码不匹配: expected={str(expected_fund_code).zfill(6)} actual={fund_code}")
     feature_path_in_metadata = str(feature_preprocess_output.get("feature_path", "")).strip()
     if len(feature_path_in_metadata) == 0:
-        feature_path_in_metadata = str(feature_preprocess_output.get("csv_path", "")).strip()
-    if len(feature_path_in_metadata) == 0:
-        raise ValueError("流程0元信息缺少 feature_path/csv_path。")
+        raise ValueError("流程0元信息缺少 feature_path。")
     feature_format = str(feature_preprocess_output.get("feature_format", "")).strip().lower()
     if len(feature_format) == 0:
         feature_format = Path(feature_path_in_metadata).suffix.lstrip(".").lower()
@@ -73,7 +69,7 @@ def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, ex
         preprocess_path = feature_path_in_metadata
     preprocess_path = Path(preprocess_path)
     if Path(feature_path_in_metadata).resolve() != preprocess_path.resolve():
-        raise ValueError("流程0元信息中的 feature_path/csv_path 与传入 preprocess_path 不一致。")
+        raise ValueError("流程0元信息中的 feature_path 与传入 preprocess_path 不一致。")
     if not preprocess_path.exists():
         raise FileNotFoundError(f"流程0特征文件不存在: {preprocess_path}")
     if feature_format == "parquet":
@@ -89,6 +85,7 @@ def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, ex
     target_nav_column = str(feature_preprocess_output.get("target_nav_column", "")).strip()
     target_price_column = str(feature_preprocess_output.get("target_price_column", "")).strip()
     factor_feature_column_list = [str(column) for column in list(feature_preprocess_output.get("factor_feature_column_list", []))]
+    factor_binding_record_list = list(feature_preprocess_output.get("factor_binding_record_list", []))
     if len(target_nav_column) == 0:
         raise ValueError("流程0元信息缺少 target_nav_column。")
     if target_nav_column not in feature_df.columns:
@@ -97,6 +94,18 @@ def load_feature_preprocess_bundle(preprocess_path, preprocess_metadata_path, ex
         raise ValueError("流程0元信息缺少 target_price_column。")
     if target_price_column not in feature_df.columns:
         raise ValueError(f"target_price_column 不存在于流程0特征文件: {target_price_column}")
+    if len(factor_binding_record_list) == 0:
+        raise ValueError("流程0元信息缺少 factor_binding_record_list。")
+    binding_record_candidate_label_list = []
+    for binding_record in factor_binding_record_list:
+        if not isinstance(binding_record, dict):
+            raise ValueError("流程0元信息中的 factor_binding_record_list 必须由字典组成。")
+        output_column = str(binding_record.get("output_column", "")).strip()
+        if len(output_column) == 0:
+            raise ValueError("流程0元信息中的因子绑定记录缺少 output_column。")
+        binding_record_candidate_label_list.append(output_column)
+    if factor_feature_column_list != binding_record_candidate_label_list:
+        raise ValueError("流程0元信息中的 factor_feature_column_list 与 factor_binding_record_list 不一致。")
     missing_factor_column_list = [column for column in factor_feature_column_list if column not in feature_df.columns]
     if len(missing_factor_column_list) > 0:
         raise ValueError(f"流程0元信息中的因子列不存在于特征文件: {missing_factor_column_list[:10]}")

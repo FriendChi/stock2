@@ -1136,6 +1136,25 @@ def _build_flipped_factor_feature_column_name(factor_feature_column):
     return f"{source_column}__-{factor_name}{factor_suffix}"
 
 
+def _build_flipped_factor_binding_record_list(flipped_factor_report_list, factor_binding_record_list):
+    # 翻转列的绑定记录直接复用原列的结构化绑定信息，只替换输出列并补充原列来源，保证流程1看到的候选集合完全闭合。
+    original_binding_record_dict = {
+        str(binding_record["output_column"]): dict(binding_record) for binding_record in list(factor_binding_record_list)
+    }
+    flipped_factor_binding_record_list = []
+    for flipped_factor_report in list(flipped_factor_report_list):
+        original_column = str(flipped_factor_report["original_column"])
+        if original_column not in original_binding_record_dict:
+            raise ValueError(f"翻转因子缺少原始绑定记录: {original_column}")
+        original_binding_record = dict(original_binding_record_dict[original_column])
+        flipped_binding_record = dict(original_binding_record)
+        flipped_binding_record["output_column"] = str(flipped_factor_report["flipped_column"])
+        flipped_binding_record["candidate_label"] = str(flipped_factor_report["flipped_column"])
+        flipped_binding_record["original_output_column"] = original_column
+        flipped_factor_binding_record_list.append(flipped_binding_record)
+    return flipped_factor_binding_record_list
+
+
 def _build_flipped_factor_report_list(checked_feature_df, factor_feature_column_list, target_nav_column, config):
     # 翻转判定严格复用流程1的训练集口径，只额外统计正负 IC 次数决定是否追加反向候选列。
     feature_df = checked_feature_df.copy()
@@ -1189,8 +1208,8 @@ def _build_flipped_factor_report_list(checked_feature_df, factor_feature_column_
     return flipped_factor_report_list
 
 
-def _append_flipped_factor_feature_columns(checked_feature_df, checked_output_path, source_column_list, fund_code, config):
-    # 翻转列同样先批量构造成新表，再统一拼接到 checked 宽表，避免继续逐列插入。
+def _append_flipped_factor_feature_columns(checked_feature_df, checked_output_path, source_column_list, fund_code, config, factor_binding_record_list):
+    # 翻转列同样先批量构造成新表，再统一拼接到 checked 宽表，并同步补齐绑定记录，保证 metadata 自洽。
     checked_feature_df = checked_feature_df.copy()
     _, _, factor_feature_column_list = _resolve_feature_column_group_list(
         checked_feature_df=checked_feature_df,
@@ -1216,8 +1235,12 @@ def _append_flipped_factor_feature_columns(checked_feature_df, checked_output_pa
             [checked_feature_df, pd.DataFrame(flipped_factor_column_dict, index=checked_feature_df.index)],
             axis=1,
         )
+    flipped_factor_binding_record_list = _build_flipped_factor_binding_record_list(
+        flipped_factor_report_list=flipped_factor_report_list,
+        factor_binding_record_list=factor_binding_record_list,
+    )
     _save_feature_table(feature_df=checked_feature_df, table_path=checked_output_path)
-    return checked_feature_df, checked_output_path, flipped_factor_report_list
+    return checked_feature_df, checked_output_path, flipped_factor_report_list, flipped_factor_binding_record_list
 
 
 def _build_feature_preprocess_metadata(
@@ -1234,9 +1257,9 @@ def _build_feature_preprocess_metadata(
     factor_binding_record_list,
     flipped_factor_report_list,
 ):
-    # 元信息 JSON 显式声明目标列和特征列，避免流程1再从命名规则反推接口。
+    # 流程0对流程1只暴露最小必要承接字段，诊断信息保留在质量报告区域，不再重复输出可推导列集合。
     checked_feature_df = checked_feature_df.copy()
-    raw_feature_column_list, raw_feature_zscore_column_list, factor_feature_column_list = _resolve_feature_column_group_list(
+    _, _, factor_feature_column_list = _resolve_feature_column_group_list(
         checked_feature_df=checked_feature_df,
         source_column_list=source_column_list,
     )
@@ -1244,24 +1267,16 @@ def _build_feature_preprocess_metadata(
         checked_feature_df=checked_feature_df,
         fund_code=fund_code,
     )
-    feature_column_list = list(raw_feature_zscore_column_list) + list(factor_feature_column_list)
     return {
         "fund_code": str(fund_code).zfill(6),
-        "primary_code": str(fund_code).zfill(6),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
-        "data_mode": "feature_matrix",
         "path_code": str(path_code),
         "feature_path": str(Path(feature_path).resolve()),
         "feature_format": str(Path(feature_path).suffix).lstrip(".").lower(),
         "target_price_column": target_price_column,
         "target_nav_column": target_nav_column,
-        "feature_column_list": feature_column_list,
-        "raw_feature_column_list": raw_feature_column_list,
-        "raw_feature_zscore_column_list": raw_feature_zscore_column_list,
         "factor_feature_column_list": factor_feature_column_list,
         "factor_binding_record_list": list(factor_binding_record_list),
-        "linked_code_type_dict": {str(code).zfill(6): str(code_type) for code, code_type in dict(code_type_dict).items()},
-        "candidate_factor_count": int(len(candidate_factor_list)),
         "row_count": int(len(checked_feature_df)),
         "column_count": int(len(checked_feature_df.columns)),
         "quality_summary": {
@@ -1428,13 +1443,15 @@ def run_feature_preprocess_single_fund(config_override=None):
         dropped_source_column_list=dropped_source_column_list,
     )
     # 翻转列生成沿用流程1训练集口径，只把稳定负向候选追加成新的 factor_feature 列。
-    checked_feature_df, checked_output_path, flipped_factor_report_list = _append_flipped_factor_feature_columns(
+    checked_feature_df, checked_output_path, flipped_factor_report_list, flipped_factor_binding_record_list = _append_flipped_factor_feature_columns(
         checked_feature_df=checked_feature_df,
         checked_output_path=checked_output_path,
         source_column_list=source_column_list,
         fund_code=fund_code,
         config=config,
+        factor_binding_record_list=factor_binding_record_list,
     )
+    factor_binding_record_list = list(factor_binding_record_list) + list(flipped_factor_binding_record_list)
     # 流程0最终供后续阶段消费的整张特征表统一裁掉前段不稳定样本，保持全表列对齐。
     checked_feature_df = _trim_initial_rows(feature_df=checked_feature_df)
     _save_feature_table(feature_df=checked_feature_df, table_path=checked_output_path)

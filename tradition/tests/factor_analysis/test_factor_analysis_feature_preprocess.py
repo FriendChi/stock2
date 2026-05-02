@@ -66,7 +66,7 @@ def test_append_flipped_factor_feature_columns_uses_train_metrics_and_writes_neg
         "compute_segment_correlation_metrics",
         fake_compute_segment_correlation_metrics,
     )
-    updated_checked_df, _, flipped_factor_report_list = factor_analysis_feature_preprocess._append_flipped_factor_feature_columns(
+    updated_checked_df, _, flipped_factor_report_list, flipped_factor_binding_record_list = factor_analysis_feature_preprocess._append_flipped_factor_feature_columns(
         checked_feature_df=checked_feature_df,
         checked_output_path=checked_output_path,
         source_column_list=["007301__price", "007301__cumulative_nav", "512480__price"],
@@ -86,6 +86,30 @@ def test_append_flipped_factor_feature_columns_uses_train_metrics_and_writes_neg
             "ic_aggregation_mode": "classic",
             "ic_exp_weight_half_life": 3.0,
         },
+        factor_binding_record_list=[
+            {
+                "output_column": "512480__price__momentum(window=10)__zscore",
+                "factor_name": "momentum",
+                "candidate_label": "512480__price__momentum(window=10)__zscore",
+                "binding_mode": "single_field",
+                "asset_code": "512480",
+                "bound_field_name_list": ["price"],
+                "bound_source_column_list": ["512480__price"],
+                "target_code": "007301",
+                "linked_code": None,
+            },
+            {
+                "output_column": "512480__price__ma_slope(window=20,lookback=5)__zscore",
+                "factor_name": "ma_slope",
+                "candidate_label": "512480__price__ma_slope(window=20,lookback=5)__zscore",
+                "binding_mode": "single_field",
+                "asset_code": "512480",
+                "bound_field_name_list": ["price"],
+                "bound_source_column_list": ["512480__price"],
+                "target_code": "007301",
+                "linked_code": None,
+            },
+        ],
     )
 
     flipped_column = "512480__price__-momentum(window=10)__zscore"
@@ -100,6 +124,20 @@ def test_append_flipped_factor_feature_columns_uses_train_metrics_and_writes_neg
             "train_sample_fold_count": 2,
             "positive_ic_count": 0,
             "negative_ic_count": 2,
+        }
+    ]
+    assert flipped_factor_binding_record_list == [
+        {
+            "output_column": flipped_column,
+            "factor_name": "momentum",
+            "candidate_label": flipped_column,
+            "binding_mode": "single_field",
+            "asset_code": "512480",
+            "bound_field_name_list": ["price"],
+            "bound_source_column_list": ["512480__price"],
+            "target_code": "007301",
+            "linked_code": None,
+            "original_output_column": "512480__price__momentum(window=10)__zscore",
         }
     ]
     saved_df = pd.read_csv(checked_output_path)
@@ -486,9 +524,10 @@ def test_run_feature_preprocess_trims_final_checked_table(monkeypatch, tmp_path)
     monkeypatch.setattr(
         factor_analysis_feature_preprocess,
         "_append_flipped_factor_feature_columns",
-        lambda checked_feature_df, checked_output_path, source_column_list, fund_code, config: (
+        lambda checked_feature_df, checked_output_path, source_column_list, fund_code, config, factor_binding_record_list: (
             checked_feature_df.copy(),
             checked_output_path,
+            [],
             [],
         ),
     )
@@ -519,6 +558,10 @@ def test_run_feature_preprocess_trims_final_checked_table(monkeypatch, tmp_path)
     assert saved_payload["feature_preprocess_output"]["feature_path"] == str(checked_output_path.resolve())
     assert saved_payload["feature_preprocess_output"]["feature_format"] == "parquet"
     assert saved_payload["feature_preprocess_output"]["factor_binding_record_list"] == []
+    assert "csv_path" not in saved_payload["feature_preprocess_output"]
+    assert "feature_column_list" not in saved_payload["feature_preprocess_output"]
+    assert "raw_feature_column_list" not in saved_payload["feature_preprocess_output"]
+    assert "raw_feature_zscore_column_list" not in saved_payload["feature_preprocess_output"]
 
 def test_run_feature_preprocess_metadata_records_dropped_source_columns(monkeypatch, tmp_path):
     sample_size = factor_analysis_feature_preprocess.INITIAL_TRIM_ROW_COUNT + 5
@@ -601,9 +644,10 @@ def test_run_feature_preprocess_metadata_records_dropped_source_columns(monkeypa
     monkeypatch.setattr(
         factor_analysis_feature_preprocess,
         "_append_flipped_factor_feature_columns",
-        lambda checked_feature_df, checked_output_path, source_column_list, fund_code, config: (
+        lambda checked_feature_df, checked_output_path, source_column_list, fund_code, config, factor_binding_record_list: (
             checked_feature_df.copy(),
             checked_output_path,
+            [],
             [],
         ),
     )

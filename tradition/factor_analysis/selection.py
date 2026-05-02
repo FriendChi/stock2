@@ -47,6 +47,9 @@ def build_factor_selection_record(factor_candidate, train_metric_list, valid_met
         "factor_group": str(factor_candidate["factor_group"]),
         "factor_param_dict": dict(factor_candidate["param_dict"]),
         "candidate_label": str(factor_candidate["candidate_label"]),
+        "binding_mode": str(dict(factor_candidate["param_dict"]).get("binding_mode", "")).strip(),
+        "bound_field_name_list": [str(field_name) for field_name in list(dict(factor_candidate["param_dict"]).get("bound_field_name_list", []))],
+        "bound_source_column_list": [str(source_column) for source_column in list(dict(factor_candidate["param_dict"]).get("bound_source_column_list", []))],
         "train_sample_fold_count": train_spearman_summary["count"],
         "train_spearman_ic_mean": train_spearman_summary["mean"],
         "train_spearman_ic_std": train_spearman_summary["std"],
@@ -129,10 +132,10 @@ def run_factor_selection_single_fund(config_override=None):
         expected_fund_code=fund_code,
     )
     fund_code = resolved_fund_code
-    data_mode = str(feature_preprocess_output.get("data_mode", "feature_matrix"))
+    data_mode = "feature_matrix"
     target_nav_column = str(feature_preprocess_output["target_nav_column"])
-    candidate_factor_name_list = [str(column) for column in list(feature_preprocess_output.get("factor_feature_column_list", []))]
-    if len(candidate_factor_name_list) == 0:
+    factor_binding_record_list = list(feature_preprocess_output.get("factor_binding_record_list", []))
+    if len(factor_binding_record_list) == 0:
         raise ValueError("流程0输出中不存在可用因子特征列。")
     feature_df = feature_df.copy()
     feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
@@ -144,15 +147,22 @@ def run_factor_selection_single_fund(config_override=None):
         walk_forward_config=dict(config["walk_forward_config"]),
         split_config=config["data_split_dict"],
     )
-    candidate_factor_list = [
-        {
-            "factor_name": str(candidate_label),
-            "factor_group": "factor_feature_zscore",
-            "param_dict": {},
-            "candidate_label": str(candidate_label),
-        }
-        for candidate_label in candidate_factor_name_list
-    ]
+    candidate_factor_list = []
+    for factor_binding_record in factor_binding_record_list:
+        candidate_label = str(factor_binding_record["output_column"])
+        candidate_factor_list.append(
+            {
+                "factor_name": str(factor_binding_record["factor_name"]),
+                "factor_group": "feature_preprocess_output",
+                "param_dict": {
+                    "binding_mode": str(factor_binding_record["binding_mode"]),
+                    "bound_field_name_list": [str(field_name) for field_name in list(factor_binding_record.get("bound_field_name_list", []))],
+                    "bound_source_column_list": [str(source_column) for source_column in list(factor_binding_record.get("bound_source_column_list", []))],
+                },
+                "candidate_label": candidate_label,
+            }
+        )
+    candidate_factor_name_list = [str(factor_candidate["candidate_label"]) for factor_candidate in candidate_factor_list]
     forward_return_series = build_forward_return_series(price_series=target_nav_series, forward_window=5)
 
     factor_record_list = []
@@ -206,7 +216,7 @@ def run_factor_selection_single_fund(config_override=None):
         "preprocess_metadata_path": str(resolved_preprocess_metadata_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),
         "target_nav_column": target_nav_column,
-        "factor_group_list": [],
+        "factor_group_list": ["feature_preprocess_output"],
         "candidate_factor_name_list": candidate_factor_name_list,
         "selected_factor_name_list": selected_summary_df["factor_name"].tolist(),
         "selected_candidate_label_list": selected_summary_df["candidate_label"].tolist(),
@@ -221,6 +231,9 @@ def run_factor_selection_single_fund(config_override=None):
                 "factor_group",
                 "factor_name",
                 "factor_param_dict",
+                "binding_mode",
+                "bound_field_name_list",
+                "bound_source_column_list",
                 "selected",
             ],
         ),
@@ -235,7 +248,7 @@ def run_factor_selection_single_fund(config_override=None):
     result = {
         "fund_code": fund_code,
         "data_mode": data_mode,
-        "factor_group_list": [],
+        "factor_group_list": ["feature_preprocess_output"],
         "candidate_factor_name_list": candidate_factor_name_list,
         "candidate_factor_list": candidate_factor_list,
         "selected_factor_name_list": selected_summary_df["factor_name"].tolist(),
