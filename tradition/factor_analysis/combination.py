@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -308,18 +309,33 @@ def run_factor_combination(config_override=None):
     if preprocess_path is None:
         raise ValueError("dedup 结果缺少 preprocess_path，请重新执行流程3。")
     resolved_preprocess_path = Path(preprocess_path)
+    preprocess_metadata_path = dedup_selection_output.get("preprocess_metadata_path")
+    if preprocess_metadata_path is None:
+        raise ValueError("dedup 结果缺少 preprocess_metadata_path，请重新执行流程3。")
+    resolved_preprocess_metadata_path = Path(preprocess_metadata_path)
+    if not resolved_preprocess_metadata_path.exists():
+        raise FileNotFoundError(f"流程0元信息 JSON 不存在: {resolved_preprocess_metadata_path}")
+    metadata_input = json.loads(resolved_preprocess_metadata_path.read_text(encoding="utf-8"))
+    feature_preprocess_output = dict(metadata_input.get("feature_preprocess_output", {}))
+    feature_path = feature_preprocess_output.get("feature_path")
+    if feature_path is None:
+        raise ValueError("流程0元信息缺少 feature_path，请重新执行流程0。")
+    feature_format = str(feature_preprocess_output.get("feature_format", "")).strip().lower()
+    if feature_format != "parquet":
+        raise ValueError(f"流程4仅支持 parquet 特征文件，当前 feature_format={feature_format or 'empty'}。")
+    resolved_preprocess_path = Path(feature_path)
     if not resolved_preprocess_path.exists():
-        raise FileNotFoundError(f"流程3特征 CSV 不存在: {resolved_preprocess_path}")
+        raise FileNotFoundError(f"流程0特征文件不存在: {resolved_preprocess_path}")
     target_nav_column = str(dedup_selection_output.get("target_nav_column", "")).strip()
     if len(target_nav_column) == 0:
         raise ValueError("dedup 结果缺少 target_nav_column，请重新执行流程3。")
-    feature_df = pd.read_csv(resolved_preprocess_path)
+    feature_df = pd.read_parquet(resolved_preprocess_path)
     required_column_list = ["date", target_nav_column] + input_candidate_label_list
     missing_column_list = [column for column in required_column_list if column not in feature_df.columns]
     if len(missing_column_list) > 0:
-        raise ValueError(f"流程3特征 CSV 缺少流程4必需列: {missing_column_list[:10]}")
+        raise ValueError(f"流程0特征文件缺少流程4必需列: {missing_column_list[:10]}")
 
-    # 逻辑块：直接复用流程3固化的特征 CSV，保持流程3与流程4使用完全一致的因子列口径。
+    # 逻辑块：直接复用流程0固化的特征文件，保持流程3与流程4使用完全一致的因子列口径。
     feature_df = feature_df.copy()
     feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
     feature_df = feature_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
@@ -349,12 +365,12 @@ def run_factor_combination(config_override=None):
     factor_series_dict = {}
     candidate_train_icir_dict = {}
     if len(price_series.dropna()) < 2:
-        raise ValueError("流程3特征 CSV 中目标净值列有效样本不足，无法执行流程4。")
+        raise ValueError("流程0特征文件中目标净值列有效样本不足，无法执行流程4。")
     for factor_candidate in factor_candidate_list:
         candidate_label = str(factor_candidate["candidate_label"])
         factor_series_dict[candidate_label] = pd.Series(feature_df[candidate_label], copy=True).astype(float)
         if factor_series_dict[candidate_label].dropna().empty:
-            raise ValueError(f"流程3特征 CSV 中候选因子列全为空: {candidate_label}")
+            raise ValueError(f"流程0特征文件中候选因子列全为空: {candidate_label}")
         candidate_train_icir_dict[candidate_label] = float(candidate_record_lookup[candidate_label]["train_spearman_icir"])
 
     combination_summary_list = [
@@ -413,6 +429,7 @@ def run_factor_combination(config_override=None):
     factor_combination_output = {
         "fund_code": fund_code,
         "preprocess_path": str(resolved_preprocess_path),
+        "preprocess_metadata_path": str(resolved_preprocess_metadata_path),
         "target_nav_column": target_nav_column,
         "dedup_selection_path": str(resolved_dedup_selection_path),
         "analysis_date": datetime.today().strftime("%Y-%m-%d"),

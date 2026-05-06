@@ -6,7 +6,7 @@ from tradition import factor_analysis
 from tradition.factor_analysis import io as factor_analysis_io
 def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, tmp_path):
     sample_index = pd.date_range("2024-01-01", periods=30, freq="D")
-    feature_csv_path = tmp_path / "feature_preprocess_007301_2026-04-05_a00000_checked.csv"
+    feature_csv_path = tmp_path / "feature_preprocess_007301_2026-04-05_a00000_checked.parquet"
     pd.DataFrame(
         {
             "date": sample_index,
@@ -14,7 +14,20 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
             "momentum(window=10)": [0.1 * idx for idx in range(len(sample_index))],
             "momentum(window=15)": [0.2 * idx for idx in range(len(sample_index))],
         }
-    ).to_csv(feature_csv_path, index=False)
+    ).to_parquet(feature_csv_path, index=False)
+    preprocess_metadata_path = tmp_path / "feature_preprocess_007301_2026-04-05_a00000.json"
+    preprocess_metadata_path.write_text(
+        json.dumps(
+            {
+                "feature_preprocess_output": {
+                    "feature_path": str(feature_csv_path),
+                    "feature_format": "parquet",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     factor_selection_path = tmp_path / "factor_selection_007301_2026-04-05.json"
     factor_selection_path.write_text(
         json.dumps(
@@ -24,7 +37,7 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
                     "fund_code": "007301",
                     "data_mode": "feature_matrix",
                     "preprocess_path": str(feature_csv_path),
-                    "preprocess_metadata_path": str(tmp_path / "feature_preprocess_007301_2026-04-05_a00000.json"),
+                    "preprocess_metadata_path": str(preprocess_metadata_path),
                     "target_nav_column": "007301__cumulative_nav",
                     "record_dict": {
                         "momentum(window=10)": {
@@ -32,6 +45,9 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
                             "factor_group": "趋势/动量",
                             "factor_param_dict": {"window": 10},
                             "candidate_label": "momentum(window=10)",
+                            "binding_mode": "single_field",
+                            "bound_field_name_list": ["price"],
+                            "bound_source_column_list": ["007301__price"],
                             "selected": True,
                         },
                         "momentum(window=15)": {
@@ -39,6 +55,9 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
                             "factor_group": "趋势/动量",
                             "factor_param_dict": {"window": 15},
                             "candidate_label": "momentum(window=15)",
+                            "binding_mode": "single_field",
+                            "bound_field_name_list": ["price"],
+                            "bound_source_column_list": ["007301__price"],
                             "selected": False,
                         },
                     },
@@ -130,12 +149,15 @@ def test_run_single_factor_stability_analysis_outputs_nested_json(monkeypatch, t
     assert "stability_analysis_output" in saved_payload
     assert saved_payload["stability_analysis_output"]["fund_code"] == "007301"
     assert saved_payload["stability_analysis_output"]["preprocess_path"] == str(feature_csv_path)
-    assert saved_payload["stability_analysis_output"]["preprocess_metadata_path"] == str(tmp_path / "feature_preprocess_007301_2026-04-05_a00000.json")
+    assert saved_payload["stability_analysis_output"]["preprocess_metadata_path"] == str(preprocess_metadata_path)
     assert saved_payload["stability_analysis_output"]["target_nav_column"] == "007301__cumulative_nav"
     assert saved_payload["stability_analysis_output"]["candidate_count"] == 1
     assert saved_payload["stability_analysis_output"]["selected_count"] == 1
     assert saved_payload["stability_analysis_output"]["ic_aggregation_config"]["mode"] == "classic"
     assert saved_payload["stability_analysis_output"]["record_dict"]["momentum(window=10)"]["candidate_label"] == "momentum(window=10)"
+    assert saved_payload["stability_analysis_output"]["record_dict"]["momentum(window=10)"]["binding_mode"] == "single_field"
+    assert saved_payload["stability_analysis_output"]["record_dict"]["momentum(window=10)"]["bound_field_name_list"] == ["price"]
+    assert saved_payload["stability_analysis_output"]["record_dict"]["momentum(window=10)"]["bound_source_column_list"] == ["007301__price"]
 
 def test_run_single_factor_stability_analysis_prefers_json_fund_code_and_absolute_gap_sort(monkeypatch, tmp_path):
     sample_index = pd.date_range("2024-01-01", periods=30, freq="D")

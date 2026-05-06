@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+import json
 
 import pandas as pd
 
@@ -37,6 +38,9 @@ def build_single_factor_stability_record(factor_candidate, train_metric_list, va
         "factor_group": str(factor_candidate["factor_group"]),
         "factor_param_dict": dict(factor_candidate["factor_param_dict"]),
         "candidate_label": str(factor_candidate["candidate_label"]),
+        "binding_mode": str(factor_candidate.get("binding_mode", "")).strip(),
+        "bound_field_name_list": [str(field_name) for field_name in list(factor_candidate.get("bound_field_name_list", []))],
+        "bound_source_column_list": [str(source_column) for source_column in list(factor_candidate.get("bound_source_column_list", []))],
         "train_sample_fold_count": train_spearman_summary["count"],
         "train_spearman_ic_mean": train_spearman_summary["mean"],
         "train_spearman_ic_std": train_spearman_summary["std"],
@@ -62,17 +66,35 @@ def load_selected_feature_matrix(factor_selection_output, selected_factor_input_
     if preprocess_path is None:
         raise ValueError("factor_select 结果缺少 preprocess_path，请重新执行流程1并提供流程0输出。")
     resolved_preprocess_path = Path(preprocess_path)
+    preprocess_metadata_path = factor_selection_output.get("preprocess_metadata_path")
+    resolved_preprocess_metadata_path = None if preprocess_metadata_path is None else Path(preprocess_metadata_path)
+    feature_format = str(resolved_preprocess_path.suffix).lstrip(".").lower()
+    if resolved_preprocess_metadata_path is not None and resolved_preprocess_metadata_path.exists():
+        metadata_input = json.loads(resolved_preprocess_metadata_path.read_text(encoding="utf-8"))
+        feature_preprocess_output = dict(metadata_input.get("feature_preprocess_output", {}))
+        feature_path = str(feature_preprocess_output.get("feature_path", "")).strip()
+        if len(feature_path) == 0:
+            raise ValueError("流程0元信息缺少 feature_path，请重新执行流程0。")
+        resolved_preprocess_path = Path(feature_path)
+        feature_format = str(feature_preprocess_output.get("feature_format", "")).strip().lower()
+        if len(feature_format) == 0:
+            feature_format = str(resolved_preprocess_path.suffix).lstrip(".").lower()
     if not resolved_preprocess_path.exists():
-        raise FileNotFoundError(f"流程0特征 CSV 不存在: {resolved_preprocess_path}")
+        raise FileNotFoundError(f"流程0特征文件不存在: {resolved_preprocess_path}")
     target_nav_column = str(factor_selection_output.get("target_nav_column", "")).strip()
     if len(target_nav_column) == 0:
         raise ValueError("factor_select 结果缺少 target_nav_column，请重新执行流程1。")
     selected_candidate_label_list = [str(record["candidate_label"]) for record in selected_factor_input_list]
-    feature_df = pd.read_csv(resolved_preprocess_path)
+    if feature_format == "parquet":
+        feature_df = pd.read_parquet(resolved_preprocess_path)
+    elif feature_format == "csv":
+        feature_df = pd.read_csv(resolved_preprocess_path)
+    else:
+        raise ValueError(f"未支持的流程0特征文件格式: {feature_format}")
     required_column_list = ["date", target_nav_column] + selected_candidate_label_list
     missing_column_list = [column for column in required_column_list if column not in feature_df.columns]
     if len(missing_column_list) > 0:
-        raise ValueError(f"流程0特征 CSV 缺少流程2必需列: {missing_column_list[:10]}")
+        raise ValueError(f"流程0特征文件缺少流程2必需列: {missing_column_list[:10]}")
     # 流程2直接消费流程1筛出的候选列，不再按旧式因子定义重建时序。
     feature_df = feature_df.copy()
     feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
@@ -188,6 +210,9 @@ def run_single_factor_stability_analysis(config_override=None):
                 "factor_group",
                 "factor_name",
                 "factor_param_dict",
+                "binding_mode",
+                "bound_field_name_list",
+                "bound_source_column_list",
                 "selected",
                 "train_spearman_icir",
                 "valid_spearman_ic_mean",

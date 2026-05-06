@@ -5,6 +5,43 @@ import pandas as pd
 
 from tradition import factor_analysis
 from tradition.factor_analysis import io as factor_analysis_io
+
+
+def test_load_selected_feature_matrix_rejects_csv_feature_format(tmp_path):
+    preprocess_csv_path = tmp_path / "feature_preprocess_007301_2026-04-05_c00000_checked.csv"
+    pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=3, freq="D"),
+            "007301__cumulative_nav": [1.0, 1.01, 1.02],
+            "momentum(window=10)": [0.1, 0.2, 0.3],
+        }
+    ).to_csv(preprocess_csv_path, index=False)
+    preprocess_metadata_path = tmp_path / "feature_preprocess_007301_2026-04-05_c00000.json"
+    preprocess_metadata_path.write_text(
+        json.dumps(
+            {
+                "feature_preprocess_output": {
+                    "feature_path": str(preprocess_csv_path),
+                    "feature_format": "csv",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        factor_analysis.dedup.load_selected_feature_matrix(
+            stability_analysis_output={
+                "preprocess_path": str(preprocess_csv_path),
+                "preprocess_metadata_path": str(preprocess_metadata_path),
+                "target_nav_column": "007301__cumulative_nav",
+            },
+            selected_stability_candidate_list=[{"candidate_label": "momentum(window=10)"}],
+        )
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "仅支持 parquet 特征文件" in str(exc)
 def test_build_corr_dedup_result_drops_global_worst_ten_percent_with_min_two_and_cap(monkeypatch):
     selected_summary_df = pd.DataFrame(
         [
@@ -536,7 +573,7 @@ def test_run_optuna_extension_search_uses_remaining_factor_square_trials_and_can
 
 def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_path):
     sample_index = pd.date_range("2024-01-01", periods=30, freq="D")
-    feature_csv_path = tmp_path / "feature_preprocess_007301_2026-04-05_c00000_checked.csv"
+    feature_parquet_path = tmp_path / "feature_preprocess_007301_2026-04-05_c00000_checked.parquet"
     pd.DataFrame(
         {
             "date": sample_index,
@@ -544,7 +581,31 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
             "momentum(window=10)": list(range(len(sample_index))),
             "ma_slope(lookback=5, window=20)": list(reversed(range(len(sample_index)))),
         }
-    ).to_csv(feature_csv_path, index=False)
+    ).to_parquet(feature_parquet_path, index=False)
+    preprocess_metadata_path = tmp_path / "feature_preprocess_007301_2026-04-05_c00000.json"
+    preprocess_metadata_path.write_text(
+        json.dumps(
+            {
+                "path_code": "c00000",
+                "feature_preprocess_output": {
+                    "fund_code": "007301",
+                    "feature_path": str(feature_parquet_path),
+                    "feature_format": "parquet",
+                    "target_nav_column": "007301__cumulative_nav",
+                    "factor_feature_column_list": [
+                        "momentum(window=10)",
+                        "ma_slope(lookback=5, window=20)",
+                    ],
+                    "factor_binding_record_list": [
+                        {"output_column": "momentum(window=10)"},
+                        {"output_column": "ma_slope(lookback=5, window=20)"},
+                    ],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     stability_analysis_path = tmp_path / "single_factor_stability_007301_2026-04-05.json"
     stability_analysis_path.write_text(
         json.dumps(
@@ -553,12 +614,18 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
                 "stability_analysis_output": {
                     "fund_code": "007301",
                     "data_mode": "feature_matrix",
-                    "preprocess_path": str(feature_csv_path),
-                    "preprocess_metadata_path": str(tmp_path / "feature_preprocess_007301_2026-04-05_c00000.json"),
+                    "preprocess_path": str(feature_parquet_path),
+                    "preprocess_metadata_path": str(preprocess_metadata_path),
                     "target_nav_column": "007301__cumulative_nav",
                     "record_dict": {
                         "momentum(window=10)": {
                             "candidate_label": "momentum(window=10)",
+                            "factor_name": "momentum",
+                            "factor_group": "feature_preprocess_output",
+                            "factor_param_dict": {"binding_mode": "single_field"},
+                            "binding_mode": "single_field",
+                            "bound_field_name_list": ["price"],
+                            "bound_source_column_list": ["007301__price"],
                             "train_spearman_icir": 0.8,
                             "valid_spearman_icir": 0.6,
                             "valid_spearman_ic_mean": 0.11,
@@ -566,6 +633,12 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
                         },
                         "ma_slope(lookback=5, window=20)": {
                             "candidate_label": "ma_slope(lookback=5, window=20)",
+                            "factor_name": "ma_slope",
+                            "factor_group": "feature_preprocess_output",
+                            "factor_param_dict": {"binding_mode": "single_field"},
+                            "binding_mode": "single_field",
+                            "bound_field_name_list": ["price"],
+                            "bound_source_column_list": ["007301__price"],
                             "train_spearman_icir": 0.7,
                             "valid_spearman_icir": 0.5,
                             "valid_spearman_ic_mean": 0.10,
@@ -674,8 +747,8 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     assert saved_payload["path_code"][4:] == "00"
     assert result["summary_path"].stem.split("_")[-1] == saved_payload["path_code"]
     assert "dedup_selection_output" in saved_payload
-    assert saved_payload["dedup_selection_output"]["preprocess_path"] == str(feature_csv_path)
-    assert saved_payload["dedup_selection_output"]["preprocess_metadata_path"] == str(tmp_path / "feature_preprocess_007301_2026-04-05_c00000.json")
+    assert saved_payload["dedup_selection_output"]["preprocess_path"] == str(feature_parquet_path)
+    assert saved_payload["dedup_selection_output"]["preprocess_metadata_path"] == str(preprocess_metadata_path)
     assert saved_payload["dedup_selection_output"]["target_nav_column"] == "007301__cumulative_nav"
     assert saved_payload["dedup_selection_output"]["train_path_count"] == 3
     assert saved_payload["dedup_selection_output"]["valid_eval_count"] == 1
@@ -688,6 +761,9 @@ def test_run_single_factor_dedup_selection_outputs_nested_json(monkeypatch, tmp_
     assert saved_payload["dedup_selection_output"]["forward_selected_candidate_label_list"] == ["momentum(window=10)"]
     assert saved_payload["dedup_selection_output"]["best_final_selection_summary"]["candidate_label_list"] == ["momentum(window=10)"]
     selected_record = saved_payload["dedup_selection_output"]["record_dict"]["momentum(window=10)"]
-    assert "factor_name" not in selected_record
-    assert "factor_param_dict" not in selected_record
-    assert "factor_group" not in selected_record
+    assert selected_record["factor_name"] == "momentum"
+    assert selected_record["factor_group"] == "feature_preprocess_output"
+    assert selected_record["factor_param_dict"] == {"binding_mode": "single_field"}
+    assert selected_record["binding_mode"] == "single_field"
+    assert selected_record["bound_field_name_list"] == ["price"]
+    assert selected_record["bound_source_column_list"] == ["007301__price"]
